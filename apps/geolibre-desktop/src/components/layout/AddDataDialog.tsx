@@ -29,6 +29,8 @@ import {
   FileUp,
   Globe2,
   Image,
+  LogIn,
+  LogOut,
   Map as MapIcon,
 } from "lucide-react";
 import {
@@ -39,6 +41,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { useArcGISOAuth } from "../../hooks/useArcGISOAuth";
 import {
   openLocalDataFileWithFallback,
   openVectorFileWithFallback,
@@ -433,6 +436,8 @@ export function AddDataDialog({
   const addLayer = useAppStore((s) => s.addLayer);
   const addGeoJsonLayer = useAppStore((s) => s.addGeoJsonLayer);
   const title = kind ? KIND_LABELS[kind] : "Add Data";
+
+  const arcGISOAuth = useArcGISOAuth();
 
   const [layerName, setLayerName] = useState("");
   const [beforeLayerId, setBeforeLayerId] = useState("");
@@ -1433,14 +1438,20 @@ export function AddDataDialog({
       }
 
       if (kind === "arcgis") {
+        const effectiveToken =
+          arcGISOAuth.token?.accessToken ?? (arcgisAccessToken.trim() || undefined);
+        const effectivePortalUrl =
+          arcGISOAuth.token
+            ? "https://www.arcgis.com/sharing/rest"
+            : arcgisPortalUrl.trim() || undefined;
         await addArcGISLayer(createAppAPI(mapControllerRef), {
           beforeLayerId: beforeLayer,
           itemId: arcgisItemId.trim() || undefined,
           layerType: arcgisLayerType,
           name,
-          portalUrl: arcgisPortalUrl.trim() || undefined,
+          portalUrl: effectivePortalUrl,
           sourceType: arcgisSourceType,
-          token: arcgisAccessToken.trim() || undefined,
+          token: effectiveToken,
           url: arcgisUrl.trim() || undefined,
         });
         closeDialog();
@@ -2179,27 +2190,71 @@ export function AddDataDialog({
                 </div>
               )}
               <div className="space-y-1.5">
-                <Label htmlFor="arcgis-portal-url">Portal URL</Label>
-                <Input
-                  id="arcgis-portal-url"
-                  placeholder="https://www.arcgis.com/sharing/rest"
-                  value={arcgisPortalUrl}
-                  onChange={(event) => setArcgisPortalUrl(event.target.value)}
-                />
+                {arcGISOAuth.clientId ? (
+                  arcGISOAuth.token ? (
+                    <div className="flex items-center justify-between rounded-md border border-green-500/40 bg-green-500/10 px-3 py-2">
+                      <span className="text-xs text-green-700 dark:text-green-300">
+                        Signed in as <strong>{arcGISOAuth.token.username}</strong>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={arcGISOAuth.signOut}
+                        className="ml-2 flex items-center gap-1 text-xs text-green-700 hover:text-green-900 dark:text-green-300 dark:hover:text-green-100"
+                      >
+                        <LogOut className="h-3 w-3" />
+                        Sign out
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="space-y-1.5">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="w-full"
+                        disabled={arcGISOAuth.isSigningIn}
+                        onClick={arcGISOAuth.signIn}
+                      >
+                        <LogIn className="mr-2 h-4 w-4" />
+                        {arcGISOAuth.isSigningIn
+                          ? "Signing in…"
+                          : "Sign in with ArcGIS Online"}
+                      </Button>
+                      {arcGISOAuth.error && (
+                        <p className="text-xs text-destructive">{arcGISOAuth.error}</p>
+                      )}
+                      <p className="text-xs text-muted-foreground">
+                        Or enter credentials manually below.
+                      </p>
+                    </div>
+                  )
+                ) : null}
               </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="arcgis-access-token">Access token</Label>
-                <Input
-                  id="arcgis-access-token"
-                  type="password"
-                  autoComplete="off"
-                  placeholder="Optional"
-                  value={arcgisAccessToken}
-                  onChange={(event) =>
-                    setArcgisAccessToken(event.target.value)
-                  }
-                />
-              </div>
+              {!arcGISOAuth.token && (
+                <>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="arcgis-portal-url">Portal URL</Label>
+                    <Input
+                      id="arcgis-portal-url"
+                      placeholder="https://www.arcgis.com/sharing/rest"
+                      value={arcgisPortalUrl}
+                      onChange={(event) => setArcgisPortalUrl(event.target.value)}
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="arcgis-access-token">Access token</Label>
+                    <Input
+                      id="arcgis-access-token"
+                      type="password"
+                      autoComplete="off"
+                      placeholder="Optional"
+                      value={arcgisAccessToken}
+                      onChange={(event) =>
+                        setArcgisAccessToken(event.target.value)
+                      }
+                    />
+                  </div>
+                </>
+              )}
             </div>
           )}
 

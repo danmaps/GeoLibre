@@ -1,4 +1,5 @@
 import "./lib/symbol-dispose-polyfill";
+import { handleOAuthCallbackIfNeeded } from "./lib/arcgis-oauth";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
@@ -18,8 +19,12 @@ import "./lib/geoagent-style";
 import "./lib/lidar-style";
 import "./lib/swipe-style";
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
-);
+// If this page load is an OAuth popup returning from ArcGIS, post the code
+// back to the opener and close — skip rendering the full app.
+if (!handleOAuthCallbackIfNeeded()) {
+  ReactDOM.createRoot(document.getElementById("root")!).render(
+    <React.StrictMode>
+      <App />
+    </React.StrictMode>,
+  );
+}
