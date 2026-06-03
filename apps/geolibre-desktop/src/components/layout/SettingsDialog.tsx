@@ -29,16 +29,20 @@ import {
   Eye,
   EyeOff,
   FolderCog,
+  LogIn,
+  LogOut,
   MapPinned,
   Plus,
   RotateCcw,
   Settings,
   Trash2,
   TriangleAlert,
+  User,
 } from "lucide-react";
 import { useEffect, useMemo, useState, type RefObject } from "react";
+import { useArcGISOAuth } from "../../hooks/useArcGISOAuth";
 
-type SettingsSection = "map" | "environment" | "project";
+type SettingsSection = "map" | "environment" | "project" | "account";
 
 interface SettingsDialogProps {
   buttonClassName?: string;
@@ -56,6 +60,7 @@ const SECTION_ITEMS: Array<{
   { id: "map", label: "Map", icon: MapPinned },
   { id: "environment", label: "Environment", icon: Braces },
   { id: "project", label: "Project", icon: FolderCog },
+  { id: "account", label: "Account", icon: User },
 ];
 
 const VARIABLE_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -165,6 +170,7 @@ export function SettingsDialog({
   const setProjectName = useAppStore((s) => s.setProjectName);
   const [open, setOpen] = useState(false);
   const [section, setSection] = useState<SettingsSection>("map");
+  const arcGISOAuth = useArcGISOAuth();
   const [draftPreferences, setDraftPreferences] = useState<DraftPreferences>(
     () => clonePreferences(preferences),
   );
@@ -371,6 +377,22 @@ export function SettingsDialog({
             <FolderCog className="mr-2 h-3.5 w-3.5" />
             Project Settings
           </DropdownMenuItem>
+          {arcGISOAuth.clientId ? (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onSelect={() => {
+                  setSection("account");
+                  setOpen(true);
+                }}
+              >
+                <User className="mr-2 h-3.5 w-3.5" />
+                {arcGISOAuth.token
+                  ? arcGISOAuth.token.username
+                  : "Sign in with ArcGIS"}
+              </DropdownMenuItem>
+            </>
+          ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
       <Dialog open={open} onOpenChange={setOpen}>
@@ -666,6 +688,69 @@ export function SettingsDialog({
                       </div>
                     </div>
                   </div>
+                </div>
+              ) : null}
+              {section === "account" ? (
+                <div className="space-y-5">
+                  <div>
+                    <h3 className="text-sm font-semibold">ArcGIS Online Account</h3>
+                    <p className="text-xs text-muted-foreground">
+                      Sign in to load private layers and portal items without
+                      entering a token manually.
+                    </p>
+                  </div>
+                  {arcGISOAuth.clientId ? (
+                    arcGISOAuth.token ? (
+                      <div className="space-y-4">
+                        <div className="flex items-center gap-3 rounded-md border bg-muted px-4 py-3">
+                          <User className="h-5 w-5 shrink-0 text-muted-foreground" />
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-medium">
+                              {arcGISOAuth.token.username}
+                            </p>
+                            <p className="text-xs text-muted-foreground">
+                              Session expires{" "}
+                              {new Date(arcGISOAuth.token.expiresAt).toLocaleTimeString()}
+                            </p>
+                          </div>
+                        </div>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={arcGISOAuth.signOut}
+                        >
+                          <LogOut className="mr-2 h-3.5 w-3.5" />
+                          Sign out
+                        </Button>
+                      </div>
+                    ) : (
+                      <div className="space-y-3">
+                        {arcGISOAuth.error ? (
+                          <p className="flex items-center gap-1.5 text-sm text-destructive">
+                            <TriangleAlert className="h-3.5 w-3.5 shrink-0" />
+                            {arcGISOAuth.error}
+                          </p>
+                        ) : null}
+                        <Button
+                          type="button"
+                          size="sm"
+                          disabled={arcGISOAuth.isSigningIn}
+                          onClick={arcGISOAuth.signIn}
+                        >
+                          <LogIn className="mr-2 h-3.5 w-3.5" />
+                          {arcGISOAuth.isSigningIn
+                            ? "Signing in…"
+                            : "Sign in with ArcGIS Online"}
+                        </Button>
+                      </div>
+                    )
+                  ) : (
+                    <p className="text-sm text-muted-foreground">
+                      Set <code className="rounded bg-muted px-1 py-0.5 text-xs">VITE_ARCGIS_CLIENT_ID</code> in your{" "}
+                      <code className="rounded bg-muted px-1 py-0.5 text-xs">.env.local</code> to enable ArcGIS Online sign-in.
+                    </p>
+                  )}
                 </div>
               ) : null}
             </div>
