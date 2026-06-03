@@ -41,6 +41,39 @@ npm run build
 npm run tauri:build
 ```
 
+## Windows and corporate network setup
+
+### Corporate proxy (e.g. Netskope)
+
+If your machine uses a corporate security agent that intercepts HTTPS traffic (such as Netskope), both npm and Cargo need to be pointed at the corporate proxy. Without this, all package downloads fail with `ECONNRESET`.
+
+**npm** — run once, persists in `~/.npmrc`:
+
+```
+npm config set proxy http://<proxy-host>:<port>
+npm config set https-proxy http://<proxy-host>:<port>
+```
+
+**Cargo** — create or edit `~/.cargo/config.toml`:
+
+```toml
+[http]
+proxy = "http://<proxy-host>:<port>"
+check-revoke = false
+```
+
+### MSVC linker (`link.exe` not found)
+
+Tauri requires the MSVC linker on Windows. Install Visual Studio 2022 Build Tools with the C++ workload:
+
+```
+winget install Microsoft.VisualStudio.2022.BuildTools --silent --override "--wait --quiet --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.Windows11SDK.22621 --includeRecommended"
+```
+
+### Rust / cargo not on PATH
+
+If `cargo` is installed via rustup but not found, add `~\.cargo\bin` to your PATH or open a new terminal after installing rustup.
+
 ## Optional imagery credentials
 
 The Street View plugin can use Google Street View and Mapillary imagery. Create `apps/geolibre-desktop/.env.local` and set one or both provider credentials:
