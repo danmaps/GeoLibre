@@ -399,9 +399,7 @@ function SettingsDialog({
                 }}
               >
                 <User className="mr-2 h-3.5 w-3.5" />
-                {arcGISOAuth.token
-                  ? arcGISOAuth.token.username
-                  : "Sign in with ArcGIS"}
+                Account
               </DropdownMenuItem>
             </>
           ) : null}
