@@ -1,14 +1,16 @@
 /**
  * ArcGIS Online OAuth 2.0 with PKCE (Proof Key for Code Exchange).
  *
- * Works over plain HTTP — ArcGIS Online allows non-HTTPS redirect URIs for
- * internal/intranet deployments when registered as such in the app settings.
+ * Uses @noble/hashes for SHA-256 so it works without a secure context —
+ * required when serving over plain HTTP (e.g. internal intranet).
  *
  * Register your app at:
  *   https://www.arcgis.com/home/item.html → New Item → Application
  * Set redirect URI to: http://gisapps.sce.com/geolibre/
  * Then set VITE_ARCGIS_CLIENT_ID in your .env.local.
  */
+
+import { sha256 } from "@noble/hashes/sha2.js";
 
 const AGOL_AUTHORIZE_URL = "https://www.arcgis.com/sharing/rest/oauth2/authorize";
 const AGOL_TOKEN_URL = "https://www.arcgis.com/sharing/rest/oauth2/token";
@@ -24,7 +26,11 @@ export interface ArcGISOAuthToken {
 
 function generateCodeVerifier(): string {
   const array = new Uint8Array(48);
-  crypto.getRandomValues(array);
+  if (typeof crypto !== "undefined" && crypto.getRandomValues) {
+    crypto.getRandomValues(array);
+  } else {
+    for (let i = 0; i < array.length; i++) array[i] = Math.random() * 256;
+  }
   return btoa(String.fromCharCode(...array))
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
@@ -33,8 +39,8 @@ function generateCodeVerifier(): string {
 
 async function generateCodeChallenge(verifier: string): Promise<string> {
   const data = new TextEncoder().encode(verifier);
-  const digest = await crypto.subtle.digest("SHA-256", data);
-  return btoa(String.fromCharCode(...new Uint8Array(digest)))
+  const digest = sha256(data);
+  return btoa(String.fromCharCode(...digest))
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=/g, "");
