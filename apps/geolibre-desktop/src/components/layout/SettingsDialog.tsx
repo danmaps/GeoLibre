@@ -39,10 +39,14 @@ import {
   TriangleAlert,
   User,
 } from "lucide-react";
-import { useEffect, useMemo, useState, type RefObject } from "react";
+import { useEffect, useMemo, useState, useImperativeHandle, forwardRef, type RefObject } from "react";
 import { useArcGISOAuth } from "../../hooks/useArcGISOAuth";
 
 type SettingsSection = "map" | "environment" | "project" | "account";
+
+export interface SettingsDialogHandle {
+  openAccountSettings: () => void;
+}
 
 interface SettingsDialogProps {
   buttonClassName?: string;
@@ -156,13 +160,14 @@ function validateEnvironmentVariables(
   return null;
 }
 
-export function SettingsDialog({
+export const SettingsDialog = forwardRef<SettingsDialogHandle, SettingsDialogProps>(
+function SettingsDialog({
   buttonClassName,
   buttonSize = "sm",
   iconClassName,
   mapControllerRef,
   showLabels = true,
-}: SettingsDialogProps) {
+}: SettingsDialogProps, ref) {
   const preferences = useAppStore((s) => s.preferences);
   const setPreferences = useAppStore((s) => s.setPreferences);
   const projectName = useAppStore((s) => s.projectName);
@@ -188,6 +193,13 @@ export function SettingsDialog({
       ).length,
     [draftPreferences.environmentVariables],
   );
+
+  useImperativeHandle(ref, () => ({
+    openAccountSettings: () => {
+      setSection("account");
+      setOpen(true);
+    },
+  }));
 
   // Seed the draft from the store only when the dialog opens. Depending on
   // preferences/projectName would reset in-progress edits if the store changed
@@ -694,10 +706,6 @@ export function SettingsDialog({
                 <div className="space-y-5">
                   <div>
                     <h3 className="text-sm font-semibold">ArcGIS Online Account</h3>
-                    <p className="text-xs text-muted-foreground">
-                      Sign in to load private layers and portal items without
-                      entering a token manually.
-                    </p>
                   </div>
                   {arcGISOAuth.clientId ? (
                     arcGISOAuth.token ? (
@@ -776,4 +784,4 @@ export function SettingsDialog({
       </Dialog>
     </>
   );
-}
+});

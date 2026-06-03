@@ -180,7 +180,7 @@ async function fetchAGOLUsername(accessToken: string): Promise<string> {
 
 // ── Session storage persistence ───────────────────────────────────────────────
 
-export function loadStoredToken(): ArcGISOAuthToken | null {
+function loadStoredToken(): ArcGISOAuthToken | null {
   try {
     const raw = sessionStorage.getItem(SESSION_STORAGE_KEY);
     if (!raw) return null;
@@ -195,12 +195,37 @@ export function loadStoredToken(): ArcGISOAuthToken | null {
   }
 }
 
+// ── Shared external store ─────────────────────────────────────────────────────
+// All consumers of the token subscribe here so they stay in sync without
+// needing a React context or prop drilling.
+
+type TokenSubscriber = () => void;
+const tokenSubscribers = new Set<TokenSubscriber>();
+let currentToken: ArcGISOAuthToken | null = loadStoredToken();
+
+function notifyTokenSubscribers(): void {
+  for (const sub of tokenSubscribers) sub();
+}
+
+export function subscribeArcGISToken(subscriber: TokenSubscriber): () => void {
+  tokenSubscribers.add(subscriber);
+  return () => tokenSubscribers.delete(subscriber);
+}
+
+export function getArcGISToken(): ArcGISOAuthToken | null {
+  return currentToken;
+}
+
 export function storeToken(token: ArcGISOAuthToken): void {
   sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(token));
+  currentToken = token;
+  notifyTokenSubscribers();
 }
 
 export function clearStoredToken(): void {
   sessionStorage.removeItem(SESSION_STORAGE_KEY);
+  currentToken = null;
+  notifyTokenSubscribers();
 }
 
 // ── OAuth callback handler ────────────────────────────────────────────────────

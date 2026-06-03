@@ -85,11 +85,12 @@ import { resolveProjectXyzLayers } from "../../lib/xyz-url";
 import { AddDataDialog, type AddDataKind } from "./AddDataDialog";
 import { AboutDialog } from "./AboutDialog";
 import { NewProjectDialog } from "./NewProjectDialog";
-import { SettingsDialog } from "./SettingsDialog";
+import { SettingsDialog, type SettingsDialogHandle } from "./SettingsDialog";
 
 interface TopToolbarProps {
   compact?: boolean;
   mapControllerRef: React.RefObject<MapController | null>;
+  settingsDialogRef?: React.Ref<SettingsDialogHandle>;
   showLabels?: boolean;
   showProjectInfo?: boolean;
   themeMode: ThemeMode;
@@ -138,6 +139,7 @@ function formatRecentProjectTime(openedAt: string): string {
 export function TopToolbar({
   compact = false,
   mapControllerRef,
+  settingsDialogRef,
   showLabels = true,
   showProjectInfo = true,
   themeMode,
@@ -679,6 +681,7 @@ export function TopToolbar({
         </DropdownMenuContent>
       </DropdownMenu>
       <SettingsDialog
+        ref={settingsDialogRef}
         buttonClassName={toolbarButtonClass}
         buttonSize={toolbarButtonSize}
         iconClassName={toolbarIconClassName}

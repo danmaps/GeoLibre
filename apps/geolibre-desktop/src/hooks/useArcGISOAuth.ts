@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import {
   clearStoredToken,
-  loadStoredToken,
+  getArcGISToken,
   signInWithArcGISOnline,
   storeToken,
+  subscribeArcGISToken,
   type ArcGISOAuthToken,
 } from "../lib/arcgis-oauth";
 
@@ -20,7 +21,7 @@ export interface ArcGISOAuthState {
 }
 
 export function useArcGISOAuth(): ArcGISOAuthState {
-  const [token, setToken] = useState<ArcGISOAuthToken | null>(() => loadStoredToken());
+  const token = useSyncExternalStore(subscribeArcGISToken, getArcGISToken);
   const [isSigningIn, setIsSigningIn] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -29,12 +30,10 @@ export function useArcGISOAuth(): ArcGISOAuthState {
     if (!token) return;
     const ms = token.expiresAt - Date.now();
     if (ms <= 0) {
-      setToken(null);
       clearStoredToken();
       return;
     }
     const timer = setTimeout(() => {
-      setToken(null);
       clearStoredToken();
     }, ms);
     return () => clearTimeout(timer);
@@ -47,7 +46,6 @@ export function useArcGISOAuth(): ArcGISOAuthState {
     try {
       const next = await signInWithArcGISOnline(CLIENT_ID);
       storeToken(next);
-      setToken(next);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       // Don't surface "cancelled" as a red error
@@ -61,7 +59,6 @@ export function useArcGISOAuth(): ArcGISOAuthState {
 
   const signOut = useCallback(() => {
     clearStoredToken();
-    setToken(null);
     setError(null);
   }, []);
 

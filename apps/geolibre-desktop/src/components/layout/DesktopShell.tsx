@@ -25,6 +25,7 @@ import { LayerPanel } from "../panels/LayerPanel";
 import { StylePanel } from "../panels/StylePanel";
 import { StatusBar } from "./StatusBar";
 import { TopToolbar } from "./TopToolbar";
+import type { SettingsDialogHandle } from "./SettingsDialog";
 import type { LayoutOptions } from "../../hooks/useLayoutOptions";
 import type { ThemeMode } from "../../hooks/useThemeMode";
 import type { ProjectUrlLoadState } from "../../hooks/useProjectUrlLoader";
@@ -89,6 +90,7 @@ export function DesktopShell({
   const shellRef = useRef<HTMLDivElement>(null);
   const verticalResizeGuideRef = useRef<HTMLDivElement>(null);
   const mapControllerRef = useRef<MapController | null>(null);
+  const settingsDialogRef = useRef<SettingsDialogHandle>(null);
   const dragDepthRef = useRef(0);
   const dropMessageTimeoutRef = useRef<number | null>(null);
   const addGeoJsonLayer = useAppStore((s) => s.addGeoJsonLayer);
@@ -431,6 +433,7 @@ export function DesktopShell({
       <TopToolbar
         compact={layoutOptions.compact}
         mapControllerRef={mapControllerRef}
+        settingsDialogRef={settingsDialogRef}
         showLabels={layoutOptions.toolbarLabels}
         showProjectInfo={layoutOptions.showProjectInfo}
         themeMode={themeMode}
@@ -458,7 +461,10 @@ export function DesktopShell({
         ) : null}
       </div>
       {layoutOptions.panelsVisible ? <AttributeTable /> : null}
-      <StatusBar compact={layoutOptions.compact} />
+      <StatusBar
+        compact={layoutOptions.compact}
+        onOpenAccountSettings={() => settingsDialogRef.current?.openAccountSettings()}
+      />
       <Suspense fallback={null}>
         <ProcessingDialog mapControllerRef={mapControllerRef} />
       </Suspense>
