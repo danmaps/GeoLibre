@@ -43,7 +43,7 @@ export function StatusBar({ compact = false, onOpenAccountSettings }: StatusBarP
         <span className="shrink-0">Pitch: {mapView.pitch.toFixed(1)}°</span>
         {compact ? null : <span className="min-w-0 truncate">BBox: {bboxText}</span>}
       </div>
-      {arcGISOAuth.clientId ? (
+      {(arcGISOAuth.clientId || arcGISOAuth.token) ? (
         <button
           type="button"
           onClick={onOpenAccountSettings}
