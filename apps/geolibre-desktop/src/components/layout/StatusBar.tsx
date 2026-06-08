@@ -1,17 +1,23 @@
 import { useAppStore } from "@geolibre/core";
 import { cn } from "@geolibre/ui";
-import { LogIn, User } from "lucide-react";
-import { useArcGISOAuth } from "../../hooks/useArcGISOAuth";
+import { Bug } from "lucide-react";
 
 interface StatusBarProps {
   compact?: boolean;
-  onOpenAccountSettings?: () => void;
+  diagnosticsErrorCount: number;
+  diagnosticsWarningCount: number;
+  onOpenDiagnostics: () => void;
 }
 
-export function StatusBar({ compact = false, onOpenAccountSettings }: StatusBarProps) {
+export function StatusBar({
+  compact = false,
+  diagnosticsErrorCount,
+  diagnosticsWarningCount,
+  onOpenDiagnostics,
+}: StatusBarProps) {
   const pointerCoords = useAppStore((s) => s.pointerCoords);
   const mapView = useAppStore((s) => s.mapView);
-  const arcGISOAuth = useArcGISOAuth();
+  const diagnosticsCount = diagnosticsErrorCount + diagnosticsWarningCount;
 
   const coordText = pointerCoords
     ? `${pointerCoords[0].toFixed(5)}, ${pointerCoords[1].toFixed(5)}`
@@ -24,45 +30,36 @@ export function StatusBar({ compact = false, onOpenAccountSettings }: StatusBarP
   return (
     <footer
       className={cn(
-        "flex h-7 shrink-0 items-center border-t bg-muted/40 font-mono text-xs text-muted-foreground",
+        "flex h-7 shrink-0 items-center gap-4 overflow-y-hidden whitespace-nowrap border-t bg-muted/40 px-3 font-mono text-xs text-muted-foreground",
+        compact ? "overflow-hidden" : "overflow-x-auto",
       )}
     >
-      <div
+      <span className="shrink-0">
+        {compact ? "XY" : "Coords"}: {coordText}
+      </span>
+      <span className="shrink-0">Zoom: {mapView.zoom.toFixed(2)}</span>
+      <span className="shrink-0">
+        Bearing: {mapView.bearing.toFixed(1)}°
+      </span>
+      <span className="shrink-0">Pitch: {mapView.pitch.toFixed(1)}°</span>
+      {compact ? null : (
+        <span className="min-w-0 flex-1 truncate">BBox: {bboxText}</span>
+      )}
+      <button
+        type="button"
         className={cn(
-          "flex flex-1 items-center gap-4 overflow-y-hidden whitespace-nowrap px-3",
-          compact ? "overflow-hidden" : "overflow-x-auto",
+          "inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 hover:bg-accent hover:text-accent-foreground",
+          "ml-auto",
+          diagnosticsErrorCount > 0 && "text-red-700 dark:text-red-300",
+          diagnosticsErrorCount === 0 &&
+            diagnosticsWarningCount > 0 &&
+            "text-amber-700 dark:text-amber-300",
         )}
+        onClick={onOpenDiagnostics}
       >
-        <span className="shrink-0">
-          {compact ? "XY" : "Coords"}: {coordText}
-        </span>
-        <span className="shrink-0">Zoom: {mapView.zoom.toFixed(2)}</span>
-        <span className="shrink-0">
-          Bearing: {mapView.bearing.toFixed(1)}°
-        </span>
-        <span className="shrink-0">Pitch: {mapView.pitch.toFixed(1)}°</span>
-        {compact ? null : <span className="min-w-0 truncate">BBox: {bboxText}</span>}
-      </div>
-      {(arcGISOAuth.clientId || arcGISOAuth.token) ? (
-        <button
-          type="button"
-          onClick={onOpenAccountSettings}
-          className="flex shrink-0 items-center gap-1.5 border-l px-3 py-1 hover:bg-muted/60 hover:text-foreground"
-          title={arcGISOAuth.token ? `Signed in as ${arcGISOAuth.token.username}` : "Sign in to ArcGIS Online"}
-        >
-          {arcGISOAuth.token ? (
-            <>
-              <User className="h-3 w-3" />
-              <span>{arcGISOAuth.token.username}</span>
-            </>
-          ) : (
-            <>
-              <LogIn className="h-3 w-3" />
-              {compact ? null : <span>ArcGIS Sign In</span>}
-            </>
-          )}
-        </button>
-      ) : null}
+        <Bug className="h-3 w-3" />
+        {compact ? "Diag" : "Diagnostics"}: {diagnosticsCount}
+      </button>
     </footer>
   );
 }

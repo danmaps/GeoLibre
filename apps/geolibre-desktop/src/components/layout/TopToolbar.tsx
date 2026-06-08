@@ -10,18 +10,64 @@ import {
   type MapController,
 } from "@geolibre/map";
 import {
+  closeBookmarkPanel,
+  closeColorbarPanel,
+  closeDuckDBLayerPanel,
+  closeEarthEnginePanel,
+  closeHtmlPanel,
+  closeLegendPanel,
+  closeMaplibreComponentControls,
+  closeMeasurePanel,
+  closeMinimapPanel,
+  closePlanetaryComputerPanel,
+  closePrintPanel,
+  closeRasterLayerPanel,
   closeSearchPlacesPanel,
+  closeThreeDTilesLayerPanel,
+  closeVectorLayerPanel,
+  closeViewStatePanel,
   openFlatGeobufAddVectorLayerPanel,
   openDuckDBLayerPanel,
-  openGeoParquetLayerPanel,
+  isBookmarkPanelVisible,
+  isEarthEnginePanelVisible,
+  isColorbarPanelVisible,
+  isHtmlPanelVisible,
+  isLegendPanelVisible,
+  isMeasurePanelVisible,
+  isMinimapPanelVisible,
+  isPrintPanelVisible,
   isSearchPlacesPanelVisible,
+  isViewStatePanelVisible,
+  openBookmarkPanel,
+  openColorbarPanel,
+  openHtmlPanel,
+  openLegendPanel,
   openLidarLayerPanel,
+  openMeasurePanel,
+  openMinimapPanel,
+  openPlanetaryComputerPanel,
   openPMTilesLayerPanel,
+  openPrintPanel,
+  openRasterLayerPanel,
   openSearchPlacesPanel,
   openSplattingLayerPanel,
   openStacSearchLayerPanel,
+  openThreeDTilesLayerPanel,
+  openVectorLayerPanel,
+  openViewStatePanel,
   openZarrLayerPanel,
+  subscribeBookmarkPanel,
+  subscribeColorbarPanel,
+  subscribeEarthEnginePanel,
+  subscribeHtmlPanel,
+  subscribeLegendPanel,
+  subscribeMeasurePanel,
+  subscribeMinimapPanel,
+  subscribePrintPanel,
   subscribeSearchPlacesPanel,
+  subscribeViewStatePanel,
+  toggleEarthEnginePanel,
+  WEB_SERVICE_PLUGIN_IDS,
   type GeoLibreMapControlPosition,
 } from "@geolibre/plugins";
 import {
@@ -47,39 +93,49 @@ import {
   Label,
 } from "@geolibre/ui";
 import {
+  Bug,
+  CircleHelp,
   Database,
+  FilePen,
+  FilePlus2,
+  FileText,
+  Folder,
   FolderOpen,
   History,
+  Info,
   Layers,
   Link2,
   Map,
+  MessageSquare,
   Moon,
+  Printer,
   Puzzle,
+  RefreshCw,
   Save,
   SlidersHorizontal,
   Sun,
   Wrench,
   X,
 } from "lucide-react";
-import {
-  type FormEvent,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { type FormEvent, useRef, useState, useSyncExternalStore } from "react";
 import {
   createAppAPI,
   getPluginManager,
   usePluginRegistry,
 } from "../../hooks/usePlugins";
+import { useDesktopSettingsStore } from "../../hooks/useDesktopSettings";
 import type { ThemeMode } from "../../hooks/useThemeMode";
 import {
+  isHttpUrl,
   isTauri,
   openProjectFile,
   openRecentProjectFile,
   RecentProjectGoneError,
   saveProjectFile,
+  saveProjectFileToPath,
 } from "../../lib/tauri-io";
+import { mergeStringLists } from "../../lib/string-lists";
 import { normalizeProjectUrl } from "../../lib/urls";
 import { resolveProjectXyzLayers } from "../../lib/xyz-url";
 import { AddDataDialog, type AddDataKind } from "./AddDataDialog";
@@ -89,11 +145,13 @@ import { SettingsDialog, type SettingsDialogHandle } from "./SettingsDialog";
 
 interface TopToolbarProps {
   compact?: boolean;
+  diagnosticsErrorCount: number;
   mapControllerRef: React.RefObject<MapController | null>;
   settingsDialogRef?: React.Ref<SettingsDialogHandle>;
   showLabels?: boolean;
   showProjectInfo?: boolean;
   themeMode: ThemeMode;
+  onOpenDiagnostics: () => void;
   onToggleThemeMode: () => void;
 }
 
@@ -113,6 +171,18 @@ const MAP_CONTROL_ITEMS: Array<{
   { id: "logo", label: "MapLibre logo" },
 ];
 
+const NEW_PROJECT_VISIBLE_BUILT_IN_CONTROLS = new Set<BuiltInMapControl>([
+  "navigation",
+  "fullscreen",
+  "globe",
+  "layer-control",
+]);
+
+const ALL_BUILT_IN_CONTROL_IDS: BuiltInMapControl[] = [
+  ...MAP_CONTROL_ITEMS.map(({ id }) => id),
+  "layer-control",
+];
+
 const PLUGIN_POSITION_ITEMS: Array<{
   value: GeoLibreMapControlPosition;
   label: string;
@@ -122,6 +192,19 @@ const PLUGIN_POSITION_ITEMS: Array<{
   { value: "bottom-left", label: "Bottom left" },
   { value: "bottom-right", label: "Bottom right" },
 ];
+
+// Plugins grouped under the "Web Services" submenu of the Plugins menu.
+const WEB_SERVICE_PLUGIN_ID_SET = new Set<string>(WEB_SERVICE_PLUGIN_IDS);
+
+const FEEDBACK_URL = "https://github.com/opengeos/GeoLibre/issues";
+
+async function openExternalLink(url: string): Promise<void> {
+  if (isTauri()) {
+    await openUrl(url);
+    return;
+  }
+  window.open(url, "_blank", "noopener,noreferrer");
+}
 
 function formatRecentProjectTime(openedAt: string): string {
   const openedDate = new Date(openedAt);
@@ -136,17 +219,34 @@ function formatRecentProjectTime(openedAt: string): string {
   }).format(openedDate);
 }
 
+function newProjectToolbarControlVisibility(): Record<
+  ToolbarMapControl,
+  boolean
+> {
+  return MAP_CONTROL_ITEMS.reduce(
+    (acc, { id }) => {
+      acc[id] = NEW_PROJECT_VISIBLE_BUILT_IN_CONTROLS.has(id);
+      return acc;
+    },
+    {} as Record<ToolbarMapControl, boolean>,
+  );
+}
+
 export function TopToolbar({
   compact = false,
+  diagnosticsErrorCount,
   mapControllerRef,
   settingsDialogRef,
   showLabels = true,
   showProjectInfo = true,
   themeMode,
+  onOpenDiagnostics,
   onToggleThemeMode,
 }: TopToolbarProps) {
   const loadProject = useAppStore((s) => s.loadProject);
   const setProcessingOpen = useAppStore((s) => s.setProcessingOpen);
+  const setConversionOpen = useAppStore((s) => s.setConversionOpen);
+  const setSqlWorkspaceOpen = useAppStore((s) => s.setSqlWorkspaceOpen);
   const projectName = useAppStore((s) => s.projectName);
   const projectPath = useAppStore((s) => s.projectPath);
   const recentProjects = useAppStore((s) => s.recentProjects);
@@ -168,11 +268,14 @@ export function TopToolbar({
     ),
   );
   const [addDataKind, setAddDataKind] = useState<AddDataKind | null>(null);
+  const [newProjectDialogOpen, setNewProjectDialogOpen] = useState(false);
   const [projectUrlDialogOpen, setProjectUrlDialogOpen] = useState(false);
   const [projectUrl, setProjectUrl] = useState("");
   const [projectUrlError, setProjectUrlError] = useState<string | null>(null);
   const [projectUrlLoading, setProjectUrlLoading] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [aboutOpen, setAboutOpen] = useState(false);
+  const [checkForUpdatesRequest, setCheckForUpdatesRequest] = useState(0);
   const projectUrlAbortRef = useRef<AbortController | null>(null);
   const recentAbortRef = useRef<AbortController | null>(null);
 
@@ -285,9 +388,15 @@ export function TopToolbar({
     }
   };
 
-  const handleSave = async (): Promise<boolean> => {
+  const saveProject = async (options?: {
+    saveAs?: boolean;
+  }): Promise<boolean> => {
     const state = useAppStore.getState();
     const defaultProjectName = state.projectName.trim() || "Untitled Project";
+    const pluginManifestUrls = mergeStringLists(
+      state.projectPlugins?.manifestUrls ?? [],
+      useDesktopSettingsStore.getState().desktopSettings.pluginManifestUrls,
+    );
     const project = projectFromStore({
       projectName: defaultProjectName,
       mapView: mapControllerRef.current?.readView() ?? state.mapView,
@@ -296,14 +405,35 @@ export function TopToolbar({
       basemapOpacity: state.basemapOpacity,
       layers: state.layers,
       preferences: state.preferences,
-      plugins: getPluginManager().getProjectState(),
+      plugins: {
+        ...getPluginManager().getProjectState(),
+        manifestUrls: pluginManifestUrls,
+      },
       metadata: state.metadata,
     });
     const content = serializeProject(project);
-    const path = await saveProjectFile(
-      content,
-      state.projectPath ?? `${defaultProjectName}.geolibre.json`,
-    );
+    // Projects opened from a URL have no writable path, so both Save and
+    // Save As fall back to the save dialog for them.
+    const existingLocalPath =
+      state.projectPath && !isHttpUrl(state.projectPath)
+        ? state.projectPath
+        : null;
+    let path: string | null;
+    try {
+      path =
+        !options?.saveAs && existingLocalPath
+          ? await saveProjectFileToPath(content, existingLocalPath)
+          : await saveProjectFile(
+              content,
+              existingLocalPath ?? `${defaultProjectName}.geolibre.json`,
+            );
+    } catch (error) {
+      console.error("Failed to save project", error);
+      setActionError(
+        error instanceof Error ? error.message : "Could not save the project.",
+      );
+      return false;
+    }
     if (!path) return false;
     setProjectPath(path);
     rememberRecentProject({
@@ -315,6 +445,9 @@ export function TopToolbar({
     return true;
   };
 
+  const handleSave = () => saveProject();
+  const handleSaveAs = () => saveProject({ saveAs: true });
+
   const {
     plugins,
     isActive,
@@ -323,14 +456,34 @@ export function TopToolbar({
     setMapControlPosition,
   } = usePluginRegistry();
   const appApi = createAppAPI(mapControllerRef);
+  const resetRuntimeControlsForNewProject = () => {
+    closeMaplibreComponentControls(appApi);
+    closeRasterLayerPanel(appApi);
+    closeVectorLayerPanel(appApi);
+    closePlanetaryComputerPanel(appApi);
+    closeEarthEnginePanel(appApi);
+    closeThreeDTilesLayerPanel(appApi);
+    closeDuckDBLayerPanel(appApi);
+    getPluginManager().restoreProjectState(null, appApi, {
+      resetMissingSettings: true,
+    });
+
+    for (const control of ALL_BUILT_IN_CONTROL_IDS) {
+      mapControllerRef.current?.setBuiltInControlPosition(control, "top-right");
+    }
+    for (const control of ALL_BUILT_IN_CONTROL_IDS) {
+      mapControllerRef.current?.setBuiltInControlVisible(
+        control,
+        NEW_PROJECT_VISIBLE_BUILT_IN_CONTROLS.has(control),
+      );
+    }
+    setControlsVisible(newProjectToolbarControlVisibility());
+  };
   const handleAddFlatGeobufLayer = () => {
     openFlatGeobufAddVectorLayerPanel(appApi);
   };
   const handleAddDuckDBLayer = () => {
     openDuckDBLayerPanel(appApi);
-  };
-  const handleAddGeoParquetLayer = () => {
-    openGeoParquetLayerPanel(appApi);
   };
   const handleAddPMTilesLayer = () => {
     openPMTilesLayerPanel(appApi);
@@ -338,17 +491,119 @@ export function TopToolbar({
   const handleAddStacLayer = () => {
     openStacSearchLayerPanel(appApi);
   };
+  const handleAddRasterLayer = () => {
+    openRasterLayerPanel(appApi);
+  };
+  const handleAddVectorLayer = () => {
+    openVectorLayerPanel(appApi);
+  };
   const searchPlacesVisible = useSyncExternalStore(
     subscribeSearchPlacesPanel,
     isSearchPlacesPanelVisible,
     isSearchPlacesPanelVisible,
   );
-  const handleToggleSearchPlaces = () => {
+  const handleToggleSearchPlacesPanel = () => {
     if (searchPlacesVisible) {
       closeSearchPlacesPanel();
       return;
     }
     openSearchPlacesPanel(appApi);
+  };
+  const printPanelVisible = useSyncExternalStore(
+    subscribePrintPanel,
+    isPrintPanelVisible,
+    isPrintPanelVisible,
+  );
+  const handleTogglePrintPanel = () => {
+    if (printPanelVisible) {
+      closePrintPanel();
+      return;
+    }
+    openPrintPanel(appApi);
+  };
+  const colorbarPanelVisible = useSyncExternalStore(
+    subscribeColorbarPanel,
+    isColorbarPanelVisible,
+    isColorbarPanelVisible,
+  );
+  const handleToggleColorbarPanel = () => {
+    if (colorbarPanelVisible) {
+      closeColorbarPanel(appApi);
+      return;
+    }
+    openColorbarPanel(appApi);
+  };
+  const legendPanelVisible = useSyncExternalStore(
+    subscribeLegendPanel,
+    isLegendPanelVisible,
+    isLegendPanelVisible,
+  );
+  const handleToggleLegendPanel = () => {
+    if (legendPanelVisible) {
+      closeLegendPanel(appApi);
+      return;
+    }
+    openLegendPanel(appApi);
+  };
+  const htmlPanelVisible = useSyncExternalStore(
+    subscribeHtmlPanel,
+    isHtmlPanelVisible,
+    isHtmlPanelVisible,
+  );
+  const handleToggleHtmlPanel = () => {
+    if (htmlPanelVisible) {
+      closeHtmlPanel(appApi);
+      return;
+    }
+    openHtmlPanel(appApi);
+  };
+  const measurePanelVisible = useSyncExternalStore(
+    subscribeMeasurePanel,
+    isMeasurePanelVisible,
+    isMeasurePanelVisible,
+  );
+  const handleToggleMeasurePanel = () => {
+    if (measurePanelVisible) {
+      closeMeasurePanel(appApi);
+      return;
+    }
+    openMeasurePanel(appApi);
+  };
+  const bookmarkPanelVisible = useSyncExternalStore(
+    subscribeBookmarkPanel,
+    isBookmarkPanelVisible,
+    isBookmarkPanelVisible,
+  );
+  const handleToggleBookmarkPanel = () => {
+    if (bookmarkPanelVisible) {
+      closeBookmarkPanel(appApi);
+      return;
+    }
+    openBookmarkPanel(appApi);
+  };
+  const minimapPanelVisible = useSyncExternalStore(
+    subscribeMinimapPanel,
+    isMinimapPanelVisible,
+    isMinimapPanelVisible,
+  );
+  const handleToggleMinimapPanel = () => {
+    if (minimapPanelVisible) {
+      closeMinimapPanel(appApi);
+      return;
+    }
+    openMinimapPanel(appApi);
+  };
+  const viewStatePanelVisible = useSyncExternalStore(
+    subscribeViewStatePanel,
+    isViewStatePanelVisible,
+    isViewStatePanelVisible,
+  );
+  const handleToggleViewStatePanel = () => {
+    if (viewStatePanelVisible) {
+      closeViewStatePanel(appApi);
+      return;
+    }
+    openViewStatePanel(appApi);
   };
   const handleAddZarrLayer = () => {
     openZarrLayerPanel(appApi);
@@ -358,6 +613,20 @@ export function TopToolbar({
   };
   const handleAddSplattingLayer = () => {
     openSplattingLayerPanel(appApi);
+  };
+  const handleAddThreeDTilesLayer = () => {
+    openThreeDTilesLayerPanel(appApi);
+  };
+  const handleOpenPlanetaryComputerPanel = () => {
+    openPlanetaryComputerPanel(appApi);
+  };
+  const earthEnginePanelVisible = useSyncExternalStore(
+    subscribeEarthEnginePanel,
+    isEarthEnginePanelVisible,
+    isEarthEnginePanelVisible,
+  );
+  const handleToggleEarthEnginePanel = () => {
+    toggleEarthEnginePanel(appApi);
   };
   const toggleMapControl = (control: ToolbarMapControl) => {
     setControlsVisible((current) => {
@@ -371,6 +640,7 @@ export function TopToolbar({
   const toolbarButtonSize = compact ? "icon" : "sm";
   const toolbarButtonClass = compact ? "h-8 w-8 shrink-0" : "shrink-0";
   const toolbarIconClassName = cn("h-3.5 w-3.5", showLabels && "sm:mr-1");
+  const appTitle = isTauri() ? "GeoLibre Desktop" : "GeoLibre";
   const renderToolbarLabel = (label: string) =>
     showLabels ? <span className="hidden sm:inline">{label}</span> : null;
 
@@ -386,103 +656,132 @@ export function TopToolbar({
       <span className="mr-1 flex shrink-0 items-center gap-1.5 text-sm font-semibold text-primary md:mr-2">
         <Map className="h-4 w-4" />
         {showProjectInfo ? (
-          <span className="hidden sm:inline">GeoLibre Desktop</span>
+          <span className="hidden sm:inline">{appTitle}</span>
         ) : null}
       </span>
-      <NewProjectDialog
-        buttonClassName={toolbarButtonClass}
-        buttonSize={toolbarButtonSize}
-        iconClassName={toolbarIconClassName}
-        showLabels={showLabels}
-        onSaveCurrentProject={handleSave}
-      />
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button
             className={toolbarButtonClass}
             variant="ghost"
             size={toolbarButtonSize}
-            aria-label="Open"
+            aria-label="Project"
           >
-            <FolderOpen className={toolbarIconClassName} />
-            {renderToolbarLabel("Open")}
+            <Folder className={toolbarIconClassName} />
+            {renderToolbarLabel("Project")}
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="w-80">
+        <DropdownMenuContent align="start" className="w-64">
           <DropdownMenuLabel>Project</DropdownMenuLabel>
           <DropdownMenuSeparator />
-          <DropdownMenuItem onSelect={() => void handleOpenFromFile()}>
-            <FolderOpen className="mr-2 h-3.5 w-3.5" />
-            Open Project from File...
+          <DropdownMenuItem onSelect={() => setNewProjectDialogOpen(true)}>
+            <FilePlus2 className="mr-2 h-3.5 w-3.5" />
+            New...
           </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setProjectUrlDialogOpen(true)}>
-            <Link2 className="mr-2 h-3.5 w-3.5" />
-            Open Project from URL...
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuLabel>Recent projects</DropdownMenuLabel>
-          {recentProjects.length === 0 ? (
-            <DropdownMenuItem disabled>No recent projects</DropdownMenuItem>
-          ) : (
-            recentProjects.map((project) => {
-              const openedAt = formatRecentProjectTime(project.openedAt);
-              const label = project.name || projectPathLabel(project.path);
-              return (
-                <DropdownMenuItem
-                  key={project.path}
-                  className="flex items-start justify-between gap-2"
-                  onSelect={() => void handleOpenRecent(project.path)}
-                >
-                  <span className="flex min-w-0 flex-col items-start gap-0.5">
-                    <span className="max-w-full truncate font-medium">
-                      {label}
-                    </span>
-                    <span className="flex max-w-full items-center gap-1 text-xs text-muted-foreground">
-                      <History className="h-3 w-3 shrink-0" />
-                      <span className="truncate">
-                        {openedAt
-                          ? `${openedAt} - ${project.path}`
-                          : project.path}
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>
+              <FolderOpen className="mr-2 h-3.5 w-3.5" />
+              Open From
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent>
+              <DropdownMenuItem onSelect={() => void handleOpenFromFile()}>
+                <FileText className="mr-2 h-3.5 w-3.5" />
+                File...
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setProjectUrlDialogOpen(true)}>
+                <Link2 className="mr-2 h-3.5 w-3.5" />
+                URL...
+              </DropdownMenuItem>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger disabled={recentProjects.length === 0}>
+              <History className="mr-2 h-3.5 w-3.5" />
+              Open Recent
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent className="w-80">
+              {recentProjects.length === 0 ? (
+                <DropdownMenuItem disabled>No recent projects</DropdownMenuItem>
+              ) : (
+                recentProjects.map((project) => {
+                  const openedAt = formatRecentProjectTime(project.openedAt);
+                  const label = project.name || projectPathLabel(project.path);
+                  return (
+                    <DropdownMenuItem
+                      key={project.path}
+                      className="flex items-start justify-between gap-2"
+                      onSelect={() => void handleOpenRecent(project.path)}
+                      title={project.path}
+                    >
+                      <span className="flex min-w-0 flex-col items-start gap-0.5">
+                        <span
+                          className="max-w-full truncate font-medium"
+                          title={label}
+                        >
+                          {label}
+                        </span>
+                        <span className="flex max-w-full items-start gap-1 text-xs text-muted-foreground">
+                          <History className="h-3 w-3 shrink-0" />
+                          <span
+                            className="break-all text-left leading-snug"
+                            title={project.path}
+                          >
+                            {openedAt
+                              ? `${openedAt} - ${project.path}`
+                              : project.path}
+                          </span>
+                        </span>
                       </span>
-                    </span>
-                  </span>
-                  <button
-                    type="button"
-                    aria-label={`Remove ${label} from recent projects`}
-                    className="mt-0.5 shrink-0 rounded p-0.5 text-muted-foreground hover:text-foreground"
-                    onClick={(event) => {
-                      // Keep the menu open and prevent the row's onSelect (which
-                      // would reopen the project) from firing.
-                      event.stopPropagation();
-                      event.preventDefault();
-                      forgetRecentProject(project.path);
-                    }}
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                </DropdownMenuItem>
-              );
-            })
-          )}
+                      <button
+                        type="button"
+                        aria-label={`Remove ${label} from recent projects`}
+                        className="mt-0.5 shrink-0 rounded p-0.5 text-muted-foreground hover:text-foreground"
+                        onClick={(event) => {
+                          // Keep the menu open and prevent the row's onSelect
+                          // (which would reopen the project) from firing.
+                          event.stopPropagation();
+                          event.preventDefault();
+                          forgetRecentProject(project.path);
+                        }}
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </DropdownMenuItem>
+                  );
+                })
+              )}
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                disabled={recentProjects.length === 0}
+                onSelect={clearRecentProjects}
+              >
+                Clear Recent Projects
+              </DropdownMenuItem>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
           <DropdownMenuSeparator />
-          <DropdownMenuItem
-            disabled={recentProjects.length === 0}
-            onSelect={clearRecentProjects}
-          >
-            Clear Recent Projects
+          <DropdownMenuItem onSelect={() => void handleSave()}>
+            <Save className="mr-2 h-3.5 w-3.5" />
+            Save
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => void handleSaveAs()}>
+            <FilePen className="mr-2 h-3.5 w-3.5" />
+            Save As...
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onSelect={handleTogglePrintPanel}>
+            <Printer className="mr-2 h-3.5 w-3.5" />
+            Print...
+            {printPanelVisible ? " ✓" : ""}
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
-      <Button
-        className={toolbarButtonClass}
-        variant="ghost"
-        size={toolbarButtonSize}
-        onClick={handleSave}
-        aria-label="Save"
-      >
-        <Save className={toolbarIconClassName} />
-        {renderToolbarLabel("Save")}
-      </Button>
+      <NewProjectDialog
+        open={newProjectDialogOpen}
+        onOpenChange={setNewProjectDialogOpen}
+        onSaveCurrentProject={handleSave}
+        onProjectCreated={resetRuntimeControlsForNewProject}
+      />
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button
@@ -495,65 +794,87 @@ export function TopToolbar({
             {renderToolbarLabel("Add Data")}
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="start">
+        <DropdownMenuContent align="start" className="w-64">
           <DropdownMenuLabel>Add data</DropdownMenuLabel>
           <DropdownMenuSeparator />
-          <DropdownMenuItem onSelect={() => setAddDataKind("xyz")}>
-            Add XYZ Layer
+          <DropdownMenuLabel className="text-xs text-muted-foreground">
+            Files
+          </DropdownMenuLabel>
+          <DropdownMenuItem onSelect={handleAddVectorLayer}>
+            Vector Layer
           </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setAddDataKind("wms")}>
-            Add WMS Layer
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setAddDataKind("wfs")}>
-            Add WFS Layer
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setAddDataKind("wmts")}>
-            Add WMTS Layer
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setAddDataKind("vector")}>
-            Add Vector Layer
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setAddDataKind("raster")}>
-            Add Raster Layer
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={handleAddGeoParquetLayer}>
-            Add GeoParquet Layer
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={handleAddFlatGeobufLayer}>
-            Add FlatGeobuf Layer
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={handleAddPMTilesLayer}>
-            Add PMTiles Layer
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setAddDataKind("mbtiles")}>
-            Add MBTiles Layer
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setAddDataKind("arcgis")}>
-            Add ArcGIS Layer
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={handleAddZarrLayer}>
-            Add Zarr Layer
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={handleAddLidarLayer}>
-            Add LiDAR Layer
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={handleAddSplattingLayer}>
-            Add Splatting Layer
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={handleAddStacLayer}>
-            Add STAC Layer
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={handleAddDuckDBLayer}>
-            Add DuckDB Layer
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setAddDataKind("postgres")}>
-            Add PostgreSQL Layer
+          <DropdownMenuItem onSelect={handleAddRasterLayer}>
+            Raster Layer
           </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => setAddDataKind("delimited-text")}>
-            Add Delimited Text Layer
+            Delimited Text Layer
           </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => setAddDataKind("gpx")}>
-            Add GPX Layer
+            GPX Layer
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setAddDataKind("mbtiles")}>
+            MBTiles Layer
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel className="text-xs text-muted-foreground">
+            Web services
+          </DropdownMenuLabel>
+          <DropdownMenuItem onSelect={() => setAddDataKind("xyz")}>
+            XYZ Layer
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setAddDataKind("wms")}>
+            WMS Layer
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setAddDataKind("wfs")}>
+            WFS Layer
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setAddDataKind("wmts")}>
+            WMTS Layer
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setAddDataKind("arcgis")}>
+            ArcGIS Layer
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={handleAddStacLayer}>
+            STAC Layer
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel className="text-xs text-muted-foreground">
+            Cloud formats
+          </DropdownMenuLabel>
+          <DropdownMenuItem onSelect={handleAddVectorLayer}>
+            GeoParquet Layer
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={handleAddFlatGeobufLayer}>
+            FlatGeobuf Layer
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={handleAddPMTilesLayer}>
+            PMTiles Layer
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={handleAddZarrLayer}>
+            Zarr Layer
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel className="text-xs text-muted-foreground">
+            3D layers
+          </DropdownMenuLabel>
+          <DropdownMenuItem onSelect={handleAddLidarLayer}>
+            LiDAR Layer
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={handleAddSplattingLayer}>
+            Splatting Layer
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={handleAddThreeDTilesLayer}>
+            3D Tiles Layer
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel className="text-xs text-muted-foreground">
+            Databases
+          </DropdownMenuLabel>
+          <DropdownMenuItem onSelect={handleAddDuckDBLayer}>
+            DuckDB Layer
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setAddDataKind("postgres")}>
+            PostgreSQL Layer
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -572,14 +893,49 @@ export function TopToolbar({
         <DropdownMenuContent align="start">
           <DropdownMenuLabel>Processing</DropdownMenuLabel>
           <DropdownMenuSeparator />
+          <DropdownMenuItem onSelect={() => setProcessingOpen(true)}>
+            Whitebox
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setSqlWorkspaceOpen(true)}>
+            SQL Workspace
+          </DropdownMenuItem>
           <DropdownMenuSub>
-            <DropdownMenuSubTrigger>Whitebox</DropdownMenuSubTrigger>
+            <DropdownMenuSubTrigger>Conversion</DropdownMenuSubTrigger>
             <DropdownMenuSubContent>
-              <DropdownMenuItem onSelect={() => setProcessingOpen(true)}>
-                Toolbox
+              <DropdownMenuItem
+                onSelect={() => setConversionOpen("vector-to-geoparquet")}
+              >
+                Vector to GeoParquet
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => setConversionOpen("vector-to-flatgeobuf")}
+              >
+                Vector to FlatGeobuf
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => setConversionOpen("csv-to-geoparquet")}
+              >
+                CSV to GeoParquet
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => setConversionOpen("vector-to-pmtiles")}
+              >
+                Vector to PMTiles
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => setConversionOpen("raster-to-cog")}
+              >
+                Raster to COG
               </DropdownMenuItem>
             </DropdownMenuSubContent>
           </DropdownMenuSub>
+          <DropdownMenuItem onSelect={handleOpenPlanetaryComputerPanel}>
+            Planetary Computer
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={handleToggleEarthEnginePanel}>
+            Earth Engine
+            {earthEnginePanelVisible ? " ✓" : ""}
+          </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
       <DropdownMenu>
@@ -607,9 +963,37 @@ export function TopToolbar({
             </DropdownMenuItem>
           ))}
           <DropdownMenuSeparator />
-          <DropdownMenuItem onSelect={handleToggleSearchPlaces}>
+          <DropdownMenuItem onSelect={handleToggleSearchPlacesPanel}>
             Search
             {searchPlacesVisible ? " ✓" : ""}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={handleToggleColorbarPanel}>
+            Colorbar
+            {colorbarPanelVisible ? " ✓" : ""}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={handleToggleLegendPanel}>
+            Legend
+            {legendPanelVisible ? " ✓" : ""}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={handleToggleHtmlPanel}>
+            HTML
+            {htmlPanelVisible ? " ✓" : ""}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={handleToggleMeasurePanel}>
+            Measure
+            {measurePanelVisible ? " ✓" : ""}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={handleToggleBookmarkPanel}>
+            Bookmark
+            {bookmarkPanelVisible ? " ✓" : ""}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={handleToggleMinimapPanel}>
+            Minimap
+            {minimapPanelVisible ? " ✓" : ""}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={handleToggleViewStatePanel}>
+            View State
+            {viewStatePanelVisible ? " ✓" : ""}
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -628,56 +1012,86 @@ export function TopToolbar({
         <DropdownMenuContent align="start">
           <DropdownMenuLabel>Activate plugin</DropdownMenuLabel>
           <DropdownMenuSeparator />
-          {plugins.map((p) => {
-            const pluginPosition = getMapControlPosition(p.id);
-            if (!pluginPosition) {
-              return (
-                <DropdownMenuItem
-                  key={p.id}
-                  onClick={() => toggle(p.id, appApi)}
-                >
-                  {p.name}
-                  {isActive(p.id) ? " ✓" : ""}
-                </DropdownMenuItem>
-              );
-            }
-
-            return (
-              <DropdownMenuSub key={p.id}>
-                <DropdownMenuSubTrigger>
-                  {p.name}
-                  {isActive(p.id) ? " ✓" : ""}
-                </DropdownMenuSubTrigger>
-                <DropdownMenuSubContent>
-                  <DropdownMenuItem onClick={() => toggle(p.id, appApi)}>
-                    {isActive(p.id) ? "Deactivate" : "Activate"}
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuLabel>Position</DropdownMenuLabel>
-                  <DropdownMenuRadioGroup
-                    value={pluginPosition}
-                    onValueChange={(position: string) =>
-                      setMapControlPosition(
-                        p.id,
-                        appApi,
-                        position as GeoLibreMapControlPosition,
-                      )
-                    }
+          {(() => {
+            const renderPluginMenuItem = (p: (typeof plugins)[number]) => {
+              const pluginPosition = getMapControlPosition(p.id);
+              if (!pluginPosition) {
+                return (
+                  <DropdownMenuItem
+                    key={p.id}
+                    onClick={() => toggle(p.id, appApi)}
                   >
-                    {PLUGIN_POSITION_ITEMS.map((position) => (
-                      <DropdownMenuRadioItem
-                        key={position.value}
-                        value={position.value}
-                        onSelect={(event) => event.preventDefault()}
-                      >
-                        {position.label}
-                      </DropdownMenuRadioItem>
-                    ))}
-                  </DropdownMenuRadioGroup>
-                </DropdownMenuSubContent>
-              </DropdownMenuSub>
+                    {p.name}
+                    {isActive(p.id) ? " ✓" : ""}
+                  </DropdownMenuItem>
+                );
+              }
+
+              return (
+                <DropdownMenuSub key={p.id}>
+                  <DropdownMenuSubTrigger>
+                    {p.name}
+                    {isActive(p.id) ? " ✓" : ""}
+                  </DropdownMenuSubTrigger>
+                  <DropdownMenuSubContent>
+                    <DropdownMenuItem onClick={() => toggle(p.id, appApi)}>
+                      {isActive(p.id) ? "Deactivate" : "Activate"}
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuLabel>Position</DropdownMenuLabel>
+                    <DropdownMenuRadioGroup
+                      value={pluginPosition}
+                      onValueChange={(position: string) =>
+                        setMapControlPosition(
+                          p.id,
+                          appApi,
+                          position as GeoLibreMapControlPosition,
+                        )
+                      }
+                    >
+                      {PLUGIN_POSITION_ITEMS.map((position) => (
+                        <DropdownMenuRadioItem
+                          key={position.value}
+                          value={position.value}
+                          onSelect={(event) => event.preventDefault()}
+                        >
+                          {position.label}
+                        </DropdownMenuRadioItem>
+                      ))}
+                    </DropdownMenuRadioGroup>
+                  </DropdownMenuSubContent>
+                </DropdownMenuSub>
+              );
+            };
+
+            const webServicePlugins = plugins.filter((p) =>
+              WEB_SERVICE_PLUGIN_ID_SET.has(p.id),
             );
-          })}
+            // The web service plugins render as one grouped submenu, placed
+            // where the first of them appears in registration order (just
+            // above Esri Wayback).
+            let webServicesRendered = false;
+            return plugins.map((p) => {
+              if (!WEB_SERVICE_PLUGIN_ID_SET.has(p.id)) {
+                return renderPluginMenuItem(p);
+              }
+              if (webServicesRendered) return null;
+              webServicesRendered = true;
+              return (
+                <DropdownMenuSub key="web-services">
+                  <DropdownMenuSubTrigger>
+                    Web Services
+                    {webServicePlugins.some((plugin) => isActive(plugin.id))
+                      ? " ✓"
+                      : ""}
+                  </DropdownMenuSubTrigger>
+                  <DropdownMenuSubContent>
+                    {webServicePlugins.map(renderPluginMenuItem)}
+                  </DropdownMenuSubContent>
+                </DropdownMenuSub>
+              );
+            });
+          })()}
         </DropdownMenuContent>
       </DropdownMenu>
       <SettingsDialog
@@ -688,6 +1102,51 @@ export function TopToolbar({
         mapControllerRef={mapControllerRef}
         showLabels={showLabels}
       />
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            className={toolbarButtonClass}
+            variant="ghost"
+            size={toolbarButtonSize}
+            aria-label="Help"
+          >
+            <CircleHelp className={toolbarIconClassName} />
+            {renderToolbarLabel("Help")}
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start">
+          <DropdownMenuLabel>Help</DropdownMenuLabel>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onSelect={onOpenDiagnostics}>
+            <Bug className="mr-2 h-3.5 w-3.5" />
+            Diagnostics
+            {diagnosticsErrorCount > 0 ? (
+              <span className="ml-2 rounded bg-destructive px-1.5 py-0.5 text-[10px] leading-none text-destructive-foreground">
+                {diagnosticsErrorCount}
+              </span>
+            ) : null}
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onSelect={() => void openExternalLink(FEEDBACK_URL)}
+          >
+            <MessageSquare className="mr-2 h-3.5 w-3.5" />
+            Give feedback
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onSelect={() => {
+              setAboutOpen(true);
+              setCheckForUpdatesRequest((value) => value + 1);
+            }}
+          >
+            <RefreshCw className="mr-2 h-3.5 w-3.5" />
+            Check for updates
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setAboutOpen(true)}>
+            <Info className="mr-2 h-3.5 w-3.5" />
+            About
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
       <AddDataDialog
         kind={addDataKind}
         mapControllerRef={mapControllerRef}
@@ -755,7 +1214,7 @@ export function TopToolbar({
       >
         <DialogContent className="max-w-lg">
           <DialogHeader>
-            <DialogTitle>Could not open project</DialogTitle>
+            <DialogTitle>Something went wrong</DialogTitle>
             <DialogDescription>{actionError}</DialogDescription>
           </DialogHeader>
           <div className="flex justify-end">
@@ -764,10 +1223,10 @@ export function TopToolbar({
         </DialogContent>
       </Dialog>
       <AboutDialog
-        buttonClassName={toolbarButtonClass}
-        buttonSize={toolbarButtonSize}
-        iconClassName={toolbarIconClassName}
-        showLabels={showLabels}
+        checkForUpdatesRequest={checkForUpdatesRequest}
+        open={aboutOpen}
+        renderTrigger={false}
+        onOpenChange={setAboutOpen}
       />
       <div className="ml-auto flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
         <Button
@@ -806,7 +1265,9 @@ export function TopToolbar({
               }}
             />
             {projectPath ? (
-              <span className="hidden truncate lg:inline">{projectPath}</span>
+              <span className="hidden truncate lg:inline" title={projectPath}>
+                {projectPath}
+              </span>
             ) : null}
           </>
         ) : null}

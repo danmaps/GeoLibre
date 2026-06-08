@@ -1,15 +1,19 @@
 import { parseProject, type GeoLibreProject } from "@geolibre/core";
+import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   readFile,
   readTextFile,
+  readTextFileLines,
   writeFile,
   writeTextFile,
 } from "@tauri-apps/plugin-fs";
 import { unzip } from "fflate";
 import type { FeatureCollection } from "geojson";
 import shp from "shpjs";
+import { parseDelimitedTextFields } from "./delimited-text";
 import type { DuckDbVectorFile } from "./duckdb-vector-loader";
+import { parseGpxLayer } from "./gpx";
 
 export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -96,6 +100,12 @@ interface SaveBinaryFileOptions extends SaveTextFileOptions {}
 
 const SHAPEFILE_SIDECAR_EXTENSIONS = ["dbf", "shx", "prj", "cpg"];
 
+export interface LoadedVectorLayer {
+  data: FeatureCollection;
+  name?: string;
+  path: string;
+}
+
 // Auxiliary files that accompany Shapefiles (spatial indexes, metadata, etc.)
 // but are never standalone vector layers. Skipping them keeps a single such
 // file from aborting an otherwise valid drag-and-drop import.
@@ -118,7 +128,7 @@ function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
 
-function isHttpUrl(path: string): boolean {
+export function isHttpUrl(path: string): boolean {
   try {
     const url = new URL(path);
     return url.protocol === "http:" || url.protocol === "https:";
@@ -144,7 +154,8 @@ function isGeoLibreProjectFile(path: string): boolean {
 
 function isVectorFileName(path: string): boolean {
   if (isGeoLibreProjectFile(path)) return false;
-  if (browserSafeFileName(path).toLowerCase().endsWith(".shp.xml")) return false;
+  if (browserSafeFileName(path).toLowerCase().endsWith(".shp.xml"))
+    return false;
   return !NON_VECTOR_SIDECAR_EXTENSIONS.includes(fileExtension(path));
 }
 
@@ -157,7 +168,9 @@ function assertFeatureCollection(value: unknown): FeatureCollection {
   ) {
     return value as FeatureCollection;
   }
-  throw new Error("The selected file did not produce a GeoJSON FeatureCollection.");
+  throw new Error(
+    "The selected file did not produce a GeoJSON FeatureCollection.",
+  );
 }
 
 // DuckDB-wasm (pthreads build) can hand back a Uint8Array backed by a
@@ -185,10 +198,33 @@ function normalizeShapefileResult(value: unknown): FeatureCollection {
   return assertFeatureCollection(value);
 }
 
-async function parseGeoJsonText(
-  text: string,
-): Promise<FeatureCollection> {
+async function parseGeoJsonText(text: string): Promise<FeatureCollection> {
   return assertFeatureCollection(JSON.parse(text));
+}
+
+function parseGpxText(text: string): FeatureCollection {
+  const result = parseGpxLayer(text);
+  return mergeFeatureCollections([
+    result.waypoints,
+    result.tracks,
+    result.routes,
+  ]);
+}
+
+function parseGpxTextLayers(text: string, path: string): LoadedVectorLayer[] {
+  const result = parseGpxLayer(text);
+  const baseName = pathWithoutExtension(browserSafeFileName(path)) || "GPX";
+  return [
+    { data: result.waypoints, label: "Waypoints" },
+    { data: result.tracks, label: "Tracks" },
+    { data: result.routes, label: "Routes" },
+  ]
+    .filter((layer) => layer.data.features.length > 0)
+    .map((layer) => ({
+      data: layer.data,
+      name: `${baseName} ${layer.label}`,
+      path,
+    }));
 }
 
 async function parseShapefileZip(
@@ -270,10 +306,7 @@ async function fileToDuckDbVectorFile(file: File): Promise<DuckDbVectorFile> {
 async function loadBrowserVectorFile(
   file: File,
   siblingFiles: DuckDbVectorFile[] = [],
-): Promise<{
-  data: FeatureCollection;
-  path: string;
-}> {
+): Promise<LoadedVectorLayer> {
   const extension = fileExtension(file.name);
   if (extension === "geojson" || extension === "json") {
     try {
@@ -301,6 +334,13 @@ async function loadBrowserVectorFile(
   if (extension === "kmz") {
     return {
       data: await parseKmz(await file.arrayBuffer()),
+      path: file.name,
+    };
+  }
+
+  if (extension === "gpx") {
+    return {
+      data: parseGpxText(await file.text()),
       path: file.name,
     };
   }
@@ -388,6 +428,18 @@ async function loadTauriVectorFile(path: string): Promise<{
     } catch (error) {
       const detail = error instanceof Error ? error.message : "Unknown error";
       throw new Error(`Could not read this KMZ file. ${detail}`);
+    }
+  }
+
+  if (extension === "gpx") {
+    try {
+      return {
+        data: parseGpxText(await readTextFile(path)),
+        path,
+      };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Unknown error";
+      throw new Error(`Could not read this GPX file. ${detail}`);
     }
   }
 
@@ -757,7 +809,10 @@ export async function openRecentProjectFile(
     // Only a present Content-Length lets us guard up front. `Number(null)` is
     // 0, which would silently pass for chunked/CDN responses that omit it.
     const contentLength = response.headers.get("content-length");
-    if (contentLength !== null && Number(contentLength) > MAX_PROJECT_URL_BYTES) {
+    if (
+      contentLength !== null &&
+      Number(contentLength) > MAX_PROJECT_URL_BYTES
+    ) {
       throw new Error("Project file is too large to load (over 25 MB).");
     }
 
@@ -779,10 +834,12 @@ export async function openRecentProjectFile(
 
   let text: string;
   try {
-    text = await readTextFile(path);
+    text = await invoke<string>("read_project_file", { path });
   } catch (error) {
     if (isFileMissingError(error)) {
-      throw new RecentProjectGoneError(`Project file no longer exists: ${path}`);
+      throw new RecentProjectGoneError(
+        `Project file no longer exists: ${path}`,
+      );
     }
     throw error;
   }
@@ -803,6 +860,22 @@ export async function saveProjectFile(
     defaultPath: defaultName ?? "project.geolibre.json",
   });
   if (!path) return null;
+  await writeTextFile(path, content);
+  return path;
+}
+
+/**
+ * Save a project directly to an already-known local path without prompting.
+ * Falls back to the save dialog when not running in Tauri (the browser never
+ * has a writable filesystem path) or when the path is an HTTP(S) URL.
+ */
+export async function saveProjectFileToPath(
+  content: string,
+  path: string,
+): Promise<string | null> {
+  if (!isTauri() || isHttpUrl(path)) {
+    return saveProjectFile(content, path);
+  }
   await writeTextFile(path, content);
   return path;
 }
@@ -884,11 +957,9 @@ export async function openVectorFileWithFallback(): Promise<{
 
 export async function loadDroppedVectorFiles(
   droppedFiles: FileList | File[],
-): Promise<Array<{ data: FeatureCollection; path: string }>> {
+): Promise<LoadedVectorLayer[]> {
   const droppedFileArray = Array.from(droppedFiles);
-  const files = droppedFileArray.filter((file) =>
-    isVectorFileName(file.name),
-  );
+  const files = droppedFileArray.filter((file) => isVectorFileName(file.name));
   if (!files.length) return [];
 
   const filesByBaseName = new Map<string, File[]>();
@@ -900,17 +971,23 @@ export async function loadDroppedVectorFiles(
     ]);
   }
 
-  const layers: Array<{ data: FeatureCollection; path: string }> = [];
+  const layers: LoadedVectorLayer[] = [];
   for (const file of files) {
     const extension = fileExtension(file.name);
     if (SHAPEFILE_SIDECAR_EXTENSIONS.includes(extension)) continue;
+
+    if (extension === "gpx") {
+      layers.push(...parseGpxTextLayers(await file.text(), file.name));
+      continue;
+    }
 
     const siblingFiles =
       extension === "shp"
         ? await Promise.all(
             (
-              filesByBaseName.get(pathWithoutExtension(file.name).toLowerCase()) ??
-              []
+              filesByBaseName.get(
+                pathWithoutExtension(file.name).toLowerCase(),
+              ) ?? []
             )
               .filter((candidate) =>
                 SHAPEFILE_SIDECAR_EXTENSIONS.includes(
@@ -928,15 +1005,72 @@ export async function loadDroppedVectorFiles(
 
 export async function loadDroppedVectorPaths(
   paths: string[],
-): Promise<Array<{ data: FeatureCollection; path: string }>> {
+): Promise<LoadedVectorLayer[]> {
   const vectorPaths = paths.filter(isVectorFileName);
   if (!vectorPaths.length) return [];
 
-  const layers: Array<{ data: FeatureCollection; path: string }> = [];
+  const layers: LoadedVectorLayer[] = [];
   for (const path of vectorPaths) {
-    if (SHAPEFILE_SIDECAR_EXTENSIONS.includes(fileExtension(path))) continue;
+    const extension = fileExtension(path);
+    if (SHAPEFILE_SIDECAR_EXTENSIONS.includes(extension)) continue;
+    if (extension === "gpx") {
+      try {
+        layers.push(...parseGpxTextLayers(await readTextFile(path), path));
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : "Unknown error";
+        throw new Error(`Could not read this GPX file. ${detail}`);
+      }
+      continue;
+    }
     layers.push(await loadTauriVectorFile(path));
   }
 
   return layers;
+}
+
+/** Split a CSV/TSV header line into trimmed column names. */
+export function parseCsvHeaderLine(line: string): string[] {
+  const header = line.replace(/^﻿/, "").replace(/[\r\n]+$/, "");
+  if (!header) return [];
+  // Reuse the project's quote-aware delimited-text parser for each candidate
+  // delimiter (comma, tab, semicolon) and keep the one that yields the most
+  // columns. Quoting is respected, so a quoted field containing the delimiter
+  // (e.g. "city,state") neither skews detection nor splits the header.
+  let best: string[] = [];
+  for (const delimiter of [",", "\t", ";"]) {
+    try {
+      const fields = parseDelimitedTextFields(header, delimiter).filter(
+        (name) => name.trim().length > 0,
+      );
+      if (fields.length > best.length) best = fields;
+    } catch {
+      // No header row for this delimiter; try the next candidate.
+    }
+  }
+  return best.map((name) => name.trim()).filter((name) => name.length > 0);
+}
+
+/**
+ * Read the header column names of a CSV from a browser File or a desktop path.
+ * Reads only the first line so large CSVs are not loaded into memory.
+ */
+export async function readCsvHeaderColumns(
+  source: File | string,
+): Promise<string[]> {
+  try {
+    if (typeof source !== "string") {
+      // Browser File: decode just the leading slice that holds the header.
+      const text = await source.slice(0, 65536).text();
+      return parseCsvHeaderLine(text.split(/\r?\n/, 1)[0] ?? "");
+    }
+    if (!isTauri()) return [];
+    const lines = await readTextFileLines(source);
+    for await (const line of lines) {
+      return parseCsvHeaderLine(line);
+    }
+    return [];
+  } catch (error) {
+    console.warn("Could not read CSV header", error);
+    return [];
+  }
 }

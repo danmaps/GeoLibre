@@ -1,8 +1,10 @@
 import {
   DEFAULT_PROJECT_PREFERENCES,
+  isAllowedPluginManifestUrl,
   PROJECT_VERSION,
   useAppStore,
   type MapPreferences,
+  type ProjectPluginState,
   type ProjectPreferences,
   type RuntimeEnvironmentVariable,
 } from "@geolibre/core";
@@ -14,10 +16,14 @@ import {
   DialogHeader,
   DialogTitle,
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
   Input,
   Label,
@@ -29,24 +35,37 @@ import {
   Eye,
   EyeOff,
   FolderCog,
-  LogIn,
-  LogOut,
   MapPinned,
+  LayoutPanelTop,
+  PanelLeft,
+  PanelRight,
   Plus,
   RotateCcw,
   Settings,
+  TableProperties,
+  Type,
   Trash2,
   TriangleAlert,
-  User,
+  Puzzle,
+  FolderOpen,
 } from "lucide-react";
-import { useEffect, useMemo, useState, useImperativeHandle, forwardRef, type RefObject } from "react";
-import { useArcGISOAuth } from "../../hooks/useArcGISOAuth";
+import { useEffect, useMemo, useState, type RefObject } from "react";
+import {
+  DEFAULT_DESKTOP_LAYOUT_SETTINGS,
+  useDesktopSettingsStore,
+  type DesktopSettings,
+  type DesktopLayoutSettings,
+} from "../../hooks/useDesktopSettings";
+import { getPluginManager } from "../../hooks/usePlugins";
+import { mergeStringLists, normalizeStringList } from "../../lib/string-lists";
+import { pickLocalPathWithFallback } from "../../lib/tauri-io";
 
-type SettingsSection = "map" | "environment" | "project" | "account";
-
-export interface SettingsDialogHandle {
-  openAccountSettings: () => void;
-}
+type SettingsSection =
+  | "map"
+  | "layout"
+  | "environment"
+  | "plugins"
+  | "project";
 
 interface SettingsDialogProps {
   buttonClassName?: string;
@@ -62,9 +81,10 @@ const SECTION_ITEMS: Array<{
   icon: typeof MapPinned;
 }> = [
   { id: "map", label: "Map", icon: MapPinned },
+  { id: "layout", label: "Layout", icon: LayoutPanelTop },
   { id: "environment", label: "Environment", icon: Braces },
+  { id: "plugins", label: "Plugins", icon: Puzzle },
   { id: "project", label: "Project", icon: FolderCog },
-  { id: "account", label: "Account", icon: User },
 ];
 
 const VARIABLE_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -79,6 +99,24 @@ interface DraftEnvironmentVariable extends RuntimeEnvironmentVariable {
 interface DraftPreferences {
   map: MapPreferences;
   environmentVariables: DraftEnvironmentVariable[];
+}
+
+// Draft plugin-source rows carry the same stable client-side id as draft env
+// vars so React keys survive mid-list deletes instead of reusing input DOM
+// state across the wrong row.
+interface DraftListEntry {
+  id: string;
+  value: string;
+}
+
+interface DraftDesktopSettings {
+  additionalPluginDirectories: DraftListEntry[];
+  layout: DesktopLayoutSettings;
+  pluginManifestUrls: DraftListEntry[];
+}
+
+function toDraftListEntry(value: string): DraftListEntry {
+  return { id: createDraftId(), value };
 }
 
 function createDraftId(): string {
@@ -97,7 +135,24 @@ function clonePreferences(preferences: ProjectPreferences): DraftPreferences {
   };
 }
 
-function normalizeBounds(bounds: MapPreferences["bounds"]): MapPreferences["bounds"] {
+function cloneDesktopSettings(
+  settings: DesktopSettings,
+  projectPlugins: ProjectPluginState | null,
+): DraftDesktopSettings {
+  return {
+    additionalPluginDirectories:
+      settings.additionalPluginDirectories.map(toDraftListEntry),
+    layout: { ...settings.layout },
+    pluginManifestUrls: mergeStringLists(
+      projectPlugins?.manifestUrls ?? [],
+      settings.pluginManifestUrls,
+    ).map(toDraftListEntry),
+  };
+}
+
+function normalizeBounds(
+  bounds: MapPreferences["bounds"],
+): MapPreferences["bounds"] {
   const west = clamp(bounds[0], -180, 180);
   const south = clamp(bounds[1], -85, 85);
   const east = clamp(bounds[2], -180, 180);
@@ -160,25 +215,48 @@ function validateEnvironmentVariables(
   return null;
 }
 
-export const SettingsDialog = forwardRef<SettingsDialogHandle, SettingsDialogProps>(
-function SettingsDialog({
+function validatePluginManifestUrls(urls: string[]): string | null {
+  for (const url of urls) {
+    if (!url.trim()) continue;
+    try {
+      new URL(url.trim());
+    } catch {
+      return "Plugin manifest URLs must be valid absolute URLs.";
+    }
+    if (!isAllowedPluginManifestUrl(url.trim())) {
+      return "Plugin manifest URLs must use HTTPS, or HTTP on localhost, 127.0.0.1, or [::1].";
+    }
+  }
+  return null;
+}
+
+export function SettingsDialog({
   buttonClassName,
   buttonSize = "sm",
   iconClassName,
   mapControllerRef,
   showLabels = true,
-}: SettingsDialogProps, ref) {
+}: SettingsDialogProps) {
   const preferences = useAppStore((s) => s.preferences);
   const setPreferences = useAppStore((s) => s.setPreferences);
+  const desktopSettings = useDesktopSettingsStore((s) => s.desktopSettings);
+  const setDesktopSettings = useDesktopSettingsStore(
+    (s) => s.setDesktopSettings,
+  );
+  const projectPlugins = useAppStore((s) => s.projectPlugins);
+  const setProjectPlugins = useAppStore((s) => s.setProjectPlugins);
   const projectName = useAppStore((s) => s.projectName);
   const projectPath = useAppStore((s) => s.projectPath);
   const setProjectName = useAppStore((s) => s.setProjectName);
   const [open, setOpen] = useState(false);
   const [section, setSection] = useState<SettingsSection>("map");
-  const arcGISOAuth = useArcGISOAuth();
   const [draftPreferences, setDraftPreferences] = useState<DraftPreferences>(
     () => clonePreferences(preferences),
   );
+  const [draftDesktopSettings, setDraftDesktopSettings] =
+    useState<DraftDesktopSettings>(() =>
+      cloneDesktopSettings(desktopSettings, projectPlugins),
+    );
   const [draftProjectName, setDraftProjectName] = useState(projectName);
   const [error, setError] = useState<string | null>(null);
   // Ids of variables whose value is temporarily revealed; values are masked
@@ -194,19 +272,18 @@ function SettingsDialog({
     [draftPreferences.environmentVariables],
   );
 
-  useImperativeHandle(ref, () => ({
-    openAccountSettings: () => {
-      setSection("account");
-      setOpen(true);
-    },
-  }));
-
   // Seed the draft from the store only when the dialog opens. Depending on
   // preferences/projectName would reset in-progress edits if the store changed
   // while the dialog is open (e.g. a slow ?url= project finishes loading).
   useEffect(() => {
     if (!open) return;
     setDraftPreferences(clonePreferences(useAppStore.getState().preferences));
+    setDraftDesktopSettings(
+      cloneDesktopSettings(
+        useDesktopSettingsStore.getState().desktopSettings,
+        useAppStore.getState().projectPlugins,
+      ),
+    );
     setDraftProjectName(useAppStore.getState().projectName);
     setRevealedValueIds(new Set());
     setError(null);
@@ -232,10 +309,7 @@ function SettingsDialog({
     setError(null);
   };
 
-  const updateBoundsValue = (
-    index: number,
-    value: number,
-  ) => {
+  const updateBoundsValue = (index: number, value: number) => {
     // Ignore a cleared field (valueAsNumber is NaN) so it does not silently
     // become an edge-of-range value on save; the last valid value is kept.
     if (!Number.isFinite(value)) return;
@@ -285,6 +359,81 @@ function SettingsDialog({
     setError(null);
   };
 
+  const updatePluginDirectory = (index: number, path: string) => {
+    setDraftDesktopSettings((current) => ({
+      ...current,
+      additionalPluginDirectories: current.additionalPluginDirectories.map(
+        (entry, i) => (i === index ? { ...entry, value: path } : entry),
+      ),
+    }));
+    setError(null);
+  };
+
+  const addPluginDirectory = () => {
+    setDraftDesktopSettings((current) => ({
+      ...current,
+      additionalPluginDirectories: [
+        ...current.additionalPluginDirectories,
+        toDraftListEntry(""),
+      ],
+    }));
+    setSection("plugins");
+    setError(null);
+  };
+
+  const browsePluginDirectory = async (index: number) => {
+    try {
+      const path = await pickLocalPathWithFallback({ directory: true });
+      if (!path) return;
+      updatePluginDirectory(index, path);
+    } catch (error) {
+      setError(
+        error instanceof Error
+          ? error.message
+          : "Could not open the directory picker.",
+      );
+    }
+  };
+
+  const removePluginDirectory = (index: number) => {
+    setDraftDesktopSettings((current) => ({
+      ...current,
+      additionalPluginDirectories: current.additionalPluginDirectories.filter(
+        (_, i) => i !== index,
+      ),
+    }));
+    setError(null);
+  };
+
+  const updatePluginManifestUrl = (index: number, url: string) => {
+    setDraftDesktopSettings((current) => ({
+      ...current,
+      pluginManifestUrls: current.pluginManifestUrls.map((entry, i) =>
+        i === index ? { ...entry, value: url } : entry,
+      ),
+    }));
+    setError(null);
+  };
+
+  const addPluginManifestUrl = () => {
+    setDraftDesktopSettings((current) => ({
+      ...current,
+      pluginManifestUrls: [...current.pluginManifestUrls, toDraftListEntry("")],
+    }));
+    setSection("plugins");
+    setError(null);
+  };
+
+  const removePluginManifestUrl = (index: number) => {
+    setDraftDesktopSettings((current) => ({
+      ...current,
+      pluginManifestUrls: current.pluginManifestUrls.filter(
+        (_, i) => i !== index,
+      ),
+    }));
+    setError(null);
+  };
+
   const applyCurrentViewBounds = () => {
     const bounds = mapControllerRef.current?.readView().bbox;
     if (!bounds) {
@@ -306,6 +455,28 @@ function SettingsDialog({
     updateMapPreferences(DEFAULT_PROJECT_PREFERENCES.map);
   };
 
+  const updateDraftLayoutSettings = (patch: Partial<DesktopLayoutSettings>) => {
+    setDraftDesktopSettings((current) => ({
+      ...current,
+      layout: { ...current.layout, ...patch },
+    }));
+    setError(null);
+  };
+
+  const updateSavedLayoutSettings = (patch: Partial<DesktopLayoutSettings>) => {
+    // Read the latest state synchronously so rapid successive toggles do not
+    // overwrite each other with a stale render-closure snapshot.
+    const current = useDesktopSettingsStore.getState().desktopSettings;
+    setDesktopSettings({
+      ...current,
+      layout: { ...current.layout, ...patch },
+    });
+  };
+
+  const resetLayoutSettings = () => {
+    updateDraftLayoutSettings(DEFAULT_DESKTOP_LAYOUT_SETTINGS);
+  };
+
   const saveSettings = () => {
     const normalized = normalizePreferences(draftPreferences);
     const validationError = validateEnvironmentVariables(
@@ -317,9 +488,33 @@ function SettingsDialog({
       return;
     }
 
+    const pluginManifestUrls = normalizeStringList(
+      draftDesktopSettings.pluginManifestUrls.map((entry) => entry.value),
+    );
+    const manifestUrlValidationError =
+      validatePluginManifestUrls(pluginManifestUrls);
+    if (manifestUrlValidationError) {
+      setError(manifestUrlValidationError);
+      setSection("plugins");
+      return;
+    }
+
     const nextProjectName = draftProjectName.trim() || "Untitled Project";
     if (nextProjectName !== projectName) setProjectName(nextProjectName);
     setPreferences(normalized);
+    setDesktopSettings({
+      additionalPluginDirectories: normalizeStringList(
+        draftDesktopSettings.additionalPluginDirectories.map(
+          (entry) => entry.value,
+        ),
+      ),
+      layout: draftDesktopSettings.layout,
+      pluginManifestUrls,
+    });
+    setProjectPlugins({
+      ...getPluginManager().getProjectState(),
+      manifestUrls: pluginManifestUrls,
+    });
     setOpen(false);
   };
 
@@ -359,7 +554,7 @@ function SettingsDialog({
             ) : null}
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="start">
+        <DropdownMenuContent align="start" className="w-56">
           <DropdownMenuLabel>Settings</DropdownMenuLabel>
           <DropdownMenuSeparator />
           <DropdownMenuItem
@@ -371,6 +566,81 @@ function SettingsDialog({
             <MapPinned className="mr-2 h-3.5 w-3.5" />
             Map Preferences
           </DropdownMenuItem>
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>
+              <LayoutPanelTop className="mr-2 h-3.5 w-3.5" />
+              Layout
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent className="geolibre-layout-submenu w-40 sm:w-72">
+              <DropdownMenuCheckboxItem
+                checked={desktopSettings.layout.toolbarLabels}
+                onCheckedChange={(checked) =>
+                  updateSavedLayoutSettings({ toolbarLabels: checked === true })
+                }
+                onSelect={(event) => event.preventDefault()}
+              >
+                Show toolbar labels
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={desktopSettings.layout.showProjectInfo}
+                onCheckedChange={(checked) =>
+                  updateSavedLayoutSettings({
+                    showProjectInfo: checked === true,
+                  })
+                }
+                onSelect={(event) => event.preventDefault()}
+              >
+                Show project info
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuCheckboxItem
+                checked={desktopSettings.layout.layerPanelVisible}
+                onCheckedChange={(checked) =>
+                  updateSavedLayoutSettings({
+                    layerPanelVisible: checked === true,
+                  })
+                }
+                onSelect={(event) => event.preventDefault()}
+              >
+                Show Layers panel
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={desktopSettings.layout.stylePanelVisible}
+                onCheckedChange={(checked) =>
+                  updateSavedLayoutSettings({
+                    stylePanelVisible: checked === true,
+                  })
+                }
+                onSelect={(event) => event.preventDefault()}
+              >
+                Show Style panel
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={desktopSettings.layout.attributePanelVisible}
+                onCheckedChange={(checked) =>
+                  updateSavedLayoutSettings({
+                    attributePanelVisible: checked === true,
+                  })
+                }
+                onSelect={(event) => event.preventDefault()}
+              >
+                Show Attribute panel
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onSelect={() => {
+                  setSection("layout");
+                  setOpen(true);
+                }}
+              >
+                Layout Settings
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel className="px-2 py-1 text-xs font-normal text-muted-foreground">
+                URL layout parameters override saved settings.
+              </DropdownMenuLabel>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
           <DropdownMenuItem
             onSelect={() => {
               setSection("environment");
@@ -382,6 +652,15 @@ function SettingsDialog({
           </DropdownMenuItem>
           <DropdownMenuItem
             onSelect={() => {
+              setSection("plugins");
+              setOpen(true);
+            }}
+          >
+            <Puzzle className="mr-2 h-3.5 w-3.5" />
+            Plugin Directories
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onSelect={() => {
               setSection("project");
               setOpen(true);
             }}
@@ -389,24 +668,13 @@ function SettingsDialog({
             <FolderCog className="mr-2 h-3.5 w-3.5" />
             Project Settings
           </DropdownMenuItem>
-          {arcGISOAuth.clientId ? (
-            <>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem
-                onSelect={() => {
-                  setSection("account");
-                  setOpen(true);
-                }}
-              >
-                <User className="mr-2 h-3.5 w-3.5" />
-                Account
-              </DropdownMenuItem>
-            </>
-          ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="max-h-[min(88vh,760px)] max-w-3xl overflow-hidden p-0">
+        <DialogContent
+          className="max-h-[min(88vh,760px)] max-w-3xl"
+          bodyClassName="overflow-hidden p-0"
+        >
           <DialogHeader className="border-b px-6 pb-4 pt-6">
             <DialogTitle>Settings</DialogTitle>
             <DialogDescription>
@@ -552,6 +820,113 @@ function SettingsDialog({
                   </label>
                 </div>
               ) : null}
+              {section === "layout" ? (
+                <div className="space-y-5">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-semibold">Layout</h3>
+                      <p className="text-xs text-muted-foreground">
+                        Workspace visibility and toolbar presentation.
+                      </p>
+                    </div>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={resetLayoutSettings}
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" />
+                      Reset
+                    </Button>
+                  </div>
+                  <div className="space-y-3">
+                    <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      Toolbar
+                    </h4>
+                    <label className="flex items-center gap-3 rounded-md border p-3 text-sm">
+                      <input
+                        className="h-4 w-4"
+                        type="checkbox"
+                        checked={draftDesktopSettings.layout.toolbarLabels}
+                        onChange={(event) =>
+                          updateDraftLayoutSettings({
+                            toolbarLabels: event.target.checked,
+                          })
+                        }
+                      />
+                      <Type className="h-4 w-4 text-muted-foreground" />
+                      <span>Show toolbar labels</span>
+                    </label>
+                    <label className="flex items-center gap-3 rounded-md border p-3 text-sm">
+                      <input
+                        className="h-4 w-4"
+                        type="checkbox"
+                        checked={draftDesktopSettings.layout.showProjectInfo}
+                        onChange={(event) =>
+                          updateDraftLayoutSettings({
+                            showProjectInfo: event.target.checked,
+                          })
+                        }
+                      />
+                      <FolderCog className="h-4 w-4 text-muted-foreground" />
+                      <span>Show project info in the toolbar</span>
+                    </label>
+                  </div>
+                  <div className="space-y-3">
+                    <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      Panels
+                    </h4>
+                    <label className="flex items-center gap-3 rounded-md border p-3 text-sm">
+                      <input
+                        className="h-4 w-4"
+                        type="checkbox"
+                        checked={draftDesktopSettings.layout.layerPanelVisible}
+                        onChange={(event) =>
+                          updateDraftLayoutSettings({
+                            layerPanelVisible: event.target.checked,
+                          })
+                        }
+                      />
+                      <PanelLeft className="h-4 w-4 text-muted-foreground" />
+                      <span>Show Layers panel</span>
+                    </label>
+                    <label className="flex items-center gap-3 rounded-md border p-3 text-sm">
+                      <input
+                        className="h-4 w-4"
+                        type="checkbox"
+                        checked={draftDesktopSettings.layout.stylePanelVisible}
+                        onChange={(event) =>
+                          updateDraftLayoutSettings({
+                            stylePanelVisible: event.target.checked,
+                          })
+                        }
+                      />
+                      <PanelRight className="h-4 w-4 text-muted-foreground" />
+                      <span>Show Style panel</span>
+                    </label>
+                    <label className="flex items-center gap-3 rounded-md border p-3 text-sm">
+                      <input
+                        className="h-4 w-4"
+                        type="checkbox"
+                        checked={
+                          draftDesktopSettings.layout.attributePanelVisible
+                        }
+                        onChange={(event) =>
+                          updateDraftLayoutSettings({
+                            attributePanelVisible: event.target.checked,
+                          })
+                        }
+                      />
+                      <TableProperties className="h-4 w-4 text-muted-foreground" />
+                      <span>Show Attribute panel</span>
+                    </label>
+                  </div>
+                  <div className="rounded-md border bg-muted/40 p-3 text-xs text-muted-foreground">
+                    URL layout parameters still apply when present in shared
+                    viewer links.
+                  </div>
+                </div>
+              ) : null}
               {section === "environment" ? (
                 <div className="space-y-5">
                   <div className="flex items-center justify-between gap-3">
@@ -666,6 +1041,150 @@ function SettingsDialog({
                   )}
                 </div>
               ) : null}
+              {section === "plugins" ? (
+                <div className="space-y-5">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-semibold">Plugin sources</h3>
+                      <p className="text-xs text-muted-foreground">
+                        Extra local directories and web manifest URLs scanned
+                        for external plugins.
+                      </p>
+                    </div>
+                  </div>
+                  <div className="rounded-md border bg-muted/40 p-3 text-xs text-muted-foreground">
+                    GeoLibre always scans its app data plugins directory. These
+                    local directories are desktop-only settings and are not
+                    saved into project files. Manifest URLs are saved with the
+                    project so reloading a project can fetch its external
+                    plugins before restoring active plugin state. Desktop
+                    directories can contain `.zip` plugin bundles, unpacked
+                    plugin bundle folders, or be an unpacked plugin bundle with
+                    a root `plugin.json`.
+                  </div>
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                        Local directories
+                      </h4>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={addPluginDirectory}
+                      >
+                        <Plus className="h-3.5 w-3.5" />
+                        Add
+                      </Button>
+                    </div>
+                    {draftDesktopSettings.additionalPluginDirectories.length ===
+                    0 ? (
+                      <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+                        No additional plugin directories configured.
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        {draftDesktopSettings.additionalPluginDirectories.map(
+                          (entry, index) => (
+                            <div
+                              key={entry.id}
+                              className="grid grid-cols-[minmax(10rem,1fr)_2rem_2rem] items-center gap-2"
+                            >
+                              <Input
+                                aria-label="Plugin directory"
+                                placeholder="/path/to/geolibre-plugin"
+                                value={entry.value}
+                                onChange={(event) =>
+                                  updatePluginDirectory(
+                                    index,
+                                    event.target.value,
+                                  )
+                                }
+                              />
+                              <Button
+                                aria-label="Browse plugin directory"
+                                className="h-8 w-8"
+                                type="button"
+                                size="icon"
+                                variant="ghost"
+                                onClick={() =>
+                                  void browsePluginDirectory(index)
+                                }
+                              >
+                                <FolderOpen className="h-3.5 w-3.5" />
+                              </Button>
+                              <Button
+                                aria-label="Remove plugin directory"
+                                className="h-8 w-8"
+                                type="button"
+                                size="icon"
+                                variant="ghost"
+                                onClick={() => removePluginDirectory(index)}
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
+                          ),
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                        Manifest URLs
+                      </h4>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={addPluginManifestUrl}
+                      >
+                        <Plus className="h-3.5 w-3.5" />
+                        Add
+                      </Button>
+                    </div>
+                    {draftDesktopSettings.pluginManifestUrls.length === 0 ? (
+                      <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+                        No plugin manifest URLs configured.
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        {draftDesktopSettings.pluginManifestUrls.map(
+                          (entry, index) => (
+                            <div
+                              key={entry.id}
+                              className="grid grid-cols-[minmax(10rem,1fr)_2rem] items-center gap-2"
+                            >
+                              <Input
+                                aria-label="Plugin manifest URL"
+                                placeholder="https://example.com/plugin/plugin.json"
+                                value={entry.value}
+                                onChange={(event) =>
+                                  updatePluginManifestUrl(
+                                    index,
+                                    event.target.value,
+                                  )
+                                }
+                              />
+                              <Button
+                                aria-label="Remove plugin manifest URL"
+                                className="h-8 w-8"
+                                type="button"
+                                size="icon"
+                                variant="ghost"
+                                onClick={() => removePluginManifestUrl(index)}
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
+                          ),
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : null}
               {section === "project" ? (
                 <div className="space-y-5">
                   <div>
@@ -700,65 +1219,6 @@ function SettingsDialog({
                   </div>
                 </div>
               ) : null}
-              {section === "account" ? (
-                <div className="space-y-5">
-                  <div>
-                    <h3 className="text-sm font-semibold">ArcGIS Online Account</h3>
-                  </div>
-                  {arcGISOAuth.clientId ? (
-                    arcGISOAuth.token ? (
-                      <div className="space-y-4">
-                        <div className="flex items-center gap-3 rounded-md border bg-muted px-4 py-3">
-                          <User className="h-5 w-5 shrink-0 text-muted-foreground" />
-                          <div className="min-w-0">
-                            <p className="truncate text-sm font-medium">
-                              {arcGISOAuth.token.username}
-                            </p>
-                            <p className="text-xs text-muted-foreground">
-                              Session expires{" "}
-                              {new Date(arcGISOAuth.token.expiresAt).toLocaleTimeString()}
-                            </p>
-                          </div>
-                        </div>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          onClick={arcGISOAuth.signOut}
-                        >
-                          <LogOut className="mr-2 h-3.5 w-3.5" />
-                          Sign out
-                        </Button>
-                      </div>
-                    ) : (
-                      <div className="space-y-3">
-                        {arcGISOAuth.error ? (
-                          <p className="flex items-center gap-1.5 text-sm text-destructive">
-                            <TriangleAlert className="h-3.5 w-3.5 shrink-0" />
-                            {arcGISOAuth.error}
-                          </p>
-                        ) : null}
-                        <Button
-                          type="button"
-                          size="sm"
-                          disabled={arcGISOAuth.isSigningIn}
-                          onClick={arcGISOAuth.signIn}
-                        >
-                          <LogIn className="mr-2 h-3.5 w-3.5" />
-                          {arcGISOAuth.isSigningIn
-                            ? "Signing in…"
-                            : "Sign in with ArcGIS Online"}
-                        </Button>
-                      </div>
-                    )
-                  ) : (
-                    <p className="text-sm text-muted-foreground">
-                      Set <code className="rounded bg-muted px-1 py-0.5 text-xs">VITE_ARCGIS_CLIENT_ID</code> in your{" "}
-                      <code className="rounded bg-muted px-1 py-0.5 text-xs">.env.local</code> to enable ArcGIS Online sign-in.
-                    </p>
-                  )}
-                </div>
-              ) : null}
             </div>
           </div>
           {error ? (
@@ -782,4 +1242,4 @@ function SettingsDialog({
       </Dialog>
     </>
   );
-});
+}

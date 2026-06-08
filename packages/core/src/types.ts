@@ -52,6 +52,7 @@ export type LayerType =
   | "zarr"
   | "lidar"
   | "gaussian-splat"
+  | "3d-tiles"
   | "cog"
   | "flatgeobuf"
   | "geoparquet"
@@ -77,6 +78,10 @@ export interface LayerStyle {
   strokeWidth: number;
   fillOpacity: number;
   circleRadius: number;
+  textColor: string;
+  textHaloColor: string;
+  textHaloWidth: number;
+  textSize: number;
   extrusionEnabled: boolean;
   extrusionColor: string;
   extrusionOpacity: number;
@@ -108,6 +113,10 @@ export const DEFAULT_LAYER_STYLE: LayerStyle = {
   strokeWidth: 2,
   fillOpacity: 0.6,
   circleRadius: 6,
+  textColor: "#111827",
+  textHaloColor: "#ffffff",
+  textHaloWidth: 2,
+  textSize: 16,
   extrusionEnabled: false,
   extrusionColor: "#3b82f6",
   extrusionOpacity: 0.8,
@@ -160,6 +169,21 @@ export interface GeoLibreLayer {
   sourcePath?: string;
 }
 
+/**
+ * Detect a DuckDB query layer rendered through the plugin's external deck.gl
+ * overlay. Shared by `@geolibre/map`, `@geolibre/plugins`, and the desktop
+ * app so the detection criteria cannot drift.
+ */
+export function isDuckDBQueryLayer(
+  layer: Pick<GeoLibreLayer, "metadata" | "type"> | undefined,
+): boolean {
+  return (
+    layer?.type === "duckdb-query" &&
+    layer.metadata.sourceKind === "duckdb-query" &&
+    layer.metadata.externalDeckLayer === true
+  );
+}
+
 export interface MapViewState {
   center: [number, number];
   zoom: number;
@@ -203,6 +227,7 @@ export type ProjectPluginControlPosition =
   | "bottom-right";
 
 export interface ProjectPluginState {
+  manifestUrls: string[];
   activePluginIds: string[];
   mapControlPositions: Record<string, ProjectPluginControlPosition>;
   settings: Record<string, unknown>;

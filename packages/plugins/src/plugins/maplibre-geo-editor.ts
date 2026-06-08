@@ -1,4 +1,5 @@
-import { type GeoLibreLayer, useAppStore } from "@geolibre/core";
+import { type GeoLibreLayer, styleValue, useAppStore } from "@geolibre/core";
+import { Geoman, defaultLayerStyles } from "@geoman-io/maplibre-geoman-free";
 import type { Feature, FeatureCollection } from "geojson";
 import type maplibregl from "maplibre-gl";
 import { GeoEditor, type GeoEditorOptions } from "maplibre-gl-geo-editor";
@@ -11,6 +12,7 @@ import type {
 const SKETCHES_LAYER_NAME = "Sketches";
 const SKETCHES_SOURCE_KIND = "geoeditor-sketches";
 const SKETCHES_SOURCE_PATH = "geoeditor://sketches";
+const GEOMAN_TEXT_PROPERTY = "__gm_text";
 
 let geoEditorPosition: GeoLibreMapControlPosition = "top-left";
 
@@ -18,7 +20,15 @@ const GEO_EDITOR_OPTIONS = {
   collapsed: false,
   toolbarOrientation: "vertical",
   columns: 2,
-  drawModes: ["polygon", "line", "rectangle", "circle", "marker", "freehand"],
+  drawModes: [
+    "polygon",
+    "line",
+    "rectangle",
+    "circle",
+    "marker",
+    "freehand",
+    "text_marker",
+  ],
   editModes: [
     "select",
     "drag",
@@ -67,6 +77,13 @@ let sketchesIdleDisplayOverride = false;
 let unionSketchesWithStoreOnNextSync = false;
 /** Pending one-shot `styledata` listener, so repeated draw events don't pile up listeners. */
 let pendingStyleDataListener: (() => void) | null = null;
+let geomanEditSyncMap: maplibregl.Map | null = null;
+
+const GEOMAN_EDIT_SYNC_EVENTS = [
+  "gm:dragend",
+  "gm:editend",
+  "gm:rotateend",
+] as const;
 
 export const maplibreGeoEditorPlugin: GeoLibrePlugin = {
   id: "maplibre-gl-geo-editor",
@@ -78,6 +95,16 @@ export const maplibreGeoEditorPlugin: GeoLibrePlugin = {
 
     if (!geoEditorControl) {
       geoEditorControl = new GeoEditor(getGeoEditorOptions());
+      const map = app.getMap?.();
+      if (map) {
+        geoEditorControl.setGeoman(
+          new Geoman(map, {
+            layerStyles: geomanLayerStylesForMap(map),
+            settings: { useControlsUi: false },
+          }),
+        );
+        bindGeomanEditSync(map);
+      }
     }
 
     const added = app.addMapControl(geoEditorControl, geoEditorPosition);
@@ -100,6 +127,7 @@ export const maplibreGeoEditorPlugin: GeoLibrePlugin = {
     showGeomanDisplayLayers();
     appApi = null;
     teardownSketchesStoreSync();
+    unbindGeomanEditSync();
 
     if (!geoEditorControl) return;
     app.removeMapControl(geoEditorControl);
@@ -153,6 +181,93 @@ function getGeoEditorOptions(): GeoEditorOptions {
     },
     onSelectionChange: () => applySketchesMapDisplay(),
   };
+}
+
+function handleGeomanEditSync(): void {
+  queueMicrotask(() => {
+    syncSketchesToStore();
+    applySketchesMapDisplay();
+  });
+}
+
+function bindGeomanEditSync(map: maplibregl.Map): void {
+  if (geomanEditSyncMap === map) return;
+  unbindGeomanEditSync();
+  geomanEditSyncMap = map;
+  for (const eventName of GEOMAN_EDIT_SYNC_EVENTS) {
+    map.on(eventName, handleGeomanEditSync);
+  }
+}
+
+function unbindGeomanEditSync(): void {
+  if (!geomanEditSyncMap) return;
+  for (const eventName of GEOMAN_EDIT_SYNC_EVENTS) {
+    geomanEditSyncMap.off(eventName, handleGeomanEditSync);
+  }
+  geomanEditSyncMap = null;
+}
+
+function geomanLayerStylesForMap(map: maplibregl.Map) {
+  const layerStyles = structuredClone(defaultLayerStyles);
+
+  for (const sourceLayers of Object.values(layerStyles.text_marker ?? {})) {
+    for (const layer of sourceLayers) {
+      if (layer.type !== "symbol") continue;
+      layer.layout = {
+        ...layer.layout,
+        "text-font": textFontForMapStyle(map),
+      };
+    }
+  }
+
+  return layerStyles;
+}
+
+// Operators that can start a data-driven text-font expression. A bare
+// ["get", "font"] is all strings, so an every(typeof === "string") check
+// alone would mistake it for a font stack.
+const FONT_EXPRESSION_OPERATORS = new Set([
+  "literal",
+  "get",
+  "has",
+  "at",
+  "in",
+  "case",
+  "match",
+  "coalesce",
+  "step",
+  "interpolate",
+  "let",
+  "var",
+  "concat",
+  "to-string",
+  "string",
+  "array",
+  "format",
+]);
+
+function textFontForMapStyle(map: maplibregl.Map): string[] {
+  for (const styleLayer of map.getStyle().layers ?? []) {
+    if (styleLayer.type !== "symbol") continue;
+    // Icon-only symbol layers may carry a glyph/sprite font unsuited to text.
+    if (!styleLayer.layout?.["text-field"]) continue;
+    const textFont = styleLayer.layout?.["text-font"];
+    if (!Array.isArray(textFont)) continue;
+    // Unwrap the ["literal", ["Font A", "Font B"]] expression form used by
+    // many popular styles.
+    const fonts =
+      textFont[0] === "literal" && Array.isArray(textFont[1])
+        ? (textFont[1] as unknown[])
+        : (textFont as unknown[]);
+    if (
+      fonts.length > 0 &&
+      fonts.every((font) => typeof font === "string") &&
+      !FONT_EXPRESSION_OPERATORS.has(fonts[0] as string)
+    ) {
+      return fonts as string[];
+    }
+  }
+  return ["Noto Sans Regular"];
 }
 
 function isSketchesLayer(layer: GeoLibreLayer): boolean {
@@ -334,7 +449,9 @@ function bindSketchesStoreSync(): void {
       sketches &&
       previousSketches &&
       sketches.id === previousSketches.id &&
-      sketches.visible !== previousSketches.visible
+      (sketches.visible !== previousSketches.visible ||
+        sketches.opacity !== previousSketches.opacity ||
+        sketches.style !== previousSketches.style)
     ) {
       scheduleApplySketchesMapDisplay();
     }
@@ -359,6 +476,7 @@ function sketchesMapLayerIds(layerId: string): string[] {
     `layer-${layerId}-extrusion`,
     `layer-${layerId}-line`,
     `layer-${layerId}-circle`,
+    `layer-${layerId}-text`,
   ];
 }
 
@@ -429,6 +547,15 @@ function setSketchesMapLayersVisibility(layer: GeoLibreLayer): void {
 function setGeomanDisplayLayersVisibility(visibility: "visible" | "none"): void {
   const map = appApi?.getMap?.();
   if (!map) return;
+  const sketchesLayer = findSketchesLayer(useAppStore.getState().layers);
+  const effectiveVisibility =
+    visibility === "visible" && sketchesLayer?.visible === false
+      ? "none"
+      : visibility;
+
+  if (visibility === "visible" && sketchesLayer) {
+    applyGeomanSketchesStyle(map, sketchesLayer);
+  }
 
   const style = map.getStyle();
   if (!style?.layers) return;
@@ -436,7 +563,7 @@ function setGeomanDisplayLayersVisibility(visibility: "visible" | "none"): void 
   for (const layer of style.layers) {
     if (!isGeomanDisplayLayer(layer)) continue;
     try {
-      map.setLayoutProperty(layer.id, "visibility", visibility);
+      map.setLayoutProperty(layer.id, "visibility", effectiveVisibility);
     } catch {
       // Layer may have been removed with the current style.
     }
@@ -451,6 +578,78 @@ function showGeomanDisplayLayers(): void {
   setGeomanDisplayLayersVisibility("visible");
 }
 
+function applyGeomanSketchesStyle(
+  map: maplibregl.Map,
+  sketchesLayer: GeoLibreLayer,
+): void {
+  const style = map.getStyle();
+  if (!style?.layers) return;
+
+  for (const layer of style.layers) {
+    if (!isGeomanDisplayLayer(layer)) continue;
+    applyGeomanDisplayLayerOpacity(map, layer, sketchesLayer.opacity);
+    if (!isGeomanTextMarkerLayer(layer)) continue;
+    try {
+      map.setLayoutProperty(
+        layer.id,
+        "text-size",
+        Math.max(1, styleValue(sketchesLayer.style, "textSize")),
+      );
+      map.setPaintProperty(
+        layer.id,
+        "text-color",
+        styleValue(sketchesLayer.style, "textColor"),
+      );
+      map.setPaintProperty(
+        layer.id,
+        "text-halo-color",
+        styleValue(sketchesLayer.style, "textHaloColor"),
+      );
+      map.setPaintProperty(
+        layer.id,
+        "text-halo-width",
+        Math.max(0, styleValue(sketchesLayer.style, "textHaloWidth")),
+      );
+      map.setPaintProperty(layer.id, "text-opacity", sketchesLayer.opacity);
+    } catch {
+      // Geoman may rebuild its temporary layers while an interaction is active.
+    }
+  }
+}
+
+function applyGeomanDisplayLayerOpacity(
+  map: maplibregl.Map,
+  layer: maplibregl.LayerSpecification,
+  opacity: number,
+): void {
+  if (layer.type === "circle") {
+    setGeomanPaintProperty(map, layer.id, "circle-opacity", opacity);
+    setGeomanPaintProperty(map, layer.id, "circle-stroke-opacity", opacity);
+  } else if (layer.type === "line") {
+    setGeomanPaintProperty(map, layer.id, "line-opacity", opacity);
+  } else if (layer.type === "fill") {
+    setGeomanPaintProperty(map, layer.id, "fill-opacity", opacity);
+  } else if (layer.type === "fill-extrusion") {
+    setGeomanPaintProperty(map, layer.id, "fill-extrusion-opacity", opacity);
+  } else if (layer.type === "symbol") {
+    setGeomanPaintProperty(map, layer.id, "icon-opacity", opacity);
+    setGeomanPaintProperty(map, layer.id, "text-opacity", opacity);
+  }
+}
+
+function setGeomanPaintProperty(
+  map: maplibregl.Map,
+  layerId: string,
+  property: string,
+  value: unknown,
+): void {
+  try {
+    map.setPaintProperty(layerId, property, value);
+  } catch {
+    // Geoman layers are rebuilt often and may not support every paint property.
+  }
+}
+
 function isGeomanDisplayLayer(layer: maplibregl.LayerSpecification): boolean {
   const id = layer.id.toLowerCase();
   if (id.startsWith("gm_") || id.startsWith("gm-")) {
@@ -463,5 +662,14 @@ function isGeomanDisplayLayer(layer: maplibregl.LayerSpecification): boolean {
     (source.startsWith("gm_") ||
       source.startsWith("gm-") ||
       source.startsWith("geoman"))
+  );
+}
+
+function isGeomanTextMarkerLayer(
+  layer: maplibregl.LayerSpecification,
+): layer is maplibregl.SymbolLayerSpecification {
+  if (layer.type !== "symbol" || !isGeomanDisplayLayer(layer)) return false;
+  return JSON.stringify(layer.layout?.["text-field"] ?? "").includes(
+    GEOMAN_TEXT_PROPERTY,
   );
 }

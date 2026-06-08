@@ -21,23 +21,41 @@ import type {
   CogLayerControlOptions,
   CogLayerEventHandler,
   CogLayerInfo,
+  BookmarkControl,
+  BookmarkControlOptions,
+  ColorbarGuiControl,
+  ColorbarGuiControlOptions,
   ControlGrid,
   ControlGridOptions,
   DefaultControlName,
   GaussianSplatControl,
   GaussianSplatLayerAdapter,
+  HtmlGuiControl,
+  HtmlGuiControlOptions,
+  LegendGuiControl,
+  LegendGuiControlOptions,
   LidarControl,
   LidarLayerAdapter,
+  MapBookmark,
+  MeasureControl,
+  MeasureControlOptions,
+  MinimapControl,
+  MinimapControlOptions,
   PMTilesLayerControl,
   PMTilesLayerControlOptions,
   PMTilesLayerEventHandler,
   PMTilesLayerInfo,
+  PrintControl,
+  PrintControlOptions,
+  PrintTheme,
   SearchControl,
   SearchControlOptions,
   StacSearchControl,
   StacSearchControlOptions,
   StacSearchEventHandler,
   StacSearchItem,
+  ViewStateControl,
+  ViewStateControlOptions,
   ZarrLayerControl,
   ZarrLayerControlOptions,
   ZarrLayerEventHandler,
@@ -52,21 +70,38 @@ import type {
   GeoLibreMapControlPosition,
   GeoLibrePlugin,
 } from "../types";
+import { ensureMercatorProjection } from "./map-projection-utils";
 
 type ControlGridConstructor =
   (typeof import("maplibre-gl-components"))["ControlGrid"];
 type AddVectorControlConstructor =
   (typeof import("maplibre-gl-components"))["AddVectorControl"];
+type BookmarkControlConstructor =
+  (typeof import("maplibre-gl-components"))["BookmarkControl"];
+type MeasureControlConstructor =
+  (typeof import("maplibre-gl-components"))["MeasureControl"];
+type MinimapControlConstructor =
+  (typeof import("maplibre-gl-components"))["MinimapControl"];
+type ViewStateControlConstructor =
+  (typeof import("maplibre-gl-components"))["ViewStateControl"];
 type CogLayerControlConstructor =
   (typeof import("maplibre-gl-components"))["CogLayerControl"];
+type ColorbarGuiControlConstructor =
+  (typeof import("maplibre-gl-components"))["ColorbarGuiControl"];
 type PMTilesLayerControlConstructor =
   (typeof import("maplibre-gl-components"))["PMTilesLayerControl"];
+type PrintControlConstructor =
+  (typeof import("maplibre-gl-components"))["PrintControl"];
 type SearchControlConstructor =
   (typeof import("maplibre-gl-components"))["SearchControl"];
 type StacSearchControlConstructor =
   (typeof import("maplibre-gl-components"))["StacSearchControl"];
 type ZarrLayerControlConstructor =
   (typeof import("maplibre-gl-components"))["ZarrLayerControl"];
+type HtmlGuiControlConstructor =
+  (typeof import("maplibre-gl-components"))["HtmlGuiControl"];
+type LegendGuiControlConstructor =
+  (typeof import("maplibre-gl-components"))["LegendGuiControl"];
 type LidarControlConstructor =
   (typeof import("maplibre-gl-components"))["LidarControl"];
 type LidarLayerAdapterConstructor =
@@ -86,15 +121,23 @@ interface SplattingControlVisibilityState {
 
 interface ComponentsConstructors {
   AddVectorControl: AddVectorControlConstructor;
+  BookmarkControl: BookmarkControlConstructor;
   CogLayerControl: CogLayerControlConstructor;
+  ColorbarGuiControl: ColorbarGuiControlConstructor;
   ControlGrid: ControlGridConstructor;
   GaussianSplatControl: GaussianSplatControlConstructor;
   GaussianSplatLayerAdapter: GaussianSplatLayerAdapterConstructor;
+  HtmlGuiControl: HtmlGuiControlConstructor;
+  LegendGuiControl: LegendGuiControlConstructor;
   LidarControl: LidarControlConstructor;
   LidarLayerAdapter: LidarLayerAdapterConstructor;
+  MeasureControl: MeasureControlConstructor;
+  MinimapControl: MinimapControlConstructor;
   PMTilesLayerControl: PMTilesLayerControlConstructor;
+  PrintControl: PrintControlConstructor;
   SearchControl: SearchControlConstructor;
   StacSearchControl: StacSearchControlConstructor;
+  ViewStateControl: ViewStateControlConstructor;
   ZarrLayerControl: ZarrLayerControlConstructor;
 }
 
@@ -103,13 +146,20 @@ const cogRasterControlPosition: GeoLibreMapControlPosition = "top-left";
 const flatGeobufControlPosition: GeoLibreMapControlPosition = "top-left";
 const pmtilesControlPosition: GeoLibreMapControlPosition = "top-left";
 const searchControlPosition: GeoLibreMapControlPosition = "top-right";
+const measureControlPosition: GeoLibreMapControlPosition = "top-left";
+const bookmarkControlPosition: GeoLibreMapControlPosition = "top-left";
+const minimapControlPosition: GeoLibreMapControlPosition = "bottom-left";
+const viewStateControlPosition: GeoLibreMapControlPosition = "bottom-right";
+const printControlPosition: GeoLibreMapControlPosition = "top-left";
 const stacSearchControlPosition: GeoLibreMapControlPosition = "top-left";
 const zarrControlPosition: GeoLibreMapControlPosition = "top-left";
+const colorbarControlPosition: GeoLibreMapControlPosition = "top-left";
+const legendControlPosition: GeoLibreMapControlPosition = "top-left";
+const htmlControlPosition: GeoLibreMapControlPosition = "top-left";
 const lidarControlPosition: GeoLibreMapControlPosition = "top-left";
 const splattingControlPosition: GeoLibreMapControlPosition = "top-left";
 
-const FLATGEOBUF_SAMPLE_URL =
-  "https://flatgeobuf.org/test/data/UScounties.fgb";
+const FLATGEOBUF_SAMPLE_URL = "https://flatgeobuf.org/test/data/UScounties.fgb";
 const PMTILES_SAMPLE_URL =
   "https://overturemaps-extras-us-west-2.s3.us-west-2.amazonaws.com/tiles/2026-05-20.0/buildings.pmtiles";
 const ZARR_SAMPLE_URL =
@@ -119,6 +169,7 @@ const LIDAR_SAMPLE_URL =
 const SPLATTING_SAMPLE_URL =
   "https://maplibre.org/maplibre-gl-js/docs/assets/34M_17/34M_17.gltf";
 const RASTER_PROXY_PATH = "/__geolibre_raster_proxy";
+const GUI_PANEL_VIEWPORT_MARGIN = 16;
 
 const COMPONENT_CONTROL_NAMES = [
   "spinGlobe",
@@ -144,6 +195,9 @@ const COMPONENT_CONTROL_NAMES = [
   "stacSearch",
   "planetaryComputer",
   "gaussianSplat",
+  "colorbarGui",
+  "legendGui",
+  "htmlGui",
   "lidar",
   "usgsLidar",
 ] satisfies DefaultControlName[];
@@ -214,6 +268,60 @@ const SEARCH_OPTIONS = {
   width: 320,
 } satisfies SearchControlOptions;
 
+const MEASURE_OPTIONS = {
+  backgroundColor: "hsl(var(--popover))",
+  className: "geolibre-measure-control",
+  collapsed: false,
+  fontColor: "hsl(var(--popover-foreground))",
+  maxHeight: 520,
+  panelWidth: 260,
+  position: measureControlPosition,
+} satisfies MeasureControlOptions;
+
+const BOOKMARK_OPTIONS = {
+  backgroundColor: "hsl(var(--popover))",
+  className: "geolibre-bookmark-control",
+  collapsed: false,
+  fontColor: "hsl(var(--popover-foreground))",
+  maxHeight: 520,
+  panelWidth: 280,
+  position: bookmarkControlPosition,
+  storageKey: "geolibre-bookmarks",
+} satisfies BookmarkControlOptions;
+
+const MINIMAP_OPTIONS = {
+  className: "geolibre-minimap-control",
+  collapsed: false,
+  height: 180,
+  interactive: true,
+  position: minimapControlPosition,
+  width: 250,
+  zoomOffset: -4,
+} satisfies Omit<MinimapControlOptions, "style">;
+
+const VIEW_STATE_OPTIONS = {
+  backgroundColor: "hsl(var(--popover))",
+  className: "geolibre-view-state-control",
+  collapsed: false,
+  enableBBox: true,
+  fontColor: "hsl(var(--popover-foreground))",
+  maxHeight: 520,
+  panelWidth: 280,
+  position: viewStateControlPosition,
+} satisfies ViewStateControlOptions;
+
+const PRINT_OPTIONS = {
+  backgroundColor: "hsl(var(--popover))",
+  className: "geolibre-print-control",
+  collapsed: false,
+  fontColor: "hsl(var(--popover-foreground))",
+  maxHeight: 520,
+  panelWidth: 300,
+  position: printControlPosition,
+  showPageOptions: true,
+  showSizeOptions: true,
+} satisfies PrintControlOptions;
+
 const STAC_SEARCH_OPTIONS = {
   backgroundColor: "hsl(var(--popover))",
   className: "geolibre-stac-search-control",
@@ -227,6 +335,36 @@ const STAC_SEARCH_OPTIONS = {
   panelWidth: 365,
   showFootprints: true,
 } satisfies StacSearchControlOptions;
+
+const COLORBAR_OPTIONS = {
+  backgroundColor: "hsl(var(--popover))",
+  className: "geolibre-colorbar-control",
+  collapsed: false,
+  fontColor: "hsl(var(--popover-foreground))",
+  maxHeight: 520,
+  panelWidth: 320,
+  position: colorbarControlPosition,
+} satisfies ColorbarGuiControlOptions;
+
+const LEGEND_OPTIONS = {
+  backgroundColor: "hsl(var(--popover))",
+  className: "geolibre-legend-control",
+  collapsed: false,
+  fontColor: "hsl(var(--popover-foreground))",
+  maxHeight: 520,
+  panelWidth: 320,
+  position: legendControlPosition,
+} satisfies LegendGuiControlOptions;
+
+const HTML_OPTIONS = {
+  backgroundColor: "hsl(var(--popover))",
+  className: "geolibre-html-control",
+  collapsed: false,
+  fontColor: "hsl(var(--popover-foreground))",
+  maxHeight: 520,
+  panelWidth: 340,
+  position: htmlControlPosition,
+} satisfies HtmlGuiControlOptions;
 
 const STAC_COLOR_RAMP_MODULE = {
   name: "geolibre-stac-color-ramp",
@@ -326,7 +464,9 @@ const STAC_COLOR_RAMP_COLORS: Record<string, string[]> = {
   ],
 };
 
-function getStacColorRampModule(colormap: string): typeof STAC_COLOR_RAMP_MODULE {
+function getStacColorRampModule(
+  colormap: string,
+): typeof STAC_COLOR_RAMP_MODULE {
   const colors = STAC_COLOR_RAMP_COLORS[colormap.toLowerCase()];
   if (!colors) return STAC_COLOR_RAMP_MODULE;
 
@@ -405,9 +545,17 @@ let componentsControl: ControlGrid | null = null;
 let cogRasterControl: CogLayerControl | null = null;
 let flatGeobufControl: AddVectorControl | null = null;
 let pmtilesControl: PMTilesLayerControl | null = null;
+let printControl: PrintControl | null = null;
 let searchControl: SearchControl | null = null;
+let measureControl: MeasureControl | null = null;
+let bookmarkControl: BookmarkControl | null = null;
+let minimapControl: MinimapControl | null = null;
+let viewStateControl: ViewStateControl | null = null;
 let stacSearchControl: StacSearchControl | null = null;
 let zarrControl: ZarrLayerControl | null = null;
+let colorbarControl: ColorbarGuiControl | null = null;
+let legendControl: LegendGuiControl | null = null;
+let htmlControl: HtmlGuiControl | null = null;
 let lidarControl: LidarControl | null = null;
 let lidarLayerAdapter: LidarLayerAdapter | null = null;
 let splattingControl: GaussianSplatControl | null = null;
@@ -417,9 +565,18 @@ let flatGeobufControlMounted = false;
 let cogRasterControlMounted = false;
 let geoTiffRasterOverlayMounted = false;
 let pmtilesControlMounted = false;
+let printControlMounted = false;
 let searchControlMounted = false;
+let measureControlMounted = false;
+let bookmarkControlMounted = false;
+let minimapControlMounted = false;
+let viewStateControlMounted = false;
+let minimapBasemapUnsubscribe: (() => void) | null = null;
 let stacSearchControlMounted = false;
 let zarrControlMounted = false;
+let colorbarControlMounted = false;
+let legendControlMounted = false;
+let htmlControlMounted = false;
 let lidarControlMounted = false;
 let splattingControlMounted = false;
 let flatGeobufStoreUnsubscribe: (() => void) | null = null;
@@ -436,6 +593,175 @@ let componentsConstructorsPromise: Promise<ComponentsConstructors> | null =
   null;
 let searchPlacesPanelVisible = false;
 const searchPlacesPanelListeners = new Set<() => void>();
+let measurePanelVisible = false;
+const measurePanelListeners = new Set<() => void>();
+let bookmarkPanelVisible = false;
+const bookmarkPanelListeners = new Set<() => void>();
+let minimapPanelVisible = false;
+const minimapPanelListeners = new Set<() => void>();
+let viewStatePanelVisible = false;
+const viewStatePanelListeners = new Set<() => void>();
+let printPanelVisible = false;
+const printPanelListeners = new Set<() => void>();
+let printThemeObserver: MutationObserver | null = null;
+let colorbarPanelVisible = false;
+const colorbarPanelListeners = new Set<() => void>();
+let legendPanelVisible = false;
+const legendPanelListeners = new Set<() => void>();
+let htmlPanelVisible = false;
+const htmlPanelListeners = new Set<() => void>();
+
+interface ComponentsProjectState {
+  colorbar?: ComponentColorbarGuiState;
+  legend?: ComponentLegendGuiState;
+  html?: ComponentHtmlGuiState;
+}
+
+interface ComponentColorbarGuiEntryState {
+  mode: "named" | "custom";
+  colormap: string;
+  customColors: string;
+  vmin: number;
+  vmax: number;
+  label: string;
+  units: string;
+  orientation: "horizontal" | "vertical";
+  colorbarPosition: GeoLibreMapControlPosition;
+}
+
+interface ComponentColorbarGuiState extends ComponentColorbarGuiEntryState {
+  visible: boolean;
+  collapsed: boolean;
+  hasColorbar: boolean;
+  selectedColorbarIndex: number;
+  colorbars: ComponentColorbarGuiEntryState[];
+}
+
+interface ComponentLegendItem {
+  label: string;
+  color: string;
+  shape?: "square" | "circle" | "line";
+  strokeColor?: string;
+  icon?: string;
+}
+
+interface ComponentLegendGuiEntryState {
+  title: string;
+  items: ComponentLegendItem[];
+  legendPosition: GeoLibreMapControlPosition;
+}
+
+interface ComponentLegendGuiState extends ComponentLegendGuiEntryState {
+  visible: boolean;
+  collapsed: boolean;
+  hasLegend: boolean;
+  selectedLegendIndex: number;
+  legends: ComponentLegendGuiEntryState[];
+}
+
+interface ComponentHtmlGuiEntryState {
+  title: string;
+  html: string;
+  htmlPosition: GeoLibreMapControlPosition;
+  collapsible: boolean;
+}
+
+interface ComponentHtmlGuiState extends ComponentHtmlGuiEntryState {
+  visible: boolean;
+  collapsed: boolean;
+  hasHtmlControl: boolean;
+  selectedHtmlIndex: number;
+  htmls: ComponentHtmlGuiEntryState[];
+}
+
+type RestorableColorbarGuiControl = ColorbarGuiControl & {
+  setState?: (state: ComponentColorbarGuiState) => unknown;
+};
+
+type RestorableLegendGuiControl = LegendGuiControl & {
+  setState?: (state: ComponentLegendGuiState) => unknown;
+};
+
+type RestorableHtmlGuiControl = HtmlGuiControl & {
+  setState?: (state: ComponentHtmlGuiState) => unknown;
+};
+
+type GuiControlStateInternals<TState> = {
+  _render?: () => void;
+  _state?: TState;
+  setState?: (state: TState) => unknown;
+};
+
+const CONTROL_POSITIONS = new Set<GeoLibreMapControlPosition>([
+  "top-left",
+  "top-right",
+  "bottom-left",
+  "bottom-right",
+]);
+
+const LEGEND_ITEM_SHAPES = new Set<ComponentLegendItem["shape"]>([
+  "square",
+  "circle",
+  "line",
+]);
+
+const DEFAULT_COLORBAR_GUI_ENTRY: ComponentColorbarGuiEntryState = {
+  mode: "named",
+  colormap: "viridis",
+  customColors: "#440154, #31688e, #21918c, #90d743, #fde725",
+  vmin: 0,
+  vmax: 100,
+  label: "",
+  units: "",
+  orientation: "vertical",
+  colorbarPosition: "bottom-right",
+};
+
+const DEFAULT_LEGEND_GUI_ENTRY: ComponentLegendGuiEntryState = {
+  title: "Legend",
+  items: [
+    { label: "Category A", color: "#ff6b6b", shape: "square" },
+    { label: "Category B", color: "#4ecdc4", shape: "square" },
+    { label: "Category C", color: "#95a5a6", shape: "square" },
+  ],
+  legendPosition: "bottom-left",
+};
+
+const DEFAULT_HTML_GUI_ENTRY: ComponentHtmlGuiEntryState = {
+  title: "Info",
+  html: '<div style="padding: 4px;">\n  <h4 style="margin: 0 0 8px 0;">Welcome</h4>\n  <p style="margin: 0; color: #666;">This is a custom HTML control.</p>\n</div>',
+  htmlPosition: "top-left",
+  collapsible: true,
+};
+
+function constrainGuiPanelToViewport(panelSelector: string): void {
+  // Defer measurement until after the expanded panel has been laid out so
+  // getBoundingClientRect() reflects the fully expanded dimensions.
+  requestAnimationFrame(() => {
+    const panel = document.querySelector<HTMLElement>(panelSelector);
+    if (!panel) return;
+
+    // Clear previously-applied inline constraints before re-measuring so
+    // they don't suppress the overflow check on subsequent opens.
+    panel.style.maxHeight = "";
+    panel.style.maxWidth = "";
+
+    const rect = panel.getBoundingClientRect();
+    const availableHeight = Math.floor(
+      window.innerHeight - rect.top - GUI_PANEL_VIEWPORT_MARGIN,
+    );
+    if (availableHeight > 160 && rect.bottom > window.innerHeight) {
+      panel.style.maxHeight = `${availableHeight}px`;
+    }
+
+    const availableWidth = Math.floor(
+      window.innerWidth - rect.left - GUI_PANEL_VIEWPORT_MARGIN,
+    );
+    if (availableWidth > 220 && rect.right > window.innerWidth) {
+      panel.style.maxWidth = `${availableWidth}px`;
+    }
+  });
+}
 
 export interface CogRasterLayerOptions {
   url: string;
@@ -637,27 +963,43 @@ const getComponentsConstructors = (): Promise<ComponentsConstructors> => {
   componentsConstructorsPromise ??= import("maplibre-gl-components").then(
     ({
       AddVectorControl: AddVectorControlClass,
+      BookmarkControl: BookmarkControlClass,
       CogLayerControl: CogLayerControlClass,
+      ColorbarGuiControl: ColorbarGuiControlClass,
       ControlGrid: ControlGridClass,
       GaussianSplatControl: GaussianSplatControlClass,
       GaussianSplatLayerAdapter: GaussianSplatLayerAdapterClass,
+      HtmlGuiControl: HtmlGuiControlClass,
+      LegendGuiControl: LegendGuiControlClass,
       LidarControl: LidarControlClass,
       LidarLayerAdapter: LidarLayerAdapterClass,
+      MeasureControl: MeasureControlClass,
+      MinimapControl: MinimapControlClass,
       PMTilesLayerControl: PMTilesLayerControlClass,
+      PrintControl: PrintControlClass,
       SearchControl: SearchControlClass,
       StacSearchControl: StacSearchControlClass,
+      ViewStateControl: ViewStateControlClass,
       ZarrLayerControl: ZarrLayerControlClass,
     }) => ({
       AddVectorControl: AddVectorControlClass,
+      BookmarkControl: BookmarkControlClass,
       CogLayerControl: CogLayerControlClass,
+      ColorbarGuiControl: ColorbarGuiControlClass,
       ControlGrid: ControlGridClass,
       GaussianSplatControl: GaussianSplatControlClass,
       GaussianSplatLayerAdapter: GaussianSplatLayerAdapterClass,
+      HtmlGuiControl: HtmlGuiControlClass,
+      LegendGuiControl: LegendGuiControlClass,
       LidarControl: LidarControlClass,
       LidarLayerAdapter: LidarLayerAdapterClass,
+      MeasureControl: MeasureControlClass,
+      MinimapControl: MinimapControlClass,
       PMTilesLayerControl: PMTilesLayerControlClass,
+      PrintControl: PrintControlClass,
       SearchControl: SearchControlClass,
       StacSearchControl: StacSearchControlClass,
+      ViewStateControl: ViewStateControlClass,
       ZarrLayerControl: ZarrLayerControlClass,
     }),
   );
@@ -690,10 +1032,7 @@ const createAndMountComponentsControl = (app: GeoLibreAppAPI): void => {
 
 const mountComponentsControl = (app: GeoLibreAppAPI): boolean => {
   if (!componentsControl) return false;
-  const added = app.addMapControl(
-    componentsControl,
-    componentsControlPosition,
-  );
+  const added = app.addMapControl(componentsControl, componentsControlPosition);
   if (!added) {
     componentsControl = null;
     return false;
@@ -705,7 +1044,7 @@ const mountComponentsControl = (app: GeoLibreAppAPI): boolean => {
 export const maplibreComponentsPlugin: GeoLibrePlugin = {
   id: "maplibre-gl-components",
   name: "Components",
-  version: "0.17.1",
+  version: "0.18.2",
   activate: (app: GeoLibreAppAPI) => {
     pluginActive = true;
     if (componentsControl) return mountComponentsControl(app);
@@ -718,9 +1057,17 @@ export const maplibreComponentsPlugin: GeoLibrePlugin = {
     teardownGeoTiffRasterOverlay(app);
     teardownFlatGeobufControl(app);
     teardownPMTilesControl(app);
+    teardownPrintControl(app);
     teardownSearchControl(app);
+    teardownMeasureControl(app);
+    teardownBookmarkControl(app);
+    teardownMinimapControl(app);
+    teardownViewStateControl(app);
     teardownStacSearchControl(app);
     teardownZarrControl(app);
+    teardownColorbarControl(app);
+    teardownLegendControl(app);
+    teardownHtmlControl(app);
     teardownLidarControl(app);
     teardownSplattingControl(app);
     if (!componentsControl) return;
@@ -738,11 +1085,336 @@ export const maplibreComponentsPlugin: GeoLibrePlugin = {
     componentsControl = null;
     createAndMountComponentsControl(app);
   },
+  getProjectState: () => componentsProjectStateSnapshot(),
+  applyProjectState: (app: GeoLibreAppAPI, state: unknown) => {
+    applyComponentsProjectState(app, state);
+  },
 };
 
-export function openFlatGeobufAddVectorLayerPanel(
+function componentsProjectStateSnapshot(): ComponentsProjectState | undefined {
+  const state: ComponentsProjectState = {};
+  if (colorbarPanelVisible && colorbarControl) {
+    state.colorbar = normalizeColorbarState(colorbarControl.getState());
+  }
+  if (legendPanelVisible && legendControl) {
+    state.legend = normalizeLegendState(legendControl.getState());
+  }
+  if (htmlPanelVisible && htmlControl) {
+    state.html = normalizeHtmlState(htmlControl.getState());
+  }
+
+  return Object.keys(state).length > 0 ? state : undefined;
+}
+
+function applyComponentsProjectState(
   app: GeoLibreAppAPI,
+  state: unknown,
 ): void {
+  const normalized = normalizeComponentsProjectState(state);
+  if (normalized?.colorbar?.visible) {
+    void restoreColorbarPanel(app, normalized.colorbar);
+  } else {
+    teardownColorbarControl(app);
+  }
+
+  if (normalized?.legend?.visible) {
+    void restoreLegendPanel(app, normalized.legend);
+  } else {
+    teardownLegendControl(app);
+  }
+
+  if (normalized?.html?.visible) {
+    void restoreHtmlPanel(app, normalized.html);
+  } else {
+    teardownHtmlControl(app);
+  }
+}
+
+async function restoreColorbarPanel(
+  app: GeoLibreAppAPI,
+  state: ComponentColorbarGuiState,
+): Promise<void> {
+  const restored = await openStandaloneColorbarControl(app);
+  if (!restored) return;
+  setTimeout(() => {
+    if (!colorbarControl) return;
+    const control = colorbarControl as RestorableColorbarGuiControl;
+    restoreGuiControlState(control, state);
+    if (state.collapsed) control.collapse();
+    else control.expand();
+    if (state.visible) control.show();
+    else control.hide();
+    setColorbarPanelVisible(state.visible);
+  }, 0);
+}
+
+async function restoreLegendPanel(
+  app: GeoLibreAppAPI,
+  state: ComponentLegendGuiState,
+): Promise<void> {
+  const restored = await openStandaloneLegendControl(app);
+  if (!restored) return;
+  setTimeout(() => {
+    if (!legendControl) return;
+    const control = legendControl as RestorableLegendGuiControl;
+    restoreGuiControlState(control, state);
+    if (state.collapsed) control.collapse();
+    else control.expand();
+    if (state.visible) control.show();
+    else control.hide();
+    setLegendPanelVisible(state.visible);
+  }, 0);
+}
+
+async function restoreHtmlPanel(
+  app: GeoLibreAppAPI,
+  state: ComponentHtmlGuiState,
+): Promise<void> {
+  const restored = await openStandaloneHtmlControl(app);
+  if (!restored) return;
+  setTimeout(() => {
+    if (!htmlControl) return;
+    const control = htmlControl as RestorableHtmlGuiControl;
+    restoreGuiControlState(control, state);
+    if (state.collapsed) control.collapse();
+    else control.expand();
+    if (state.visible) control.show();
+    else control.hide();
+    setHtmlPanelVisible(state.visible);
+  }, 0);
+}
+
+function restoreGuiControlState<
+  TState extends
+    | ComponentColorbarGuiState
+    | ComponentLegendGuiState
+    | ComponentHtmlGuiState,
+>(
+  control:
+    | RestorableColorbarGuiControl
+    | RestorableLegendGuiControl
+    | RestorableHtmlGuiControl,
+  state: TState,
+): void {
+  const internals = control as unknown as GuiControlStateInternals<TState>;
+  if (internals.setState) {
+    internals.setState(state);
+    return;
+  }
+
+  internals._state = state;
+  internals._render?.();
+}
+
+function normalizeComponentsProjectState(
+  state: unknown,
+): ComponentsProjectState | null {
+  if (!state || typeof state !== "object") return null;
+  const candidate = state as Partial<ComponentsProjectState>;
+  return {
+    colorbar: normalizeColorbarState(candidate.colorbar),
+    legend: normalizeLegendState(candidate.legend),
+    html: normalizeHtmlState(candidate.html),
+  };
+}
+
+function normalizeColorbarState(
+  state: unknown,
+): ComponentColorbarGuiState | undefined {
+  if (!state || typeof state !== "object") return undefined;
+  const candidate = state as Partial<ComponentColorbarGuiState>;
+  const formEntry = normalizeColorbarEntry(candidate);
+  const colorbars = Array.isArray(candidate.colorbars)
+    ? candidate.colorbars.map(normalizeColorbarEntry)
+    : [];
+  const selectedColorbarIndex = selectedIndex(
+    candidate.selectedColorbarIndex,
+    colorbars.length,
+  );
+  return {
+    ...formEntry,
+    visible: typeof candidate.visible === "boolean" ? candidate.visible : true,
+    collapsed:
+      typeof candidate.collapsed === "boolean" ? candidate.collapsed : false,
+    hasColorbar: colorbars.length > 0,
+    selectedColorbarIndex,
+    colorbars,
+  };
+}
+
+function normalizeLegendState(
+  state: unknown,
+): ComponentLegendGuiState | undefined {
+  if (!state || typeof state !== "object") return undefined;
+  const candidate = state as Partial<ComponentLegendGuiState>;
+  const formEntry = normalizeLegendEntry(candidate);
+  const legends = Array.isArray(candidate.legends)
+    ? candidate.legends.map(normalizeLegendEntry)
+    : [];
+  return {
+    ...formEntry,
+    visible: typeof candidate.visible === "boolean" ? candidate.visible : true,
+    collapsed:
+      typeof candidate.collapsed === "boolean" ? candidate.collapsed : false,
+    hasLegend: legends.length > 0,
+    selectedLegendIndex: selectedIndex(
+      candidate.selectedLegendIndex,
+      legends.length,
+    ),
+    legends,
+  };
+}
+
+function normalizeHtmlState(state: unknown): ComponentHtmlGuiState | undefined {
+  if (!state || typeof state !== "object") return undefined;
+  const candidate = state as Partial<ComponentHtmlGuiState>;
+  const formEntry = normalizeHtmlEntry(candidate);
+  const htmls = Array.isArray(candidate.htmls)
+    ? candidate.htmls.map(normalizeHtmlEntry)
+    : [];
+  return {
+    ...formEntry,
+    visible: typeof candidate.visible === "boolean" ? candidate.visible : true,
+    collapsed:
+      typeof candidate.collapsed === "boolean" ? candidate.collapsed : false,
+    hasHtmlControl: htmls.length > 0,
+    selectedHtmlIndex: selectedIndex(candidate.selectedHtmlIndex, htmls.length),
+    htmls,
+  };
+}
+
+function normalizeColorbarEntry(
+  entry: unknown,
+): ComponentColorbarGuiEntryState {
+  const candidate = (
+    entry && typeof entry === "object" ? entry : {}
+  ) as Partial<ComponentColorbarGuiEntryState>;
+  const vmin = finiteNumber(candidate.vmin, DEFAULT_COLORBAR_GUI_ENTRY.vmin);
+  const vmax = finiteNumber(candidate.vmax, DEFAULT_COLORBAR_GUI_ENTRY.vmax);
+  return {
+    mode: candidate.mode === "custom" ? "custom" : "named",
+    colormap:
+      typeof candidate.colormap === "string" && candidate.colormap.trim()
+        ? candidate.colormap
+        : DEFAULT_COLORBAR_GUI_ENTRY.colormap,
+    customColors:
+      typeof candidate.customColors === "string" &&
+      candidate.customColors.trim()
+        ? candidate.customColors
+        : DEFAULT_COLORBAR_GUI_ENTRY.customColors,
+    vmin,
+    vmax: vmax === vmin ? vmin + 1 : vmax,
+    label: typeof candidate.label === "string" ? candidate.label : "",
+    units: typeof candidate.units === "string" ? candidate.units : "",
+    orientation:
+      candidate.orientation === "horizontal" ? "horizontal" : "vertical",
+    colorbarPosition: normalizeControlPosition(
+      candidate.colorbarPosition,
+      DEFAULT_COLORBAR_GUI_ENTRY.colorbarPosition,
+    ),
+  };
+}
+
+function normalizeLegendEntry(entry: unknown): ComponentLegendGuiEntryState {
+  const candidate = (
+    entry && typeof entry === "object" ? entry : {}
+  ) as Partial<ComponentLegendGuiEntryState>;
+  const items = Array.isArray(candidate.items)
+    ? candidate.items
+        .map(normalizeLegendItem)
+        .filter((item): item is ComponentLegendItem => item !== null)
+    : DEFAULT_LEGEND_GUI_ENTRY.items;
+  return {
+    title:
+      typeof candidate.title === "string"
+        ? candidate.title
+        : DEFAULT_LEGEND_GUI_ENTRY.title,
+    items,
+    legendPosition: normalizeControlPosition(
+      candidate.legendPosition,
+      DEFAULT_LEGEND_GUI_ENTRY.legendPosition,
+    ),
+  };
+}
+
+function normalizeHtmlEntry(entry: unknown): ComponentHtmlGuiEntryState {
+  const candidate = (
+    entry && typeof entry === "object" ? entry : {}
+  ) as Partial<ComponentHtmlGuiEntryState>;
+  return {
+    title:
+      typeof candidate.title === "string"
+        ? candidate.title
+        : DEFAULT_HTML_GUI_ENTRY.title,
+    html:
+      typeof candidate.html === "string"
+        ? candidate.html
+        : DEFAULT_HTML_GUI_ENTRY.html,
+    htmlPosition: normalizeControlPosition(
+      candidate.htmlPosition,
+      DEFAULT_HTML_GUI_ENTRY.htmlPosition,
+    ),
+    collapsible:
+      typeof candidate.collapsible === "boolean"
+        ? candidate.collapsible
+        : DEFAULT_HTML_GUI_ENTRY.collapsible,
+  };
+}
+
+function normalizeLegendItem(item: unknown): ComponentLegendItem | null {
+  if (!item || typeof item !== "object") return null;
+  const candidate = item as Partial<ComponentLegendItem>;
+  if (typeof candidate.label !== "string" || !candidate.label.trim()) {
+    return null;
+  }
+  if (typeof candidate.color !== "string" || !candidate.color.trim()) {
+    return null;
+  }
+
+  return {
+    label: candidate.label,
+    color: candidate.color,
+    ...(isLegendItemShape(candidate.shape) ? { shape: candidate.shape } : {}),
+    ...(typeof candidate.strokeColor === "string"
+      ? { strokeColor: candidate.strokeColor }
+      : {}),
+    ...(typeof candidate.icon === "string" ? { icon: candidate.icon } : {}),
+  };
+}
+
+function isLegendItemShape(
+  value: unknown,
+): value is ComponentLegendItem["shape"] {
+  return LEGEND_ITEM_SHAPES.has(value as ComponentLegendItem["shape"]);
+}
+
+function normalizeControlPosition(
+  value: unknown,
+  fallback: GeoLibreMapControlPosition,
+): GeoLibreMapControlPosition {
+  return typeof value === "string" &&
+    CONTROL_POSITIONS.has(value as GeoLibreMapControlPosition)
+    ? (value as GeoLibreMapControlPosition)
+    : fallback;
+}
+
+function selectedIndex(value: unknown, length: number): number {
+  if (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= 0 &&
+    value < length
+  ) {
+    return value;
+  }
+  return length > 0 ? length - 1 : -1;
+}
+
+function finiteNumber(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+export function openFlatGeobufAddVectorLayerPanel(app: GeoLibreAppAPI): void {
   void openStandaloneFlatGeobufControl(app);
 }
 
@@ -754,10 +1426,12 @@ export async function addCogRasterLayer(
     return addGeoTiffRasterLayer(app, options);
   }
 
-  ensureCogRasterMercatorProjection(app);
+  ensureMercatorProjection(app.getMap?.());
   const control = await ensureCogRasterControl(app);
   if (!control) {
-    throw new Error("The COG raster layer control could not be added to the map.");
+    throw new Error(
+      "The COG raster layer control could not be added to the map.",
+    );
   }
 
   try {
@@ -786,11 +1460,175 @@ export function isSearchPlacesPanelVisible(): boolean {
   return searchPlacesPanelVisible;
 }
 
-export function subscribeSearchPlacesPanel(
-  listener: () => void,
-): () => void {
+export function subscribeSearchPlacesPanel(listener: () => void): () => void {
   searchPlacesPanelListeners.add(listener);
   return () => searchPlacesPanelListeners.delete(listener);
+}
+
+// Standalone Measure panel, opened on demand from the Controls menu.
+export function openMeasurePanel(app: GeoLibreAppAPI): void {
+  void openStandaloneMeasureControl(app);
+}
+
+export function closeMeasurePanel(app: GeoLibreAppAPI): void {
+  teardownMeasureControl(app);
+}
+
+export function isMeasurePanelVisible(): boolean {
+  return measurePanelVisible;
+}
+
+export function subscribeMeasurePanel(listener: () => void): () => void {
+  measurePanelListeners.add(listener);
+  return () => measurePanelListeners.delete(listener);
+}
+
+// Standalone Bookmark panel, opened on demand from the Controls menu.
+export function openBookmarkPanel(app: GeoLibreAppAPI): void {
+  void openStandaloneBookmarkControl(app);
+}
+
+export function closeBookmarkPanel(app: GeoLibreAppAPI): void {
+  teardownBookmarkControl(app);
+}
+
+export function isBookmarkPanelVisible(): boolean {
+  return bookmarkPanelVisible;
+}
+
+export function subscribeBookmarkPanel(listener: () => void): () => void {
+  bookmarkPanelListeners.add(listener);
+  return () => bookmarkPanelListeners.delete(listener);
+}
+
+// Standalone Minimap control, toggled from the Controls menu.
+export function openMinimapPanel(app: GeoLibreAppAPI): void {
+  void openStandaloneMinimapControl(app);
+}
+
+export function closeMinimapPanel(app: GeoLibreAppAPI): void {
+  teardownMinimapControl(app);
+}
+
+export function isMinimapPanelVisible(): boolean {
+  return minimapPanelVisible;
+}
+
+export function subscribeMinimapPanel(listener: () => void): () => void {
+  minimapPanelListeners.add(listener);
+  return () => minimapPanelListeners.delete(listener);
+}
+
+// Standalone View State panel, toggled from the Controls menu.
+export function openViewStatePanel(app: GeoLibreAppAPI): void {
+  void openStandaloneViewStateControl(app);
+}
+
+export function closeViewStatePanel(app: GeoLibreAppAPI): void {
+  teardownViewStateControl(app);
+}
+
+export function isViewStatePanelVisible(): boolean {
+  return viewStatePanelVisible;
+}
+
+export function subscribeViewStatePanel(listener: () => void): () => void {
+  viewStatePanelListeners.add(listener);
+  return () => viewStatePanelListeners.delete(listener);
+}
+
+// The standalone Print panel exports the map via the maplibre-gl-components
+// PrintControl. It is opened on demand from the Project menu.
+export function openPrintPanel(app: GeoLibreAppAPI): void {
+  void openStandalonePrintControl(app);
+}
+
+// Hides the panel but leaves the control mounted on the map (mirrors
+// closeSearchPlacesPanel). For full teardown — removing the control and
+// stopping the theme observer — use closeMaplibreComponentControls(app) or
+// deactivate the plugin.
+export function closePrintPanel(): void {
+  hidePrintControl();
+}
+
+export function isPrintPanelVisible(): boolean {
+  return printPanelVisible;
+}
+
+export function subscribePrintPanel(listener: () => void): () => void {
+  printPanelListeners.add(listener);
+  return () => printPanelListeners.delete(listener);
+}
+
+export function openColorbarPanel(app: GeoLibreAppAPI): void {
+  void openStandaloneColorbarControl(app);
+}
+
+export function closeColorbarPanel(app: GeoLibreAppAPI): void {
+  teardownColorbarControl(app);
+}
+
+export function isColorbarPanelVisible(): boolean {
+  return colorbarPanelVisible;
+}
+
+export function subscribeColorbarPanel(listener: () => void): () => void {
+  colorbarPanelListeners.add(listener);
+  return () => colorbarPanelListeners.delete(listener);
+}
+
+export function openLegendPanel(app: GeoLibreAppAPI): void {
+  void openStandaloneLegendControl(app);
+}
+
+export function closeLegendPanel(app: GeoLibreAppAPI): void {
+  teardownLegendControl(app);
+}
+
+export function isLegendPanelVisible(): boolean {
+  return legendPanelVisible;
+}
+
+export function subscribeLegendPanel(listener: () => void): () => void {
+  legendPanelListeners.add(listener);
+  return () => legendPanelListeners.delete(listener);
+}
+
+export function openHtmlPanel(app: GeoLibreAppAPI): void {
+  void openStandaloneHtmlControl(app);
+}
+
+export function closeHtmlPanel(app: GeoLibreAppAPI): void {
+  teardownHtmlControl(app);
+}
+
+export function closeMaplibreComponentControls(app: GeoLibreAppAPI): void {
+  teardownCogRasterControl(app);
+  teardownGeoTiffRasterOverlay(app);
+  teardownFlatGeobufControl(app);
+  teardownPMTilesControl(app);
+  teardownPrintControl(app);
+  teardownSearchControl(app);
+  teardownMeasureControl(app);
+  teardownBookmarkControl(app);
+  teardownMinimapControl(app);
+  teardownViewStateControl(app);
+  teardownStacSearchControl(app);
+  teardownZarrControl(app);
+  teardownColorbarControl(app);
+  teardownLegendControl(app);
+  teardownHtmlControl(app);
+  teardownLidarControl(app);
+  teardownSplattingControl(app);
+}
+
+export function isHtmlPanelVisible(): boolean {
+  return htmlPanelVisible;
+}
+
+export function subscribeHtmlPanel(listener: () => void): () => void {
+  htmlPanelListeners.add(listener);
+  return () => htmlPanelListeners.delete(listener);
 }
 
 export function openStacSearchLayerPanel(app: GeoLibreAppAPI): void {
@@ -809,9 +1647,7 @@ export function openSplattingLayerPanel(app: GeoLibreAppAPI): void {
   void openStandaloneSplattingControl(app);
 }
 
-function getComponentsOptions(
-  app: GeoLibreAppAPI,
-): ControlGridOptions {
+function getComponentsOptions(app: GeoLibreAppAPI): ControlGridOptions {
   return {
     ...COMPONENTS_OPTIONS,
     basemapStyleUrl: app.getActiveBasemap(),
@@ -894,10 +1730,41 @@ async function openStandalonePMTilesControl(
   return true;
 }
 
+async function openStandalonePrintControl(
+  app: GeoLibreAppAPI,
+): Promise<boolean> {
+  const { PrintControl: PrintControlClass } =
+    await getComponentsConstructors();
+
+  printControl ??= createPrintControl(PrintControlClass);
+
+  if (!printControlMounted) {
+    const added = app.addMapControl(printControl, printControlPosition);
+    if (!added) {
+      printControl = null;
+      return false;
+    }
+    printControlMounted = true;
+    startPrintThemeSync();
+  }
+
+  setTimeout(() => {
+    // Guard against a teardown that nulled printControl between addMapControl
+    // succeeding and this deferred callback firing, which would otherwise mark
+    // the panel visible even though the control no longer exists.
+    if (!printControl) return;
+    printControl.show();
+    printControl.expand();
+    setPrintPanelVisible(true);
+  }, 0);
+  return true;
+}
+
 async function openStandaloneSearchControl(
   app: GeoLibreAppAPI,
 ): Promise<boolean> {
-  const { SearchControl: SearchControlClass } = await getComponentsConstructors();
+  const { SearchControl: SearchControlClass } =
+    await getComponentsConstructors();
 
   searchControl ??= createSearchControl(SearchControlClass);
 
@@ -918,6 +1785,168 @@ async function openStandaloneSearchControl(
   return true;
 }
 
+async function openStandaloneMeasureControl(
+  app: GeoLibreAppAPI,
+): Promise<boolean> {
+  const { MeasureControl: MeasureControlClass } =
+    await getComponentsConstructors();
+
+  measureControl ??= createMeasureControl(MeasureControlClass, app);
+
+  if (!measureControlMounted) {
+    const added = app.addMapControl(measureControl, measureControlPosition);
+    if (!added) {
+      measureControl = null;
+      return false;
+    }
+    measureControlMounted = true;
+  }
+
+  setTimeout(() => {
+    // Guard against a teardown that nulled measureControl between addMapControl
+    // succeeding and this deferred callback firing, which would otherwise mark
+    // the panel visible even though the control no longer exists.
+    if (!measureControl) return;
+    measureControl.show();
+    measureControl.expand();
+    setMeasurePanelVisible(true);
+  }, 0);
+  return true;
+}
+
+async function openStandaloneBookmarkControl(
+  app: GeoLibreAppAPI,
+): Promise<boolean> {
+  const { BookmarkControl: BookmarkControlClass } =
+    await getComponentsConstructors();
+
+  bookmarkControl ??= createBookmarkControl(BookmarkControlClass, app);
+
+  if (!bookmarkControlMounted) {
+    const added = app.addMapControl(bookmarkControl, bookmarkControlPosition);
+    if (!added) {
+      bookmarkControl = null;
+      return false;
+    }
+    bookmarkControlMounted = true;
+  }
+
+  setTimeout(() => {
+    if (!bookmarkControl) return;
+    bookmarkControl.show();
+    bookmarkControl.expand();
+    setBookmarkPanelVisible(true);
+  }, 0);
+  return true;
+}
+
+async function openStandaloneMinimapControl(
+  app: GeoLibreAppAPI,
+): Promise<boolean> {
+  const { MinimapControl: MinimapControlClass } =
+    await getComponentsConstructors();
+
+  minimapControl ??= createMinimapControl(
+    MinimapControlClass,
+    app.getActiveBasemap(),
+    app,
+  );
+
+  if (!minimapControlMounted) {
+    const added = app.addMapControl(minimapControl, minimapControlPosition);
+    if (!added) {
+      minimapControl = null;
+      return false;
+    }
+    minimapControlMounted = true;
+    // MinimapControl has no setStyle method and is reused across reopens, so
+    // recreate it whenever the active basemap changes to avoid showing a stale
+    // style for the rest of the session.
+    minimapBasemapUnsubscribe ??= app.onBasemapChange(() => {
+      void refreshMinimapBasemap(app);
+    });
+  }
+
+  setTimeout(() => {
+    if (!minimapControl) return;
+    minimapControl.show();
+    minimapControl.expand();
+    setMinimapPanelVisible(true);
+  }, 0);
+  return true;
+}
+
+// Swap the mounted minimap for a fresh instance built with the current
+// basemap. MinimapControl bakes the style in at construction and exposes no
+// style setter, so a rebuild is the only way to follow a basemap change.
+async function refreshMinimapBasemap(app: GeoLibreAppAPI): Promise<void> {
+  if (!minimapControl || !minimapControlMounted) return;
+  const controlAtStart = minimapControl;
+  const { MinimapControl: MinimapControlClass } =
+    await getComponentsConstructors();
+  // Bail out if a concurrent refresh already rebuilt the control or a teardown
+  // ran while awaiting; otherwise rapid basemap switches could double-remove
+  // the just-added control and leave two minimap instances on the map.
+  if (
+    !minimapControl ||
+    !minimapControlMounted ||
+    minimapControl !== controlAtStart
+  ) {
+    return;
+  }
+
+  app.removeMapControl(minimapControl);
+  minimapControl = createMinimapControl(
+    MinimapControlClass,
+    app.getActiveBasemap(),
+    app,
+  );
+  const added = app.addMapControl(minimapControl, minimapControlPosition);
+  if (!added) {
+    // Also drop the basemap subscription: minimapControlMounted is now false,
+    // so without nulling the unsubscribe the `??=` in openStandaloneMinimapControl
+    // would never re-subscribe on a later reopen, silently disabling refresh.
+    minimapBasemapUnsubscribe?.();
+    minimapBasemapUnsubscribe = null;
+    minimapControl = null;
+    minimapControlMounted = false;
+    setMinimapPanelVisible(false);
+    return;
+  }
+
+  setTimeout(() => {
+    if (!minimapControl) return;
+    minimapControl.show();
+    minimapControl.expand();
+  }, 0);
+}
+
+async function openStandaloneViewStateControl(
+  app: GeoLibreAppAPI,
+): Promise<boolean> {
+  const { ViewStateControl: ViewStateControlClass } =
+    await getComponentsConstructors();
+
+  viewStateControl ??= createViewStateControl(ViewStateControlClass, app);
+
+  if (!viewStateControlMounted) {
+    const added = app.addMapControl(viewStateControl, viewStateControlPosition);
+    if (!added) {
+      viewStateControl = null;
+      return false;
+    }
+    viewStateControlMounted = true;
+  }
+
+  setTimeout(() => {
+    if (!viewStateControl) return;
+    viewStateControl.show();
+    viewStateControl.expand();
+    setViewStatePanelVisible(true);
+  }, 0);
+  return true;
+}
+
 async function openStandaloneStacSearchControl(
   app: GeoLibreAppAPI,
 ): Promise<boolean> {
@@ -927,7 +1956,10 @@ async function openStandaloneStacSearchControl(
   stacSearchControl ??= createStacSearchControl(StacSearchControlClass);
 
   if (!stacSearchControlMounted) {
-    const added = app.addMapControl(stacSearchControl, stacSearchControlPosition);
+    const added = app.addMapControl(
+      stacSearchControl,
+      stacSearchControlPosition,
+    );
     if (!added) {
       stacSearchControl = null;
       return false;
@@ -966,14 +1998,90 @@ async function openStandaloneZarrControl(
   return true;
 }
 
+async function openStandaloneColorbarControl(
+  app: GeoLibreAppAPI,
+): Promise<boolean> {
+  const { ColorbarGuiControl: ColorbarGuiControlClass } =
+    await getComponentsConstructors();
+
+  colorbarControl ??= createColorbarControl(ColorbarGuiControlClass);
+
+  if (!colorbarControlMounted) {
+    const added = app.addMapControl(colorbarControl, colorbarControlPosition);
+    if (!added) {
+      colorbarControl = null;
+      return false;
+    }
+    colorbarControlMounted = true;
+  }
+
+  setTimeout(() => {
+    colorbarControl?.show();
+    // expand() fires the "expand" handler, which applies the viewport
+    // constraint, so no separate constrainGuiPanelToViewport call is needed.
+    colorbarControl?.expand();
+    setColorbarPanelVisible(true);
+  }, 0);
+  return true;
+}
+
+async function openStandaloneLegendControl(
+  app: GeoLibreAppAPI,
+): Promise<boolean> {
+  const { LegendGuiControl: LegendGuiControlClass } =
+    await getComponentsConstructors();
+
+  legendControl ??= createLegendControl(LegendGuiControlClass);
+
+  if (!legendControlMounted) {
+    const added = app.addMapControl(legendControl, legendControlPosition);
+    if (!added) {
+      legendControl = null;
+      return false;
+    }
+    legendControlMounted = true;
+  }
+
+  setTimeout(() => {
+    legendControl?.show();
+    legendControl?.expand();
+    setLegendPanelVisible(true);
+  }, 0);
+  return true;
+}
+
+async function openStandaloneHtmlControl(
+  app: GeoLibreAppAPI,
+): Promise<boolean> {
+  const { HtmlGuiControl: HtmlGuiControlClass } =
+    await getComponentsConstructors();
+
+  htmlControl ??= createHtmlControl(HtmlGuiControlClass);
+
+  if (!htmlControlMounted) {
+    const added = app.addMapControl(htmlControl, htmlControlPosition);
+    if (!added) {
+      htmlControl = null;
+      return false;
+    }
+    htmlControlMounted = true;
+  }
+
+  setTimeout(() => {
+    htmlControl?.show();
+    htmlControl?.expand();
+    setHtmlPanelVisible(true);
+  }, 0);
+  return true;
+}
+
 async function openStandaloneLidarControl(
   app: GeoLibreAppAPI,
 ): Promise<boolean> {
   const {
     LidarControl: LidarControlClass,
     LidarLayerAdapter: LidarLayerAdapterClass,
-  } =
-    await getComponentsConstructors();
+  } = await getComponentsConstructors();
 
   lidarControl ??= createLidarControl(
     LidarControlClass,
@@ -1012,10 +2120,7 @@ async function openStandaloneSplattingControl(
   );
 
   if (!splattingControlMounted) {
-    const added = app.addMapControl(
-      splattingControl,
-      splattingControlPosition,
-    );
+    const added = app.addMapControl(splattingControl, splattingControlPosition);
     if (!added) {
       splattingControl = null;
       return false;
@@ -1098,7 +2203,10 @@ function createCogRasterControl(
 
       if (currentLayer.opacity !== layer.opacity) {
         if (currentLayer.visible) {
-          cogRasterControl?.setLayerOpacity(currentLayer.id, currentLayer.opacity);
+          cogRasterControl?.setLayerOpacity(
+            currentLayer.id,
+            currentLayer.opacity,
+          );
         } else {
           cogRasterControl?.setLayerVisibility(
             currentLayer.id,
@@ -1182,7 +2290,10 @@ function createSplattingControl(
       }
 
       if (currentLayer.opacity !== layer.opacity) {
-        splattingLayerAdapter?.setOpacity(currentLayer.id, currentLayer.opacity);
+        splattingLayerAdapter?.setOpacity(
+          currentLayer.id,
+          currentLayer.opacity,
+        );
       }
     }
   });
@@ -1286,6 +2397,252 @@ function createSearchControl(
   return control;
 }
 
+// The panel's close (X) / collapse button emits "collapse". Treat that as a
+// request to remove the control entirely so the in-panel close button and the
+// Controls-menu toggle stay in sync — otherwise a collapsed icon button lingers
+// on the map with no way to dismiss it. Teardown is deferred so it runs after
+// the control finishes emitting the event.
+function createMeasureControl(
+  MeasureControlClass: MeasureControlConstructor,
+  app: GeoLibreAppAPI,
+): MeasureControl {
+  const control = new MeasureControlClass(MEASURE_OPTIONS);
+  control.on("collapse", () => {
+    if (control !== measureControl) return;
+    setTimeout(() => {
+      if (control === measureControl) teardownMeasureControl(app);
+    }, 0);
+  });
+  return control;
+}
+
+function createBookmarkControl(
+  BookmarkControlClass: BookmarkControlConstructor,
+  app: GeoLibreAppAPI,
+): BookmarkControl {
+  const control = new BookmarkControlClass(BOOKMARK_OPTIONS);
+  control.on("collapse", () => {
+    if (control !== bookmarkControl) return;
+    setTimeout(() => {
+      if (control === bookmarkControl) teardownBookmarkControl(app);
+    }, 0);
+  });
+  routeBookmarkFileIoThroughHost(control, app);
+  return control;
+}
+
+/**
+ * The BookmarkControl's built-in Import/Export use a Blob `<a download>` and a
+ * hidden `<input type="file">`, which do not work inside the Tauri WebView.
+ * Override the control's instance file-I/O methods so the host's runtime-aware
+ * helpers (a native dialog under Tauri, a download/file-input on the web) are
+ * used instead. Falls back to the control's originals if the host does not
+ * provide the helpers.
+ */
+function routeBookmarkFileIoThroughHost(
+  control: BookmarkControl,
+  app: GeoLibreAppAPI,
+): void {
+  // `_exportToFile`/`_importFromFile` are private (underscore-prefixed) members
+  // of BookmarkControl as of maplibre-gl-components@0.20.1. If a future version
+  // renames them, the overrides below silently stop being called and file I/O
+  // regresses to the WebView-incompatible Blob/file-input path — so warn loudly
+  // to flag it when bumping the dependency.
+  const io = control as unknown as {
+    _exportToFile?: () => void;
+    _importFromFile?: () => void;
+    exportBookmarks: () => string;
+    importBookmarks: (bookmarks: MapBookmark[]) => unknown;
+  };
+  if (!io._exportToFile || !io._importFromFile) {
+    console.warn(
+      "BookmarkControl: _exportToFile/_importFromFile not found; Tauri-aware " +
+        "Import/Export overrides are inactive. Check maplibre-gl-components.",
+    );
+    return;
+  }
+  const originalExport = io._exportToFile.bind(control);
+  const originalImport = io._importFromFile.bind(control);
+  const dialogOptions = {
+    description: "Bookmarks",
+    extensions: ["json"],
+    mimeType: "application/json",
+  };
+
+  io._exportToFile = () => {
+    if (!app.exportTextFile) {
+      originalExport();
+      return;
+    }
+    app.exportTextFile("bookmarks.json", io.exportBookmarks(), dialogOptions);
+  };
+
+  io._importFromFile = () => {
+    if (!app.importTextFile) {
+      originalImport();
+      return;
+    }
+    app
+      .importTextFile(dialogOptions)
+      .then((text) => {
+        if (!text || control !== bookmarkControl) return;
+        let data: unknown;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          console.warn("BookmarkControl: failed to parse imported file");
+          return;
+        }
+        if (!Array.isArray(data)) {
+          console.warn("BookmarkControl: imported data is not an array");
+          return;
+        }
+        const valid = data.filter(
+          (bookmark): bookmark is MapBookmark =>
+            !!bookmark &&
+            typeof (bookmark as MapBookmark).name === "string" &&
+            Number.isFinite((bookmark as MapBookmark).lng) &&
+            Number.isFinite((bookmark as MapBookmark).lat) &&
+            Number.isFinite((bookmark as MapBookmark).zoom),
+        );
+        if (valid.length === 0) {
+          console.warn("BookmarkControl: no valid bookmarks found in file");
+          return;
+        }
+        io.importBookmarks(valid);
+      })
+      .catch((error) => {
+        console.warn("BookmarkControl: import failed", error);
+      });
+  };
+}
+
+function createMinimapControl(
+  MinimapControlClass: MinimapControlConstructor,
+  basemapStyleUrl: string,
+  app: GeoLibreAppAPI,
+): MinimapControl {
+  const control = new MinimapControlClass({
+    ...MINIMAP_OPTIONS,
+    style: basemapStyleUrl,
+  });
+  control.on("collapse", () => {
+    if (control !== minimapControl) return;
+    setTimeout(() => {
+      if (control === minimapControl) teardownMinimapControl(app);
+    }, 0);
+  });
+  return control;
+}
+
+function createViewStateControl(
+  ViewStateControlClass: ViewStateControlConstructor,
+  app: GeoLibreAppAPI,
+): ViewStateControl {
+  const control = new ViewStateControlClass(VIEW_STATE_OPTIONS);
+  control.on("collapse", () => {
+    if (control !== viewStateControl) return;
+    setTimeout(() => {
+      if (control === viewStateControl) teardownViewStateControl(app);
+    }, 0);
+  });
+  return control;
+}
+
+/**
+ * Read the current GeoLibre theme from the `dark` class that the desktop app
+ * toggles on the document element so the PrintControl panel can be forced to
+ * match it (rather than following the system `prefers-color-scheme`, which may
+ * differ from the in-app theme).
+ */
+function resolveDocumentTheme(): PrintTheme {
+  if (typeof document === "undefined") return "auto";
+  return document.documentElement.classList.contains("dark")
+    ? "dark"
+    : "light";
+}
+
+function createPrintControl(
+  PrintControlClass: PrintControlConstructor,
+): PrintControl {
+  const control = new PrintControlClass({
+    ...PRINT_OPTIONS,
+    theme: resolveDocumentTheme(),
+  });
+  // Skip if a teardown has already replaced the module reference with a newer
+  // instance, so a late `collapse` from an orphaned control is ignored.
+  control.on("collapse", () => {
+    if (control === printControl) hidePrintControl();
+  });
+  return control;
+}
+
+/**
+ * Keep the PrintControl panel theme in sync with the in-app light/dark toggle
+ * by observing the `class` attribute of the document element.
+ */
+function startPrintThemeSync(): void {
+  if (
+    printThemeObserver ||
+    typeof MutationObserver === "undefined" ||
+    typeof document === "undefined"
+  ) {
+    return;
+  }
+  // The observer fires on any `class` mutation of <html>, so cache the last
+  // applied theme and only call setTheme when the dark/light value flips.
+  let lastTheme = resolveDocumentTheme();
+  printThemeObserver = new MutationObserver(() => {
+    const next = resolveDocumentTheme();
+    if (next === lastTheme) return;
+    lastTheme = next;
+    printControl?.setTheme(next);
+  });
+  printThemeObserver.observe(document.documentElement, {
+    attributeFilter: ["class"],
+  });
+}
+
+function stopPrintThemeSync(): void {
+  printThemeObserver?.disconnect();
+  printThemeObserver = null;
+}
+
+function createColorbarControl(
+  ColorbarGuiControlClass: ColorbarGuiControlConstructor,
+): ColorbarGuiControl {
+  const control = new ColorbarGuiControlClass(COLORBAR_OPTIONS);
+  control.on("expand", () => {
+    constrainGuiPanelToViewport(
+      ".geolibre-colorbar-control .colorbar-gui-panel",
+    );
+    setColorbarPanelVisible(true);
+  });
+  return control;
+}
+
+function createLegendControl(
+  LegendGuiControlClass: LegendGuiControlConstructor,
+): LegendGuiControl {
+  const control = new LegendGuiControlClass(LEGEND_OPTIONS);
+  control.on("expand", () => {
+    constrainGuiPanelToViewport(".geolibre-legend-control .legend-gui-panel");
+    setLegendPanelVisible(true);
+  });
+  return control;
+}
+
+function createHtmlControl(
+  HtmlGuiControlClass: HtmlGuiControlConstructor,
+): HtmlGuiControl {
+  const control = new HtmlGuiControlClass(HTML_OPTIONS);
+  control.on("expand", () => {
+    constrainGuiPanelToViewport(".geolibre-html-control .html-gui-panel");
+    setHtmlPanelVisible(true);
+  });
+  return control;
+}
+
 function createStacSearchControl(
   StacSearchControlClass: StacSearchControlConstructor,
 ): StacSearchControl {
@@ -1376,6 +2733,29 @@ function teardownSearchControl(app: GeoLibreAppAPI): void {
   setSearchPlacesPanelVisible(false);
 }
 
+function teardownPrintControl(app: GeoLibreAppAPI): void {
+  stopPrintThemeSync();
+  if (printControl && printControlMounted) {
+    app.removeMapControl(printControl);
+  }
+  printControl = null;
+  printControlMounted = false;
+  setPrintPanelVisible(false);
+}
+
+function hidePrintControl(): void {
+  printControl?.hide();
+  setPrintPanelVisible(false);
+}
+
+function setPrintPanelVisible(visible: boolean): void {
+  if (printPanelVisible === visible) return;
+  printPanelVisible = visible;
+  for (const listener of printPanelListeners) {
+    listener();
+  }
+}
+
 function teardownStacSearchControl(app: GeoLibreAppAPI): void {
   stacSearchStoreUnsubscribe?.();
   stacSearchStoreUnsubscribe = null;
@@ -1399,6 +2779,76 @@ function setSearchPlacesPanelVisible(visible: boolean): void {
   }
 }
 
+function teardownMeasureControl(app: GeoLibreAppAPI): void {
+  if (measureControl && measureControlMounted) {
+    app.removeMapControl(measureControl);
+  }
+  measureControl = null;
+  measureControlMounted = false;
+  setMeasurePanelVisible(false);
+}
+
+function setMeasurePanelVisible(visible: boolean): void {
+  if (measurePanelVisible === visible) return;
+  measurePanelVisible = visible;
+  for (const listener of measurePanelListeners) {
+    listener();
+  }
+}
+
+function teardownBookmarkControl(app: GeoLibreAppAPI): void {
+  if (bookmarkControl && bookmarkControlMounted) {
+    app.removeMapControl(bookmarkControl);
+  }
+  bookmarkControl = null;
+  bookmarkControlMounted = false;
+  setBookmarkPanelVisible(false);
+}
+
+function setBookmarkPanelVisible(visible: boolean): void {
+  if (bookmarkPanelVisible === visible) return;
+  bookmarkPanelVisible = visible;
+  for (const listener of bookmarkPanelListeners) {
+    listener();
+  }
+}
+
+function teardownMinimapControl(app: GeoLibreAppAPI): void {
+  minimapBasemapUnsubscribe?.();
+  minimapBasemapUnsubscribe = null;
+  if (minimapControl && minimapControlMounted) {
+    app.removeMapControl(minimapControl);
+  }
+  minimapControl = null;
+  minimapControlMounted = false;
+  setMinimapPanelVisible(false);
+}
+
+function setMinimapPanelVisible(visible: boolean): void {
+  if (minimapPanelVisible === visible) return;
+  minimapPanelVisible = visible;
+  for (const listener of minimapPanelListeners) {
+    listener();
+  }
+}
+
+function teardownViewStateControl(app: GeoLibreAppAPI): void {
+  if (viewStateControl && viewStateControlMounted) {
+    app.removeMapControl(viewStateControl);
+  }
+  viewStateControl = null;
+  viewStateControlMounted = false;
+  setViewStatePanelVisible(false);
+}
+
+function setViewStatePanelVisible(visible: boolean): void {
+  if (viewStatePanelVisible === visible) return;
+  viewStatePanelVisible = visible;
+  for (const listener of viewStatePanelListeners) {
+    listener();
+  }
+}
+
 function teardownZarrControl(app: GeoLibreAppAPI): void {
   zarrStoreUnsubscribe?.();
   zarrStoreUnsubscribe = null;
@@ -1407,6 +2857,57 @@ function teardownZarrControl(app: GeoLibreAppAPI): void {
   }
   zarrControl = null;
   zarrControlMounted = false;
+}
+
+function teardownColorbarControl(app: GeoLibreAppAPI): void {
+  if (colorbarControl && colorbarControlMounted) {
+    app.removeMapControl(colorbarControl);
+  }
+  colorbarControl = null;
+  colorbarControlMounted = false;
+  setColorbarPanelVisible(false);
+}
+
+function setColorbarPanelVisible(visible: boolean): void {
+  if (colorbarPanelVisible === visible) return;
+  colorbarPanelVisible = visible;
+  for (const listener of colorbarPanelListeners) {
+    listener();
+  }
+}
+
+function teardownLegendControl(app: GeoLibreAppAPI): void {
+  if (legendControl && legendControlMounted) {
+    app.removeMapControl(legendControl);
+  }
+  legendControl = null;
+  legendControlMounted = false;
+  setLegendPanelVisible(false);
+}
+
+function setLegendPanelVisible(visible: boolean): void {
+  if (legendPanelVisible === visible) return;
+  legendPanelVisible = visible;
+  for (const listener of legendPanelListeners) {
+    listener();
+  }
+}
+
+function teardownHtmlControl(app: GeoLibreAppAPI): void {
+  if (htmlControl && htmlControlMounted) {
+    app.removeMapControl(htmlControl);
+  }
+  htmlControl = null;
+  htmlControlMounted = false;
+  setHtmlPanelVisible(false);
+}
+
+function setHtmlPanelVisible(visible: boolean): void {
+  if (htmlPanelVisible === visible) return;
+  htmlPanelVisible = visible;
+  for (const listener of htmlPanelListeners) {
+    listener();
+  }
 }
 
 function teardownLidarControl(app: GeoLibreAppAPI): void {
@@ -1474,7 +2975,9 @@ function createSplattingLoadHandler(
   };
 }
 
-function createSplattingRemoveHandler(): Parameters<GaussianSplatControl["on"]>[1] {
+function createSplattingRemoveHandler(): Parameters<
+  GaussianSplatControl["on"]
+>[1] {
   return (event) => {
     const id = event.splatId ?? event.modelId;
     if (!id) return;
@@ -1669,7 +3172,9 @@ function addLayerWithCogRasterControl(
     };
     const handleError: CogLayerEventHandler = (event) => {
       settle(() =>
-        reject(new Error(event.error || "Failed to load the COG raster layer.")),
+        reject(
+          new Error(event.error || "Failed to load the COG raster layer."),
+        ),
       );
     };
 
@@ -1747,41 +3252,36 @@ async function ensureGeoTiffRasterOverlay(
     geoTiffRasterOverlayMounted = true;
   }
 
-  geoTiffRasterStoreUnsubscribe ??= useAppStore.subscribe(
-    (state, previous) => {
-      const currentById = new Map(state.layers.map((layer) => [layer.id, layer]));
+  geoTiffRasterStoreUnsubscribe ??= useAppStore.subscribe((state, previous) => {
+    const currentById = new Map(state.layers.map((layer) => [layer.id, layer]));
 
-      for (const layer of previous.layers) {
-        if (!isGeoTiffRasterLayer(layer)) continue;
+    for (const layer of previous.layers) {
+      if (!isGeoTiffRasterLayer(layer)) continue;
 
-        const currentLayer = currentById.get(layer.id);
-        if (!currentLayer) {
-          geoTiffRasterLayerProps.delete(layer.id);
-          geoTiffRasterLayers.delete(layer.id);
-          continue;
-        }
-
-        if (!isGeoTiffRasterLayer(currentLayer)) continue;
-
-        if (
-          currentLayer.visible !== layer.visible ||
-          currentLayer.opacity !== layer.opacity
-        ) {
-          const rasterState = geoTiffRasterLayerProps.get(layer.id);
-          if (!rasterState) continue;
-          rasterState.visible = currentLayer.visible;
-          rasterState.opacity = currentLayer.opacity;
-          geoTiffRasterLayerProps.set(layer.id, rasterState);
-          geoTiffRasterLayers.set(
-            layer.id,
-            createGeoTiffDeckLayer(rasterState),
-          );
-        }
+      const currentLayer = currentById.get(layer.id);
+      if (!currentLayer) {
+        geoTiffRasterLayerProps.delete(layer.id);
+        geoTiffRasterLayers.delete(layer.id);
+        continue;
       }
 
-      updateGeoTiffRasterOverlayLayers();
-    },
-  );
+      if (!isGeoTiffRasterLayer(currentLayer)) continue;
+
+      if (
+        currentLayer.visible !== layer.visible ||
+        currentLayer.opacity !== layer.opacity
+      ) {
+        const rasterState = geoTiffRasterLayerProps.get(layer.id);
+        if (!rasterState) continue;
+        rasterState.visible = currentLayer.visible;
+        rasterState.opacity = currentLayer.opacity;
+        geoTiffRasterLayerProps.set(layer.id, rasterState);
+        geoTiffRasterLayers.set(layer.id, createGeoTiffDeckLayer(rasterState));
+      }
+    }
+
+    updateGeoTiffRasterOverlayLayers();
+  });
 
   return geoTiffRasterOverlay;
 }
@@ -2045,9 +3545,7 @@ function getGeoTiffGeographicBounds(
   ];
 }
 
-function createGeoTiffDeckLayer(
-  state: GeoTiffRasterLayerState,
-): Layer {
+function createGeoTiffDeckLayer(state: GeoTiffRasterLayerState): Layer {
   return new RasterLayer({
     id: state.id,
     image: state.raster.image,
@@ -2102,16 +3600,6 @@ function configureCogRasterControl(
     mutableControl._options.beforeId = options.beforeLayerId || "";
   }
   mutableControl._render?.();
-}
-
-function ensureCogRasterMercatorProjection(app: GeoLibreAppAPI): void {
-  try {
-    const map = app.getMap?.();
-    if (!map || map.getProjection()?.type === "mercator") return;
-    map.setProjection({ type: "mercator" });
-  } catch {
-    // MapLibre can reject projection changes while the style is still settling.
-  }
 }
 
 function createFlatGeobufStoreLayer(
@@ -2348,9 +3836,7 @@ function createStacSearchStoreLayer(
 ): GeoLibreLayer {
   const rasterLayerInfo = getStacSearchRasterLayerInfo(snapshot.layer);
   const deckLayerProps = "props" in snapshot.layer ? snapshot.layer.props : {};
-  const sourceKind = rasterLayerInfo
-    ? "stac-search-raster"
-    : "stac-search-cog";
+  const sourceKind = rasterLayerInfo ? "stac-search-raster" : "stac-search-cog";
   const url = rasterLayerInfo?.tileUrl ?? getDeckLayerSourceUrl(snapshot.layer);
   const nativeLayerIds = rasterLayerInfo
     ? [rasterLayerInfo.layerId]
@@ -2586,7 +4072,7 @@ function patchStacSearchCogLayer(control: StacSearchControl): void {
     item: StacSearchItem,
     assetKey: string,
   ) => {
-    ensureStacSearchMercatorProjection(mutableControl);
+    ensureMercatorProjection(mutableControl._map);
     await mutableControl._ensureOverlay?.();
     const selectedAsset = getStacSearchSelectedAsset(mutableControl, item, {
       key: assetKey,
@@ -2596,9 +4082,8 @@ function patchStacSearchCogLayer(control: StacSearchControl): void {
       mutableControl._convertS3ToHttps?.(selectedAsset.url) ??
         selectedAsset.url,
     );
-    const { COGLayer: COGLayerClass, texture } = await import(
-      "@developmentseed/deck.gl-geotiff"
-    );
+    const { COGLayer: COGLayerClass, texture } =
+      await import("@developmentseed/deck.gl-geotiff");
     const renderProps = await createStacCogRenderProps(
       texture,
       getStacSearchRenderOptions(mutableControl),
@@ -2670,7 +4155,10 @@ function getStacSearchRenderOptions(
   };
 }
 
-async function createStacCogRenderProps(texture: unknown, renderOptions: StacCogRenderOptions): Promise<{
+async function createStacCogRenderProps(
+  texture: unknown,
+  renderOptions: StacCogRenderOptions,
+): Promise<{
   getTileData: (
     image: StacCogImageLike,
     options: StacCogTileOptions,
@@ -2679,12 +4167,8 @@ async function createStacCogRenderProps(texture: unknown, renderOptions: StacCog
     renderPipeline: Array<{ module: unknown; props?: Record<string, unknown> }>;
   };
 }> {
-  const {
-    BlackIsZero,
-    CreateTexture,
-    FilterNoDataVal,
-    LinearRescale,
-  } = await import("@developmentseed/deck.gl-raster/gpu-modules");
+  const { BlackIsZero, CreateTexture, FilterNoDataVal, LinearRescale } =
+    await import("@developmentseed/deck.gl-raster/gpu-modules");
   const { getColormap } = (await import("maplibre-gl-components")) as {
     getColormap?: (name: string) => StacColorStop[];
   };
@@ -2909,9 +4393,7 @@ function parseStacColor(color: string): [number, number, number] {
     ];
   }
 
-  const rgb = color.match(
-    /(?:rgb|vec3)\(([\d.]+),\s*([\d.]+),\s*([\d.]+)\)/i,
-  );
+  const rgb = color.match(/(?:rgb|vec3)\(([\d.]+),\s*([\d.]+),\s*([\d.]+)\)/i);
   if (!rgb) return [0, 0, 0];
   const values = rgb.slice(1, 4).map(Number);
   const scale = values.some((value) => value > 1) ? 1 : 255;
@@ -2958,17 +4440,6 @@ function getStacCogShaderNoData(): number | null {
   return null;
 }
 
-function ensureStacSearchMercatorProjection(
-  control: MutableStacSearchControl,
-): void {
-  try {
-    if (control._map?.getProjection()?.type === "mercator") return;
-    control._map?.setProjection({ type: "mercator" });
-  } catch {
-    // MapLibre may reject projection changes while the style is still settling.
-  }
-}
-
 async function patchStacSearchCOGLayerClass(
   COGLayerClass: unknown,
 ): Promise<void> {
@@ -2990,9 +4461,8 @@ async function patchStacSearchCOGLayerClass(
 }
 
 function removeStacSearchControlLayer(id: string): void {
-  const mutableControl = stacSearchControl as unknown as
-    | MutableStacSearchControl
-    | null;
+  const mutableControl =
+    stacSearchControl as unknown as MutableStacSearchControl | null;
   mutableControl?._removeLayer?.(id);
 }
 
@@ -3001,17 +4471,17 @@ function setStacSearchControlLayerState(
   visible: boolean,
   opacity: number,
 ): void {
-  const mutableControl = stacSearchControl as unknown as
-    | MutableStacSearchControl
-    | null;
+  const mutableControl =
+    stacSearchControl as unknown as MutableStacSearchControl | null;
   const layer = mutableControl?._cogLayers?.get(id);
   if (!layer) return;
 
   const appliedOpacity = visible ? opacity : 0;
   const rasterLayerInfo = getStacSearchRasterLayerInfo(layer);
   if (rasterLayerInfo) {
-    const map = (stacSearchControl as unknown as MutableStacSearchControl | null)
-      ?._map;
+    const map = (
+      stacSearchControl as unknown as MutableStacSearchControl | null
+    )?._map;
     try {
       map?.setLayoutProperty(
         rasterLayerInfo.layerId,
@@ -3040,9 +4510,7 @@ function setStacSearchControlLayerState(
   });
 }
 
-function getStacSearchDeckLayers(
-  control: MutableStacSearchControl,
-): Layer[] {
+function getStacSearchDeckLayers(control: MutableStacSearchControl): Layer[] {
   return Array.from(control._cogLayers?.values() ?? []).filter(
     (layer): layer is Layer => !getStacSearchRasterLayerInfo(layer),
   );
@@ -3115,10 +4583,7 @@ async function createStacGeoKeysParser(): Promise<StacGeoKeysParser> {
 }
 
 function registerStacCommonProjections(): void {
-  proj4.defs(
-    "EPSG:4326",
-    "+proj=longlat +datum=WGS84 +no_defs +type=crs",
-  );
+  proj4.defs("EPSG:4326", "+proj=longlat +datum=WGS84 +no_defs +type=crs");
   proj4.defs(
     "EPSG:3857",
     "+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 " +
@@ -3153,9 +4618,11 @@ function stacSearchLayerName(
   item?: StacSearchItem | null,
   collectionId?: string,
 ): string {
-  return [collectionId, item?.id, stacAssetFromLayerId(id)]
-    .filter(Boolean)
-    .join(" - ") || id;
+  return (
+    [collectionId, item?.id, stacAssetFromLayerId(id)]
+      .filter(Boolean)
+      .join(" - ") || id
+  );
 }
 
 function stacAssetFromLayerId(id: string): string | undefined {
@@ -3229,9 +4696,8 @@ function getSplattingControlContainer(
 }
 
 function disableLidarClickOutsideCollapse(control: LidarControl | null): void {
-  const clickOutsideState = control as unknown as
-    | LidarControlClickOutsideState
-    | null;
+  const clickOutsideState =
+    control as unknown as LidarControlClickOutsideState | null;
   const handler = clickOutsideState?._clickOutsideHandler;
   if (!handler) return;
   document.removeEventListener("click", handler);
@@ -3239,8 +4705,10 @@ function disableLidarClickOutsideCollapse(control: LidarControl | null): void {
 }
 
 function hasLidarPointCloud(id: string): boolean {
-  return lidarControl?.getPointClouds().some((pointCloud) => pointCloud.id === id)
-    ?? false;
+  return (
+    lidarControl?.getPointClouds().some((pointCloud) => pointCloud.id === id) ??
+    false
+  );
 }
 
 function findLidarPanel(control: LidarControl | null): HTMLElement | null {

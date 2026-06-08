@@ -23,6 +23,12 @@ Or:
 geolibre-server
 ```
 
+## Test
+
+```bash
+python -m pytest
+```
+
 ## Whitebox runtime
 
 Whitebox tools use a dedicated GeoLibre-managed Python environment. On first
@@ -42,6 +48,42 @@ GEOLIBRE_WHITEBOX_PACKAGE='whitebox-workflows>=2.0.2'
 WBW_EXTERNAL_PYTHON=/path/to/python
 ```
 
+## Conversion runtime
+
+The **Processing → Conversion** menu uses a dedicated managed runtime
+(DuckDB + rio-cogeo + freestiler), bootstrapped the same way as Whitebox: the
+sidecar finds or installs `uv`, creates a virtual environment, and installs the
+conversion packages on first use.
+
+- **Vector → GeoParquet** and **CSV → GeoParquet** also run entirely in the
+  browser with DuckDB-WASM, so they work in the web build with **no sidecar**.
+- **Vector → FlatGeobuf**, **Vector → PMTiles**, and **Raster → COG** have no
+  in-browser writer and require the sidecar.
+
+To enable them, install the optional extras and run the sidecar:
+
+```bash
+pip install -e ".[conversion]"
+geolibre-server
+```
+
+For the **web** build, serve the app from `localhost:5173` — CORS is restricted
+to that origin and the Tauri origins, so other ports cannot reach the sidecar.
+
+Useful overrides:
+
+```bash
+GEOLIBRE_CONVERSION_PYTHON=/path/to/python   # reuse an existing env (skip bootstrap)
+GEOLIBRE_CONVERSION_ENV=/path/to/venv        # managed runtime location
+GEOLIBRE_CONVERSION_PACKAGES='duckdb>=1.1.0 rio-cogeo>=5.0.0 freestiler>=0.1.0'  # whitespace-separated
+GEOLIBRE_CONVERSION_ROOTS=/data:/srv/geo      # confine inputs/outputs to these roots (os.pathsep-separated; unset = no restriction)
+```
+
+When the sidecar is reachable by untrusted same-origin content (e.g. the
+bundled Docker image), set `GEOLIBRE_CONVERSION_ROOTS` so conversions cannot
+read or overwrite arbitrary filesystem paths. It is unset by default for the
+desktop app, where paths are the user's own filesystem.
+
 ## Endpoints
 
 | Method | Path | Description |
@@ -49,6 +91,13 @@ WBW_EXTERNAL_PYTHON=/path/to/python
 | GET | `/health` | Health check |
 | GET | `/algorithms` | List algorithms |
 | POST | `/run` | Run algorithm (501 placeholder) |
+| GET | `/conversion/status` | Conversion runtime availability |
+| POST | `/conversion/vector-to-geoparquet` | Vector → Hilbert-sorted GeoParquet |
+| POST | `/conversion/vector-to-flatgeobuf` | Vector → Hilbert-sorted FlatGeobuf |
+| POST | `/conversion/csv-to-geoparquet` | CSV (lon/lat) → GeoParquet |
+| POST | `/conversion/vector-to-pmtiles` | Vector → PMTiles (freestiler) |
+| POST | `/conversion/raster-to-cog` | Raster → Cloud Optimized GeoTIFF |
+| GET | `/conversion/jobs/{id}` | Conversion job status |
 
 ## Future stack
 

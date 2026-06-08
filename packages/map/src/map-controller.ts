@@ -522,6 +522,10 @@ export class MapController {
     }
   }
 
+  getBasemapStyleLayerIds(): string[] {
+    return this.getBasemapStyleLayers().map((layer) => layer.id);
+  }
+
   private getBasemapStyleLayers(): maplibregl.LayerSpecification[] {
     if (!this.isStyleReady() || !this.map) return [];
     const map = this.map;
@@ -570,6 +574,28 @@ export class MapController {
   }
 
   fitLayer(layer: GeoLibreLayer): void {
+    if (layer.type === "3d-tiles" && this.map) {
+      const center = layer.metadata.center;
+      if (
+        Array.isArray(center) &&
+        typeof center[0] === "number" &&
+        typeof center[1] === "number" &&
+        Number.isFinite(center[0]) &&
+        Number.isFinite(center[1])
+      ) {
+        // Tilesets only expose their center, not a native zoom range. Use a
+        // conservative floor so city-scale tilesets that render below zoom 18
+        // are not flown past into an empty viewport.
+        this.map.flyTo({
+          center: [center[0], center[1]],
+          duration: 800,
+          pitch: Math.max(this.map.getPitch(), 60),
+          zoom: Math.max(this.map.getZoom(), 14),
+        });
+        return;
+      }
+    }
+
     const bounds =
       getLayerBounds(layer) ??
       this.getLayerMetadataBounds(layer) ??
@@ -586,6 +612,16 @@ export class MapController {
 
   fitBounds(bounds: [number, number, number, number]): void {
     if (!this.map) return;
+    if (bounds.some((value) => !Number.isFinite(value))) return;
+    // A degenerate point-sized box cannot be fit; fly to the point instead.
+    if (bounds[0] === bounds[2] && bounds[1] === bounds[3]) {
+      this.map.flyTo({
+        center: [bounds[0], bounds[1]],
+        zoom: Math.max(this.map.getZoom(), 14),
+        duration: 800,
+      });
+      return;
+    }
     this.map.fitBounds(
       [
         [bounds[0], bounds[1]],
@@ -650,17 +686,7 @@ export class MapController {
   private fitFeature(featureCollection: FeatureCollection): void {
     if (!this.map || featureCollection.features.length === 0) return;
     const box = bbox(featureCollection) as [number, number, number, number];
-    if (box.some((value) => !Number.isFinite(value))) return;
-
-    if (box[0] === box[2] && box[1] === box[3]) {
-      this.map.flyTo({
-        center: [box[0], box[1]],
-        zoom: Math.max(this.map.getZoom(), 14),
-        duration: 800,
-      });
-      return;
-    }
-
+    // fitBounds validates the box and handles point-sized boxes.
     this.fitBounds(box);
   }
 

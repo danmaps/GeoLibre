@@ -1,6 +1,6 @@
 [project]
 name = "geolibre-server"
-version = "0.7.0"
+version = "0.8.0"
 description = "Optional Python processing sidecar for GeoLibre Desktop"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -10,8 +10,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
 whitebox = [
   "whitebox-workflows>=2.0.2",
+]
+conversion = [
+  "duckdb>=1.1.0",
+  "rio-cogeo>=5.0.0",
+  "freestiler>=0.1.0",
 ]
 # Future geospatial stack (not required for MVP UI):
 # geo = [
@@ -32,3 +40,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["geolibre_server"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

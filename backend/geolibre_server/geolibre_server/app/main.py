@@ -1,7 +1,7 @@
 """
 GeoLibre processing sidecar (FastAPI).
 
-Future integrations (v0.8+):
+Future integrations (v0.9+):
 - GDAL / Rasterio — raster I/O, warping, COG
 - GeoPandas — vector operations, reproject, buffer
 - DuckDB Spatial — SQL on GeoParquet, spatial joins
@@ -20,9 +20,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from .conversion import router as conversion_router
 from .whitebox import router as whitebox_router
 
-app = FastAPI(title="GeoLibre Server", version="0.7.0")
+app = FastAPI(title="GeoLibre Server", version="0.8.0")
 # Restrict CORS to the Tauri webview origins and the pinned Vite dev server
 # (vite.config.ts sets strictPort on 5173) rather than any localhost port, so a
 # stray local web app cannot reach the Whitebox endpoints from a browser.
@@ -37,6 +38,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(whitebox_router)
+app.include_router(conversion_router)
 
 
 class RunRequest(BaseModel):

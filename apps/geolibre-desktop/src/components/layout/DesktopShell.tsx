@@ -1,6 +1,11 @@
 import { useAppStore } from "@geolibre/core";
-import type { MapController } from "@geolibre/map";
+import type { MapController, MapDiagnosticEvent } from "@geolibre/map";
 import { MapCanvas } from "@geolibre/map";
+import {
+  restoreRasterLayers,
+  restoreThreeDTilesLayers,
+  restoreVectorLayers,
+} from "@geolibre/plugins";
 import {
   type CSSProperties,
   type DragEvent,
@@ -17,15 +22,23 @@ import {
   loadDroppedVectorFiles,
   loadDroppedVectorPaths,
 } from "../../lib/tauri-io";
-import { createAppAPI, getPluginManager } from "../../hooks/usePlugins";
+import {
+  createAppAPI,
+  getPluginManager,
+  useExternalPluginsReady,
+} from "../../hooks/usePlugins";
 import { registerMbtilesProtocol } from "../../lib/mbtiles";
 import { registerXyzTileProtocol } from "../../lib/xyz-url";
+import {
+  appendDiagnostic,
+  useDiagnosticsSnapshot,
+} from "../../lib/diagnostics";
 import { AttributeTable } from "../panels/AttributeTable";
 import { LayerPanel } from "../panels/LayerPanel";
 import { StylePanel } from "../panels/StylePanel";
+import { DiagnosticsDialog } from "./DiagnosticsDialog";
 import { StatusBar } from "./StatusBar";
 import { TopToolbar } from "./TopToolbar";
-import type { SettingsDialogHandle } from "./SettingsDialog";
 import type { LayoutOptions } from "../../hooks/useLayoutOptions";
 import type { ThemeMode } from "../../hooks/useThemeMode";
 import type { ProjectUrlLoadState } from "../../hooks/useProjectUrlLoader";
@@ -40,7 +53,36 @@ const ProcessingDialog = lazy(() =>
       // throw during render and unmount the whole shell. Fall back to a
       // no-op component so the rest of the app stays interactive.
       console.error("Failed to load ProcessingDialog", error);
-      const Fallback = (() => null) as unknown as typeof import("../processing/ProcessingDialog").ProcessingDialog;
+      const Fallback = (() =>
+        null) as unknown as typeof import("../processing/ProcessingDialog").ProcessingDialog;
+      return { default: Fallback };
+    }),
+);
+
+const ConversionDialog = lazy(() =>
+  import("../processing/ConversionDialog")
+    .then((module) => ({
+      default: module.ConversionDialog,
+    }))
+    .catch((error) => {
+      // Same chunk-load fallback rationale as ProcessingDialog above.
+      console.error("Failed to load ConversionDialog", error);
+      const Fallback = (() =>
+        null) as unknown as typeof import("../processing/ConversionDialog").ConversionDialog;
+      return { default: Fallback };
+    }),
+);
+
+const SqlWorkspaceDialog = lazy(() =>
+  import("../processing/SqlWorkspaceDialog")
+    .then((module) => ({
+      default: module.SqlWorkspaceDialog,
+    }))
+    .catch((error) => {
+      // Same chunk-load fallback rationale as ProcessingDialog above.
+      console.error("Failed to load SqlWorkspaceDialog", error);
+      const Fallback = (() =>
+        null) as unknown as typeof import("../processing/SqlWorkspaceDialog").SqlWorkspaceDialog;
       return { default: Fallback };
     }),
 );
@@ -90,7 +132,6 @@ export function DesktopShell({
   const shellRef = useRef<HTMLDivElement>(null);
   const verticalResizeGuideRef = useRef<HTMLDivElement>(null);
   const mapControllerRef = useRef<MapController | null>(null);
-  const settingsDialogRef = useRef<SettingsDialogHandle>(null);
   const dragDepthRef = useRef(0);
   const dropMessageTimeoutRef = useRef<number | null>(null);
   const addGeoJsonLayer = useAppStore((s) => s.addGeoJsonLayer);
@@ -99,6 +140,9 @@ export function DesktopShell({
   const [mapReadyGeneration, setMapReadyGeneration] = useState(0);
   const [dropMessage, setDropMessage] = useState<string | null>(null);
   const [dropError, setDropError] = useState<string | null>(null);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const diagnostics = useDiagnosticsSnapshot();
+  const externalPluginsReady = useExternalPluginsReady();
   const [layerPanelWidth, setLayerPanelWidth] = useState(
     DEFAULT_SIDE_PANEL_WIDTH,
   );
@@ -134,12 +178,30 @@ export function DesktopShell({
     // or the map is reinitialised (mapReadyGeneration), not on every
     // incremental plugin write-back. projectPlugins is read from the store
     // snapshot at call time so it is always current without being a dependency.
-    if (!mapReadyGeneration || !mapControllerRef.current) return;
-    getPluginManager().restoreProjectState(
+    if (
+      !externalPluginsReady ||
+      !mapReadyGeneration ||
+      !mapControllerRef.current
+    )
+      return;
+    const appAPI = createAppAPI(mapControllerRef);
+    const pluginManager = getPluginManager();
+    pluginManager.restoreProjectState(
       useAppStore.getState().projectPlugins,
-      createAppAPI(mapControllerRef),
+      appAPI,
     );
-  }, [mapReadyGeneration, projectGeneration]);
+    restoreThreeDTilesLayers(appAPI);
+    restoreRasterLayers(appAPI);
+    restoreVectorLayers(appAPI);
+    const search = window.location.search;
+    void pluginManager
+      .handleUrlParameters(
+        new URLSearchParams(search),
+        appAPI,
+        `${projectGeneration}:${search}`,
+      )
+      .catch(console.error);
+  }, [externalPluginsReady, mapReadyGeneration, projectGeneration]);
 
   useEffect(() => {
     return () => {
@@ -153,12 +215,24 @@ export function DesktopShell({
     setMapReadyGeneration((generation) => generation + 1);
   }, []);
 
+  const handleMapDiagnosticEvent = useCallback((event: MapDiagnosticEvent) => {
+    appendDiagnostic({
+      category: "map",
+      level: "error",
+      message: event.message,
+      detail: event.detail,
+      source: event.source,
+      status: event.status,
+      url: event.url,
+    });
+  }, []);
+
   const addImportedVectorLayers = useCallback(
     (importedLayers: ImportedVectorLayer[]) => {
       let lastLayerId: string | null = null;
       for (const layer of importedLayers) {
         lastLayerId = addGeoJsonLayer(
-          layerNameFromPath(layer.path),
+          layer.name ?? layerNameFromPath(layer.path),
           layer.data,
           layer.path,
         );
@@ -430,17 +504,20 @@ export function DesktopShell({
       onDragOver={handleDragOver}
       onDrop={handleDrop}
     >
-      <TopToolbar
-        compact={layoutOptions.compact}
-        mapControllerRef={mapControllerRef}
-        settingsDialogRef={settingsDialogRef}
-        showLabels={layoutOptions.toolbarLabels}
-        showProjectInfo={layoutOptions.showProjectInfo}
-        themeMode={themeMode}
-        onToggleThemeMode={onToggleThemeMode}
-      />
+      {layoutOptions.toolbarVisible ? (
+        <TopToolbar
+          compact={layoutOptions.compact}
+          diagnosticsErrorCount={diagnostics.errorCount}
+          mapControllerRef={mapControllerRef}
+          showLabels={layoutOptions.toolbarLabels}
+          showProjectInfo={layoutOptions.showProjectInfo}
+          themeMode={themeMode}
+          onOpenDiagnostics={() => setDiagnosticsOpen(true)}
+          onToggleThemeMode={onToggleThemeMode}
+        />
+      ) : null}
       <div className="flex min-h-0 flex-1 flex-col md:flex-row">
-        {layoutOptions.panelsVisible ? (
+        {layoutOptions.layerPanelVisible ? (
           <LayerPanel
             mapControllerRef={mapControllerRef}
             onResizeStart={startLayerPanelResize}
@@ -453,20 +530,41 @@ export function DesktopShell({
         >
           <MapCanvas
             controllerRef={mapControllerRef}
+            onMapDiagnosticEvent={handleMapDiagnosticEvent}
             onControllerReady={handleMapControllerReady}
           />
         </main>
-        {layoutOptions.panelsVisible ? (
-          <StylePanel onResizeStart={startStylePanelResize} />
+        {layoutOptions.stylePanelVisible ? (
+          <StylePanel
+            mapControllerRef={mapControllerRef}
+            onResizeStart={startStylePanelResize}
+          />
         ) : null}
       </div>
-      {layoutOptions.panelsVisible ? <AttributeTable /> : null}
-      <StatusBar
-        compact={layoutOptions.compact}
-        onOpenAccountSettings={() => settingsDialogRef.current?.openAccountSettings()}
+      {layoutOptions.attributePanelVisible ? (
+        <AttributeTable mapControllerRef={mapControllerRef} />
+      ) : null}
+      {layoutOptions.statusBarVisible ? (
+        <StatusBar
+          compact={layoutOptions.compact}
+          diagnosticsErrorCount={diagnostics.errorCount}
+          diagnosticsWarningCount={diagnostics.warningCount}
+          onOpenDiagnostics={() => setDiagnosticsOpen(true)}
+        />
+      ) : null}
+      <DiagnosticsDialog
+        diagnostics={diagnostics}
+        open={diagnosticsOpen}
+        onOpenChange={setDiagnosticsOpen}
       />
       <Suspense fallback={null}>
         <ProcessingDialog mapControllerRef={mapControllerRef} />
+      </Suspense>
+      <Suspense fallback={null}>
+        <ConversionDialog />
+      </Suspense>
+      <Suspense fallback={null}>
+        <SqlWorkspaceDialog />
       </Suspense>
       <div
         ref={verticalResizeGuideRef}

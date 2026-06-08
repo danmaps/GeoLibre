@@ -1,4 +1,15 @@
-import { useAppStore } from "@geolibre/core";
+import {
+  isDuckDBQueryLayer,
+  useAppStore,
+  type GeoLibreLayer,
+} from "@geolibre/core";
+import {
+  getDuckDBLayerRows,
+  updateDuckDBLayerRows,
+  type DuckDBAttributeRow,
+} from "@geolibre/plugins";
+import type { MapController } from "@geolibre/map";
+import type { GeoJSONSource } from "maplibre-gl";
 import {
   Button,
   DropdownMenu,
@@ -13,7 +24,7 @@ import {
   TableHeader,
   TableRow,
 } from "@geolibre/ui";
-import type { Feature } from "geojson";
+import type { Feature, FeatureCollection } from "geojson";
 import {
   ArrowDown,
   ArrowUp,
@@ -28,6 +39,7 @@ import {
 } from "lucide-react";
 import {
   type MouseEvent as ReactMouseEvent,
+  type RefObject,
   useEffect,
   useRef,
   useState,
@@ -44,6 +56,10 @@ type SortKey = "__featureId" | string;
 type ColumnWidths = Record<string, number>;
 type AttributeDrafts = Record<string, Record<string, string>>;
 type ExportFormat = "geojson" | "csv" | BinaryVectorExportFormat;
+type AttributeTableRow = {
+  featureId: string;
+  properties: Record<string, unknown>;
+};
 
 const DEFAULT_FEATURE_ID_COLUMN_WIDTH = 72;
 const DEFAULT_ATTRIBUTE_COLUMN_WIDTH = 160;
@@ -152,6 +168,39 @@ function applyDraftsToFeatures(
   });
 }
 
+function duckDBRowsToAttributeRows(
+  rows: DuckDBAttributeRow[],
+): AttributeTableRow[] {
+  return rows.map((row) => ({
+    featureId: row.featureId,
+    properties: row.properties,
+  }));
+}
+
+function applyDraftsToDuckDBRows(
+  rows: AttributeTableRow[],
+  drafts: AttributeDrafts,
+): Record<string, Record<string, unknown>> {
+  const rowById = new Map(rows.map((row) => [row.featureId, row]));
+  const updates: Record<string, Record<string, unknown>> = {};
+
+  for (const [featureId, rowDrafts] of Object.entries(drafts)) {
+    const row = rowById.get(featureId);
+    if (!row) continue;
+
+    const properties: Record<string, unknown> = {};
+    for (const [column, draft] of Object.entries(rowDrafts)) {
+      const previousValue = row.properties[column];
+      if (isInvalidObjectDraft(draft, previousValue)) continue;
+      properties[column] = parseAttributeDraft(draft, previousValue);
+    }
+
+    if (Object.keys(properties).length > 0) updates[featureId] = properties;
+  }
+
+  return updates;
+}
+
 function sanitizeExportFileName(name: string): string {
   const sanitized = name
     .trim()
@@ -188,7 +237,31 @@ function exportMimeType(format: BinaryVectorExportFormat): string {
   }
 }
 
-export function AttributeTable() {
+/**
+ * Source id of a geojson-render-mode vector layer created by the Add Vector
+ * Layer control, or null. These layers hold their features in a MapLibre
+ * GeoJSON source rather than in `layer.geojson`, so the attribute table reads
+ * the data back from the map. Tiles-mode (DuckDB) vector layers are excluded.
+ */
+function geojsonVectorSourceId(layer: GeoLibreLayer | undefined): string | null {
+  if (
+    !layer ||
+    layer.type !== "geojson" ||
+    layer.metadata.sourceKind !== "maplibre-gl-vector" ||
+    layer.metadata.externalNativeLayer !== true
+  ) {
+    return null;
+  }
+  const sourceIds = layer.metadata.sourceIds;
+  const sourceId = Array.isArray(sourceIds) ? sourceIds[0] : undefined;
+  return typeof sourceId === "string" ? sourceId : null;
+}
+
+interface AttributeTableProps {
+  mapControllerRef: RefObject<MapController | null>;
+}
+
+export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
   const tableSectionRef = useRef<HTMLElement>(null);
   const tableResizeGuideRef = useRef<HTMLDivElement>(null);
   const selectedLayerId = useAppStore((s) => s.selectedLayerId);
@@ -220,15 +293,83 @@ export function AttributeTable() {
   const [exportError, setExportError] = useState<string | null>(null);
   const deferTableResize = isTauri();
 
+  const [loadingVectorGeojson, setLoadingVectorGeojson] = useState(false);
+
   const layer = layers.find((l) => l.id === selectedLayerId);
   const hasLayer = Boolean(layer);
   const features = layer?.geojson?.features ?? [];
+  const isDuckDBLayer = isDuckDBQueryLayer(layer);
+  const duckdbRows = layer && isDuckDBLayer ? getDuckDBLayerRows(layer.id) : [];
+  const attributeRows: AttributeTableRow[] = isDuckDBLayer
+    ? duckDBRowsToAttributeRows(duckdbRows)
+    : features.map((feature, index) => ({
+        featureId: String(feature.id ?? index),
+        properties: (feature.properties ?? {}) as Record<string, unknown>,
+      }));
+  const hasAttributeSource = Boolean(layer?.geojson || isDuckDBLayer);
+  // Add Vector Layer (geojson-mode) layers render from a MapLibre source the
+  // control owns, and their `layer.geojson` is dropped when a project is saved.
+  // Edits made here would neither redraw on the map nor survive a save, so the
+  // attribute table is read-only for them.
+  const isReadOnlyVectorLayer = geojsonVectorSourceId(layer) !== null;
+
+  // Vector layers added via the Add Vector Layer control keep their features in
+  // a MapLibre GeoJSON source rather than in `layer.geojson`. Read the data back
+  // from the map once so the table (and export) can use it like any other
+  // vector layer. Tiles-mode vector layers are not handled here.
+  useEffect(() => {
+    if (!layer || layer.geojson) {
+      setLoadingVectorGeojson(false);
+      return;
+    }
+    const sourceId = geojsonVectorSourceId(layer);
+    if (!sourceId) {
+      setLoadingVectorGeojson(false);
+      return;
+    }
+    const source = mapControllerRef.current?.getMap()?.getSource(sourceId) as
+      | GeoJSONSource
+      | undefined;
+    if (!source || typeof source.getData !== "function") {
+      // Reset here too: a prior run may have left the indicator true, and this
+      // early return would otherwise leave it stuck after a layer switch.
+      setLoadingVectorGeojson(false);
+      return;
+    }
+
+    let cancelled = false;
+    const layerId = layer.id;
+    setLoadingVectorGeojson(true);
+    source
+      .getData()
+      .then((data) => {
+        if (cancelled) return;
+        if (
+          data &&
+          typeof data === "object" &&
+          (data as { type?: string }).type === "FeatureCollection"
+        ) {
+          updateLayer(layerId, { geojson: data as FeatureCollection });
+        }
+      })
+      .catch(() => {
+        // Best-effort: a source that cannot return data leaves the table in its
+        // existing "requires a vector layer" empty state.
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingVectorGeojson(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [layer, mapControllerRef, updateLayer]);
   const hasEdits = hasDraftEdits(drafts);
-  const hasInvalidDrafts = features.some((feature, index) => {
-    const rowDrafts = drafts[String(feature.id ?? index)];
+  const hasInvalidDrafts = attributeRows.some((row) => {
+    const rowDrafts = drafts[row.featureId];
     if (!rowDrafts) return false;
     return Object.entries(rowDrafts).some(([column, draft]) =>
-      isInvalidObjectDraft(draft, feature.properties?.[column]),
+      isInvalidObjectDraft(draft, row.properties[column]),
     );
   });
 
@@ -238,32 +379,28 @@ export function AttributeTable() {
   }, [selectedLayerId, hasLayer]);
 
   const filterLower = attributeFilter.toLowerCase();
-  const indexedFeatures = features.map((feature, index) => ({
-    feature,
-    featureId: String(feature.id ?? index),
-  }));
-  const filtered = indexedFeatures.filter(({ feature, featureId }) => {
+  const filtered = attributeRows.filter(({ properties, featureId }) => {
     if (!filterLower) return true;
-    const props = JSON.stringify(feature.properties ?? {}).toLowerCase();
+    const props = JSON.stringify(properties).toLowerCase();
     return featureId.includes(filterLower) || props.includes(filterLower);
   });
   const sorted = [...filtered].sort((a, b) => {
     const aValue =
       sort.key === "__featureId"
         ? a.featureId
-        : a.feature.properties?.[sort.key];
+        : a.properties[sort.key];
     const bValue =
       sort.key === "__featureId"
         ? b.featureId
-        : b.feature.properties?.[sort.key];
+        : b.properties[sort.key];
     const result = compareAttributeValues(aValue, bValue);
     return sort.direction === "asc" ? result : -result;
   });
 
   const propKeys = new Set<string>();
-  for (const f of features) {
-    if (f.properties) {
-      for (const k of Object.keys(f.properties)) propKeys.add(k);
+  for (const row of attributeRows) {
+    for (const k of Object.keys(row.properties)) {
+      propKeys.add(k);
     }
   }
   const columns = Array.from(propKeys);
@@ -441,7 +578,19 @@ export function AttributeTable() {
   };
 
   const saveDrafts = () => {
-    if (!layer?.geojson || !hasEdits || hasInvalidDrafts) return;
+    if (!layer || !hasEdits || hasInvalidDrafts) return;
+
+    if (isDuckDBLayer) {
+      updateDuckDBLayerRows(
+        layer.id,
+        applyDraftsToDuckDBRows(attributeRows, drafts),
+      );
+      setIsEditing(false);
+      setDrafts({});
+      return;
+    }
+
+    if (!layer.geojson) return;
 
     const geojson = {
       ...layer.geojson,
@@ -625,7 +774,7 @@ export function AttributeTable() {
         ref={tableResizeGuideRef}
         className="pointer-events-none fixed left-0 right-0 z-50 hidden h-px bg-primary shadow-[0_0_0_1px_hsl(var(--primary)/0.25)]"
       />
-      <div className="flex items-center gap-2 border-b px-3 py-1.5">
+      <div className="flex flex-wrap items-center gap-2 border-b px-3 py-1.5 md:flex-nowrap">
         <Button
           variant="ghost"
           size="icon"
@@ -639,10 +788,12 @@ export function AttributeTable() {
         <TableProperties className="h-4 w-4 text-muted-foreground" />
         <span className="text-sm font-semibold">Attribute table</span>
         {layer ? (
-          <span className="text-xs text-muted-foreground">— {layer.name}</span>
+          <span className="min-w-0 max-w-full truncate text-xs text-muted-foreground md:max-w-56">
+            - {layer.name}
+          </span>
         ) : (
-          <span className="text-xs text-muted-foreground">
-            — select a vector layer
+          <span className="min-w-0 max-w-full truncate text-xs text-muted-foreground md:max-w-56">
+            - select a layer with attributes
           </span>
         )}
         {exportError ? (
@@ -655,20 +806,28 @@ export function AttributeTable() {
           size="sm"
           className="ml-auto h-7 px-2"
           title={
-            isEditing
-              ? hasEdits
-                ? "Use Save or Cancel to finish editing"
-                : "Exit edit mode"
-              : "Edit attribute values"
+            isReadOnlyVectorLayer
+              ? "Editing is not available for Add Vector Layer layers"
+              : isEditing
+                ? hasEdits
+                  ? "Use Save or Cancel to finish editing"
+                  : "Exit edit mode"
+                : isDuckDBLayer
+                  ? "Edit displayed DuckDB query attributes in memory"
+                  : "Edit attribute values"
           }
           aria-label={
             isEditing && !hasEdits ? "Exit edit mode" : "Edit attribute values"
           }
-          disabled={!layer?.geojson || (isEditing && hasEdits)}
+          disabled={
+            !hasAttributeSource ||
+            isReadOnlyVectorLayer ||
+            (isEditing && hasEdits)
+          }
           onClick={toggleEditing}
         >
           <Pencil className="h-3.5 w-3.5" />
-          Edit
+          <span className="hidden sm:inline">Edit</span>
         </Button>
         <Button
           variant="default"
@@ -677,14 +836,16 @@ export function AttributeTable() {
           title={
             hasInvalidDrafts
               ? "Fix invalid JSON before saving"
-              : "Save attribute edits"
+              : isDuckDBLayer
+                ? "Save in-memory DuckDB attribute edits"
+                : "Save attribute edits"
           }
           aria-label="Save attribute edits"
           disabled={!isEditing || !hasEdits || hasInvalidDrafts}
           onClick={saveDrafts}
         >
           <Save className="h-3.5 w-3.5" />
-          Save
+          <span className="hidden sm:inline">Save</span>
         </Button>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
@@ -692,12 +853,16 @@ export function AttributeTable() {
               variant="outline"
               size="sm"
               className="h-7 px-2"
-              title="Export selected layer"
+              title={
+                layer?.geojson
+                  ? "Export selected layer"
+                  : "Export requires a GeoJSON-backed layer"
+              }
               aria-label="Export selected layer"
               disabled={!layer?.geojson}
             >
               <Download className="h-3.5 w-3.5" />
-              Export
+              <span className="hidden sm:inline">Export</span>
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
@@ -725,8 +890,8 @@ export function AttributeTable() {
           </Button>
         ) : null}
         <Input
-          className="h-7 max-w-xs text-xs"
-          placeholder="Search attributes…"
+          className="h-7 min-w-36 flex-1 text-xs md:max-w-xs"
+          placeholder="Search attributes..."
           aria-label="Search attributes"
           value={attributeFilter}
           onChange={(e) => setAttributeFilter(e.target.value)}
@@ -762,9 +927,11 @@ export function AttributeTable() {
         type="always"
         className="flex-1 [&_[data-orientation=vertical]]:!top-11 [&_[data-orientation=vertical]]:!h-[calc(100%-3.625rem)]"
       >
-        {!layer?.geojson ? (
+        {!hasAttributeSource ? (
           <p className="p-4 text-xs text-muted-foreground">
-            Attribute table requires a vector layer.
+            {loadingVectorGeojson
+              ? "Loading layer attributes…"
+              : "Attribute table requires a vector or DuckDB query layer."}
           </p>
         ) : (
           <table
@@ -789,10 +956,7 @@ export function AttributeTable() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {sorted.map(({ feature, featureId }: {
-                feature: Feature;
-                featureId: string;
-              }) => {
+              {sorted.map(({ featureId, properties }) => {
                 const selected = selectedFeatureId === featureId;
                 return (
                   <TableRow
@@ -805,7 +969,7 @@ export function AttributeTable() {
                   >
                     <TableCell>{featureId}</TableCell>
                     {columns.map((col) => {
-                      const value = feature.properties?.[col];
+                      const value = properties[col];
                       const draft = drafts[featureId]?.[col];
                       const changed = draft !== undefined;
                       const invalid =

@@ -1,6 +1,48 @@
 import type { FeatureCollection } from "geojson";
 
-const DEFAULT_SIDECAR_URL = "http://127.0.0.1:8765";
+const LOCAL_SIDECAR_URL = "http://127.0.0.1:8765";
+
+/** Build-time override, e.g. `VITE_SIDECAR_URL=http://127.0.0.1:9000`. */
+function explicitSidecarUrl(): string | undefined {
+  try {
+    const env = (import.meta as { env?: Record<string, string | undefined> })
+      .env;
+    const value = env?.VITE_SIDECAR_URL;
+    return value && value.trim() ? value.trim().replace(/\/$/, "") : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Resolve the sidecar base URL for the current runtime.
+ *
+ * - An explicit `VITE_SIDECAR_URL` always wins (useful for non-standard dev
+ *   ports such as `vite --port 3000`).
+ * - Desktop (Tauri) and the default Vite dev server (port 5173) talk to a local
+ *   sidecar directly at {@link LOCAL_SIDECAR_URL}.
+ * - When the app is served from any other http(s) origin (e.g. the combined
+ *   Docker image), the sidecar is reached through a same-origin `/sidecar`
+ *   reverse proxy, which sidesteps CORS entirely.
+ */
+function resolveSidecarBaseUrl(): string {
+  const override = explicitSidecarUrl();
+  if (override) return override;
+  if (typeof window === "undefined" || !window.location) {
+    return LOCAL_SIDECAR_URL;
+  }
+  const { protocol, hostname, port, origin } = window.location;
+  const isTauri = protocol === "tauri:" || hostname === "tauri.localhost";
+  // 5173 is Vite's default dev port (vite.config.ts pins strictPort). For other
+  // ports set VITE_SIDECAR_URL explicitly.
+  const isViteDev = port === "5173";
+  if (!isTauri && !isViteDev && (protocol === "http:" || protocol === "https:")) {
+    return `${origin}/sidecar`;
+  }
+  return LOCAL_SIDECAR_URL;
+}
+
+const DEFAULT_SIDECAR_URL = resolveSidecarBaseUrl();
 const WHITEBOX_CATALOG_SNAPSHOT_URL =
   "https://raw.githubusercontent.com/opengeos/Whitebox-Next-Gen-ArcGIS/main/WNG/data/catalog_snapshot.json";
 
@@ -240,6 +282,181 @@ export async function fetchWhiteboxJsonOutput(
   return res.json();
 }
 
+export interface ConversionStatus {
+  available: boolean;
+  message: string;
+}
+
+export interface ConversionJob {
+  id: string;
+  status: "pending" | "running" | "succeeded" | "failed" | string;
+  tool_id: string;
+  created_at: string;
+  updated_at: string;
+  messages: string[];
+  outputs: Record<string, unknown>;
+  result?: unknown;
+  error?: string | null;
+}
+
+export interface VectorToGeoParquetRequest {
+  input_path: string;
+  output_path: string;
+  /** Parquet compression codec. Defaults to `"zstd"` when omitted. */
+  compression?: string;
+  /**
+   * Parquet row group size. Must be a positive integer; the backend rejects
+   * values <= 0. Defaults to 30000 when omitted.
+   */
+  row_group_size?: number;
+}
+
+export interface VectorToFlatGeobufRequest {
+  input_path: string;
+  output_path: string;
+}
+
+export interface CsvToGeoParquetRequest {
+  input_path: string;
+  output_path: string;
+  lon_column: string;
+  lat_column: string;
+  /** Parquet compression codec. Defaults to `"zstd"` when omitted. */
+  compression?: string;
+  /** Parquet row group size. Positive integer; defaults to 30000. */
+  row_group_size?: number;
+}
+
+export interface VectorToPmtilesRequest {
+  input_path: string;
+  output_path: string;
+  /** Tile layer name. Defaults to `"data"` when omitted. */
+  layer_name?: string;
+  /** Minimum zoom level. Defaults to 0. */
+  min_zoom?: number;
+  /** Maximum zoom level. Defaults to 14. */
+  max_zoom?: number;
+}
+
+export interface RasterToCogRequest {
+  input_path: string;
+  output_path: string;
+  /** COG compression profile. Defaults to `"deflate"` when omitted. */
+  compression?: string;
+}
+
+export async function fetchConversionStatus(
+  baseUrl = DEFAULT_SIDECAR_URL,
+): Promise<ConversionStatus> {
+  let res: Response;
+  try {
+    res = await fetch(`${baseUrl}/conversion/status`);
+  } catch (error) {
+    throw sidecarConnectionError(baseUrl, error);
+  }
+  if (!res.ok) {
+    throw new Error(`Conversion status failed: HTTP ${res.status}`);
+  }
+  return (await res.json()) as ConversionStatus;
+}
+
+export async function runVectorToGeoParquet(
+  request: VectorToGeoParquetRequest,
+  baseUrl = DEFAULT_SIDECAR_URL,
+): Promise<ConversionJob> {
+  return startConversion(
+    `${baseUrl}/conversion/vector-to-geoparquet`,
+    request,
+    baseUrl,
+  );
+}
+
+export async function runVectorToFlatGeobuf(
+  request: VectorToFlatGeobufRequest,
+  baseUrl = DEFAULT_SIDECAR_URL,
+): Promise<ConversionJob> {
+  return startConversion(
+    `${baseUrl}/conversion/vector-to-flatgeobuf`,
+    request,
+    baseUrl,
+  );
+}
+
+export async function runCsvToGeoParquet(
+  request: CsvToGeoParquetRequest,
+  baseUrl = DEFAULT_SIDECAR_URL,
+): Promise<ConversionJob> {
+  return startConversion(
+    `${baseUrl}/conversion/csv-to-geoparquet`,
+    request,
+    baseUrl,
+  );
+}
+
+export async function runVectorToPmtiles(
+  request: VectorToPmtilesRequest,
+  baseUrl = DEFAULT_SIDECAR_URL,
+): Promise<ConversionJob> {
+  return startConversion(
+    `${baseUrl}/conversion/vector-to-pmtiles`,
+    request,
+    baseUrl,
+  );
+}
+
+export async function runRasterToCog(
+  request: RasterToCogRequest,
+  baseUrl = DEFAULT_SIDECAR_URL,
+): Promise<ConversionJob> {
+  return startConversion(`${baseUrl}/conversion/raster-to-cog`, request, baseUrl);
+}
+
+type ConversionRequest =
+  | VectorToGeoParquetRequest
+  | VectorToFlatGeobufRequest
+  | CsvToGeoParquetRequest
+  | VectorToPmtilesRequest
+  | RasterToCogRequest;
+
+async function startConversion(
+  url: string,
+  request: ConversionRequest,
+  baseUrl: string,
+): Promise<ConversionJob> {
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request),
+    });
+  } catch (error) {
+    throw sidecarConnectionError(baseUrl, error);
+  }
+  if (!res.ok) {
+    throw new Error(await responseErrorMessage(res, "Could not start conversion"));
+  }
+  return (await res.json()) as ConversionJob;
+}
+
+export async function fetchConversionJob(
+  jobId: string,
+  baseUrl = DEFAULT_SIDECAR_URL,
+): Promise<ConversionJob> {
+  let res: Response;
+  try {
+    res = await fetch(
+      `${baseUrl}/conversion/jobs/${encodeURIComponent(jobId)}`,
+    );
+  } catch (error) {
+    throw sidecarConnectionError(baseUrl, error);
+  }
+  if (!res.ok) {
+    throw new Error(await responseErrorMessage(res, "Could not load conversion job"));
+  }
+  return (await res.json()) as ConversionJob;
+}
+
 async function responseErrorMessage(
   response: Response,
   fallback: string,
@@ -258,6 +475,6 @@ function sidecarConnectionError(baseUrl: string, error: unknown): Error {
   console.debug("GeoLibre sidecar unreachable:", error);
   return new Error(
     `Could not connect to the GeoLibre sidecar at ${baseUrl}. ` +
-      "Start the sidecar to run Whitebox tools.",
+      "Start the sidecar to run processing tools.",
   );
 }

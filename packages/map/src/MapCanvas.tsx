@@ -1,4 +1,8 @@
-import { useAppStore, type GeoLibreLayer } from "@geolibre/core";
+import {
+  isDuckDBQueryLayer,
+  useAppStore,
+  type GeoLibreLayer,
+} from "@geolibre/core";
 import maplibregl from "maplibre-gl";
 import { memo, useEffect, useRef } from "react";
 import {
@@ -34,7 +38,34 @@ const WMS_IDENTIFY_INFO_FORMATS = [
 
 export interface MapCanvasProps {
   controllerRef?: React.MutableRefObject<MapController | null>;
+  onMapDiagnosticEvent?: (event: MapDiagnosticEvent) => void;
   onControllerReady?: () => void;
+}
+
+export interface MapDiagnosticEvent {
+  message: string;
+  detail?: string;
+  source?: string;
+  status?: number;
+  url?: string;
+}
+
+interface DuckDBIdentifyBridgeResult {
+  coordinate: [number, number] | null;
+  featureId: string;
+  properties: Record<string, unknown>;
+}
+
+interface GeoLibreDuckDBBridge {
+  getFeatureBounds?: (
+    layerId: string,
+    featureId: string,
+  ) => [number, number, number, number] | null;
+  identifyLayerAtPoint?: (
+    layerId: string,
+    point: { x: number; y: number },
+  ) => DuckDBIdentifyBridgeResult | null;
+  setSelectedFeature?: (layerId: string, featureId: string | null) => void;
 }
 
 function stringifyIdentifyValue(value: unknown): string {
@@ -141,6 +172,13 @@ function findFeatureId(
 
 function isWmsLayer(layer: GeoLibreLayer): boolean {
   return layer.type === "wms";
+}
+
+function duckDBBridge(): GeoLibreDuckDBBridge | undefined {
+  return typeof window === "undefined"
+    ? undefined
+    : (window as Window & { __GEOLIBRE_DUCKDB__?: GeoLibreDuckDBBridge })
+        .__GEOLIBRE_DUCKDB__;
 }
 
 function stringSource(value: unknown): string | undefined {
@@ -441,8 +479,99 @@ function isAbortError(error: unknown): boolean {
   );
 }
 
+function recordFromUnknown(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function stringProperty(
+  record: Record<string, unknown> | null,
+  key: string,
+): string | undefined {
+  const value = record?.[key];
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function numberProperty(
+  record: Record<string, unknown> | null,
+  key: string,
+): number | undefined {
+  const value = record?.[key];
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : undefined;
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  const record = recordFromUnknown(error);
+  return stringProperty(record, "message") ?? "MapLibre reported an error.";
+}
+
+function stringifyDiagnosticDetail(value: unknown): string | undefined {
+  const seen = new WeakSet<object>();
+  try {
+    return JSON.stringify(
+      value,
+      (key, nestedValue: unknown) => {
+        // Only clamp object-valued targets (Map, XHR, DOM nodes) that risk
+        // circular or huge output; keep string targets such as tile URLs.
+        if (
+          key === "target" &&
+          typeof nestedValue === "object" &&
+          nestedValue !== null
+        ) {
+          return "[Map]";
+        }
+        if (typeof nestedValue !== "object" || nestedValue === null) {
+          return nestedValue;
+        }
+        if (seen.has(nestedValue)) return "[Circular]";
+        seen.add(nestedValue);
+        return nestedValue;
+      },
+      2,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+function mapErrorDiagnosticEvent(event: maplibregl.ErrorEvent): MapDiagnosticEvent {
+  const eventRecord = recordFromUnknown(event);
+  const errorRecord = recordFromUnknown(event.error);
+  const source =
+    stringProperty(eventRecord, "sourceId") ??
+    stringProperty(errorRecord, "sourceId");
+  const url =
+    stringProperty(eventRecord, "url") ??
+    stringProperty(errorRecord, "url") ??
+    stringProperty(errorRecord, "resource");
+  const status =
+    numberProperty(eventRecord, "status") ?? numberProperty(errorRecord, "status");
+
+  return {
+    message: errorMessage(event.error),
+    detail: stringifyDiagnosticDetail({
+      type: event.type,
+      source,
+      status,
+      url,
+      dataType: eventRecord?.dataType,
+      sourceDataType: eventRecord?.sourceDataType,
+      tile: eventRecord?.tile,
+      error: event.error,
+    }),
+    source,
+    status,
+    url,
+  };
+}
+
 export const MapCanvas = memo(function MapCanvas({
   controllerRef,
+  onMapDiagnosticEvent,
   onControllerReady,
 }: MapCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -453,6 +582,8 @@ export const MapCanvas = memo(function MapCanvas({
   // caller passes a non-memoized callback.
   const onControllerReadyRef = useRef(onControllerReady);
   onControllerReadyRef.current = onControllerReady;
+  const onMapDiagnosticEventRef = useRef(onMapDiagnosticEvent);
+  onMapDiagnosticEventRef.current = onMapDiagnosticEvent;
 
   const basemapStyleUrl = useAppStore((s) => s.basemapStyleUrl);
   const basemapVisible = useAppStore((s) => s.basemapVisible);
@@ -468,6 +599,7 @@ export const MapCanvas = memo(function MapCanvas({
   const setMapView = useAppStore((s) => s.setMapView);
   const setPointerCoords = useAppStore((s) => s.setPointerCoords);
   const previousSelectedFeatureKey = useRef<string | null>(null);
+  const previousDuckDBSelectionLayerId = useRef<string | null>(null);
   const identifyPopup = useRef<maplibregl.Popup | null>(null);
 
   useEffect(() => {
@@ -486,6 +618,12 @@ export const MapCanvas = memo(function MapCanvas({
       setPointerCoords([e.lngLat.lng, e.lngLat.lat]);
     });
     map.on("mouseout", () => setPointerCoords(null));
+    map.on("error", (event) => {
+      // Cancelled tile fetches are already surfaced (as info) by the
+      // network capture; logging them here would double-count aborts.
+      if (isAbortError(event.error)) return;
+      onMapDiagnosticEventRef.current?.(mapErrorDiagnosticEvent(event));
+    });
 
     const updateView = (event?: { originalEvent?: unknown }) =>
       setMapView(mc.readView(), Boolean(event?.originalEvent));
@@ -575,6 +713,7 @@ export const MapCanvas = memo(function MapCanvas({
         state.layers.find((layer) => layer.id === state.selectedLayerId),
         state.selectedFeatureId,
       );
+      onControllerReadyRef.current?.();
     });
     controller.current?.setStyle(basemapStyleUrl);
   }, [basemapStyleUrl]);
@@ -610,6 +749,23 @@ export const MapCanvas = memo(function MapCanvas({
     controller.current?.highlightFeature(layer, selectedFeatureId, {
       fit: shouldFit,
     });
+    if (layer && isDuckDBQueryLayer(layer)) {
+      duckDBBridge()?.setSelectedFeature?.(layer.id, selectedFeatureId);
+      if (shouldFit && selectedFeatureId) {
+        const bounds = duckDBBridge()?.getFeatureBounds?.(
+          layer.id,
+          selectedFeatureId,
+        );
+        if (bounds) controller.current?.fitBounds(bounds);
+      }
+      previousDuckDBSelectionLayerId.current = layer.id;
+    } else if (previousDuckDBSelectionLayerId.current) {
+      duckDBBridge()?.setSelectedFeature?.(
+        previousDuckDBSelectionLayerId.current,
+        null,
+      );
+      previousDuckDBSelectionLayerId.current = null;
+    }
   }, [layers, selectedLayerId, selectedFeatureId, zoomToSelectedFeature]);
 
   useEffect(() => {
@@ -706,6 +862,27 @@ export const MapCanvas = memo(function MapCanvas({
               createIdentifyMessagePopupElement(layer.name, message),
             );
           });
+        return;
+      }
+
+      if (isDuckDBQueryLayer(layer)) {
+        const result = duckDBBridge()?.identifyLayerAtPoint?.(layer.id, {
+          x: event.point.x,
+          y: event.point.y,
+        });
+        if (!result) {
+          clearIdentifyResult();
+          return;
+        }
+
+        selectFeature(result.featureId);
+        showIdentifyPopup(
+          createIdentifyPopupElement(
+            layer.name,
+            result.properties,
+            result.featureId,
+          ),
+        );
         return;
       }
 

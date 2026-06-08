@@ -14,6 +14,7 @@ import {
   fillLayerId,
   lineLayerId,
   sourceId,
+  textLayerId,
 } from "./geojson-loader";
 import { isPlaceholderLayer } from "./placeholders";
 import {
@@ -29,6 +30,35 @@ const PMTILES_PROTOCOL = "pmtiles";
 const PMTILES_PROTOCOL_GLOBAL_KEY = "__geolibrePMTilesProtocol";
 const MIN_LAYER_ZOOM = DEFAULT_LAYER_STYLE.minZoom;
 const MAX_LAYER_ZOOM = DEFAULT_LAYER_STYLE.maxZoom;
+const TEXT_MARKER_SHAPE = "text_marker";
+const GEOMAN_SHAPE_PROPERTY = "__gm_shape";
+const GEOMAN_TEXT_PROPERTY = "__gm_text";
+
+const pointGeometryFilter: maplibregl.FilterSpecification = [
+  "match",
+  ["geometry-type"],
+  ["Point", "MultiPoint"],
+  true,
+  false,
+];
+
+const textMarkerShapeFilter: maplibregl.FilterSpecification = [
+  "any",
+  ["==", ["get", GEOMAN_SHAPE_PROPERTY], TEXT_MARKER_SHAPE],
+  ["==", ["get", "shape"], TEXT_MARKER_SHAPE],
+];
+
+const textMarkerFilter: maplibregl.FilterSpecification = [
+  "all",
+  pointGeometryFilter,
+  textMarkerShapeFilter,
+];
+
+const nonTextMarkerPointFilter: maplibregl.FilterSpecification = [
+  "all",
+  pointGeometryFilter,
+  ["!", textMarkerShapeFilter],
+];
 
 // Native layer ids whose zoom range GeoLibre has taken over. A pristine external
 // layer keeps its source-declared range, but once the user sets a non-default
@@ -128,10 +158,33 @@ function syncExternalNativeLayer(
     ensurePMTilesExternalLayer(map, layer, nativeLayerIds, beforeId);
   }
 
+  // Custom render layers (e.g. 3D Tiles) manage their own visibility, opacity,
+  // and zoom behavior through the control that registered them, so the standard
+  // visibility/paint/zoom-range sync below must be skipped — only ordering is
+  // handled here.
+  if (isExternalCustomLayer(layer)) {
+    for (const nativeLayerId of nativeLayerIds) {
+      moveLayer(map, nativeLayerId, beforeId);
+    }
+    return;
+  }
+
   if (isWaybackExternalRasterLayer(layer)) {
     syncWaybackExternalRasterLayer(map, layer, nativeLayerIds, beforeId);
     return;
   }
+
+  if (isBasemapControlRasterLayer(layer)) {
+    syncBasemapControlRasterLayer(map, layer, nativeLayerIds, beforeId);
+    return;
+  }
+
+  if (isWebServiceTileRasterLayer(layer)) {
+    syncWebServiceTileRasterLayer(map, layer, nativeLayerIds, beforeId);
+    return;
+  }
+
+  ensureExternalGeoJsonNativeLayer(map, layer, nativeLayerIds, beforeId);
 
   const nativeFillLayerSpecs = nativeLayerIds
     .map((nativeLayerId) => getStyleLayerSpec(map, nativeLayerId))
@@ -198,12 +251,142 @@ function syncExternalNativeLayer(
   }
 }
 
+function ensureExternalGeoJsonNativeLayer(
+  map: maplibregl.Map,
+  layer: GeoLibreLayer,
+  nativeLayerIds: string[],
+  beforeId?: string,
+): void {
+  if (!layer.geojson) return;
+
+  if (nativeLayerIds.length === 0) {
+    console.warn(
+      `[layer-sync] external native GeoJSON layer "${layer.id}" has no nativeLayerIds; skipping native layer creation`,
+    );
+    return;
+  }
+
+  const nativeSourceId =
+    getExternalSourceIds(layer)[0] ??
+    stringSource(layer.source.sourceId) ??
+    sourceIdFromNativeLayerId(nativeLayerIds[0]) ??
+    sourceId(layer.id);
+
+  // Always refresh the source so re-registration with new geojson data takes
+  // effect, then short-circuit only the layer creation when the native layers
+  // already exist.
+  if (!map.getSource(nativeSourceId)) {
+    map.addSource(nativeSourceId, {
+      type: "geojson",
+      data: layer.geojson,
+    });
+  } else {
+    (map.getSource(nativeSourceId) as maplibregl.GeoJSONSource).setData(
+      layer.geojson,
+    );
+  }
+
+  if (nativeLayerIds.every((id) => map.getLayer(id))) return;
+
+  const visibility = layer.visible ? "visible" : "none";
+  const zoomRange = styleLayerZoomRange(layer.style);
+  const geometryType = stringMetadata(layer.metadata.geometryType);
+  const symbolLayer = layer.metadata.symbolLayer === true;
+  const profile = detectGeometryProfile(layer.geojson);
+  const primaryLayerId = nativeLayerIds[0];
+
+  // Each registration is rendered with a single representative native layer
+  // (the first nativeLayerId), chosen by the dominant geometry below. A
+  // FeatureCollection mixing geometry types only renders the representative
+  // one; callers that need every type drawn should register one entry per
+  // geometry type (one nativeLayerId each).
+  if (symbolLayer) {
+    ensureLayer(
+      map,
+      primaryLayerId,
+      {
+        id: primaryLayerId,
+        type: "symbol",
+        source: nativeSourceId,
+        ...zoomRange,
+        layout: {
+          "text-allow-overlap": true,
+          // Literal glyph rendered at every feature as a sprite-free point
+          // marker (an asterisk, not a property lookup). Symbol registrations
+          // here carry no label field, so this is intentional placeholder text.
+          "text-field": "*",
+          "text-ignore-placement": true,
+          "text-size": Math.max(8, styleValue(layer.style, "circleRadius") * 2.5),
+          visibility,
+        },
+        paint: {
+          "text-color": styleValue(layer.style, "fillColor"),
+          "text-halo-color": styleValue(layer.style, "strokeColor"),
+          "text-halo-width": styleValue(layer.style, "strokeWidth"),
+          "text-opacity": layer.opacity,
+        },
+      },
+      beforeId,
+    );
+    return;
+  }
+
+  if (geometryType === "point" || profile.hasPoint) {
+    ensureLayer(
+      map,
+      primaryLayerId,
+      {
+        id: primaryLayerId,
+        type: "circle",
+        source: nativeSourceId,
+        ...zoomRange,
+        filter: ["match", ["geometry-type"], ["Point", "MultiPoint"], true, false],
+        paint: circlePaint(layer.style, layer.opacity),
+        layout: { visibility },
+      },
+      beforeId,
+    );
+    return;
+  }
+
+  if (geometryType === "line" || profile.hasLine || profile.hasPolygon) {
+    ensureLayer(
+      map,
+      primaryLayerId,
+      {
+        id: primaryLayerId,
+        type: "line",
+        source: nativeSourceId,
+        ...zoomRange,
+        filter: [
+          "match",
+          ["geometry-type"],
+          ["LineString", "MultiLineString", "Polygon", "MultiPolygon"],
+          true,
+          false,
+        ],
+        paint: linePaint(layer.style, layer.opacity),
+        layout: { visibility },
+      },
+      beforeId,
+    );
+  }
+}
+
+function sourceIdFromNativeLayerId(layerId: string | undefined): string | null {
+  return layerId ? `${layerId}-source` : null;
+}
+
 function isPMTilesExternalLayer(layer: GeoLibreLayer): boolean {
   return (
     layer.type === "pmtiles" &&
     layer.metadata.sourceKind === "pmtiles-url" &&
     layer.metadata.externalNativeLayer === true
   );
+}
+
+function isExternalCustomLayer(layer: GeoLibreLayer): boolean {
+  return typeof layer.metadata.customLayerType === "string";
 }
 
 function ensurePMTilesExternalLayer(
@@ -486,6 +669,176 @@ function syncWaybackExternalRasterLayer(
   );
 }
 
+function isBasemapControlRasterLayer(layer: GeoLibreLayer): boolean {
+  return (
+    layer.type === "raster" &&
+    layer.metadata.sourceKind === "maplibre-basemap-control" &&
+    layer.metadata.externalNativeLayer === true
+  );
+}
+
+// Raster basemaps selected in the basemap control are normally rendered by the
+// control itself. Rebuilding them here too keeps them on the map after a style
+// reload (e.g. reopening a project), where the control does not replay them.
+// The native source/layer ids match the control's deterministic ids, so this
+// is idempotent during a live session.
+function syncBasemapControlRasterLayer(
+  map: maplibregl.Map,
+  layer: GeoLibreLayer,
+  nativeLayerIds: string[],
+  beforeId?: string,
+): void {
+  const nativeLayerId = nativeLayerIds[0] ?? layer.id;
+  const sourceId = getExternalSourceIds(layer)[0] ?? `${nativeLayerId}-source`;
+  const tiles = getBasemapControlTiles(layer);
+  if (tiles.length === 0) return;
+
+  if (!map.getSource(sourceId)) {
+    map.addSource(sourceId, {
+      type: "raster",
+      tiles,
+      tileSize: numberSource(layer.source.tileSize) ?? 256,
+      ...(numberSource(layer.source.minzoom) !== undefined
+        ? { minzoom: numberSource(layer.source.minzoom) }
+        : {}),
+      ...(numberSource(layer.source.maxzoom) !== undefined
+        ? { maxzoom: numberSource(layer.source.maxzoom) }
+        : {}),
+      ...(layer.source.scheme === "tms" ? { scheme: "tms" as const } : {}),
+      ...(stringSource(layer.source.attribution)
+        ? { attribution: stringSource(layer.source.attribution) }
+        : {}),
+    });
+  }
+
+  ensureLayer(
+    map,
+    nativeLayerId,
+    {
+      id: nativeLayerId,
+      type: "raster",
+      source: sourceId,
+      ...styleLayerZoomRange(layer.style),
+      paint: rasterPaint(layer.style, layer.opacity),
+      layout: { visibility: layer.visible ? "visible" : "none" },
+    },
+    beforeId,
+  );
+}
+
+// Store-layer metadata.sourceKind values written by the Web Services
+// plugins. Each entry pairs with a plugin id in WEB_SERVICE_PLUGIN_IDS in
+// @geolibre/plugins' web-service-sync; keep the two lists in step when
+// adding a web service plugin.
+const WEB_SERVICE_SOURCE_KINDS = new Set([
+  "fema-wms",
+  "nasa-earthdata",
+  "enviroatlas",
+  "national-map",
+]);
+
+function isWebServiceTileRasterLayer(layer: GeoLibreLayer): boolean {
+  return (
+    (layer.type === "raster" || layer.type === "wms") &&
+    typeof layer.metadata.sourceKind === "string" &&
+    WEB_SERVICE_SOURCE_KINDS.has(layer.metadata.sourceKind) &&
+    layer.metadata.externalNativeLayer === true
+  );
+}
+
+// Web service layers (FEMA NFHL, NASA Earthdata, US EPA EnviroAtlas, USGS
+// National Map) are normally rendered by their panel controls. Rebuilding
+// them here keeps them on the map after a style reload (e.g. reopening a
+// project), where the controls do not replay them. The native source/layer
+// ids match the controls' deterministic ids, so this is idempotent during a
+// live session.
+function syncWebServiceTileRasterLayer(
+  map: maplibregl.Map,
+  layer: GeoLibreLayer,
+  nativeLayerIds: string[],
+  beforeId?: string,
+): void {
+  const nativeLayerId = nativeLayerIds[0] ?? layer.id;
+  const sourceId = getExternalSourceIds(layer)[0] ?? `${nativeLayerId}-source`;
+  const tiles = getWebServiceTiles(layer);
+  if (tiles.length === 0) return;
+
+  if (!map.getSource(sourceId)) {
+    const bounds = boundsSource(layer.source.bounds);
+    map.addSource(sourceId, {
+      type: "raster",
+      tiles,
+      tileSize: numberSource(layer.source.tileSize) ?? 256,
+      ...(numberSource(layer.source.minzoom) !== undefined
+        ? { minzoom: numberSource(layer.source.minzoom) }
+        : {}),
+      ...(numberSource(layer.source.maxzoom) !== undefined
+        ? { maxzoom: numberSource(layer.source.maxzoom) }
+        : {}),
+      ...(bounds ? { bounds } : {}),
+      ...(stringSource(layer.source.attribution)
+        ? { attribution: stringSource(layer.source.attribution) }
+        : {}),
+    });
+  }
+
+  ensureLayer(
+    map,
+    nativeLayerId,
+    {
+      id: nativeLayerId,
+      type: "raster",
+      source: sourceId,
+      ...styleLayerZoomRange(layer.style),
+      paint: rasterPaint(layer.style, layer.opacity),
+      layout: { visibility: layer.visible ? "visible" : "none" },
+    },
+    beforeId,
+  );
+}
+
+// WMS-style web service tiles carry a {bbox-epsg-3857} placeholder and hit
+// federal endpoints without permissive CORS headers, so the dev server
+// routes them through the WMS proxy. The external-native path bypasses
+// getRenderableRasterTiles, hence the dedicated proxying here.
+function getWebServiceTiles(layer: GeoLibreLayer): string[] {
+  const tiles = getBasemapControlTiles(layer);
+  if (layer.type !== "wms" || !isViteDevServer()) return tiles;
+  return tiles.map((tile) =>
+    // Skip already proxied templates so repeated sync passes cannot nest
+    // proxy URLs.
+    tile.includes("{bbox-epsg-3857}") && !tile.startsWith(WMS_PROXY_PATH)
+      ? proxyWmsTileUrl(tile)
+      : tile,
+  );
+}
+
+function boundsSource(
+  value: unknown,
+): [number, number, number, number] | undefined {
+  return Array.isArray(value) &&
+    value.length === 4 &&
+    value.every((item) => typeof item === "number" && Number.isFinite(item))
+    ? (value as [number, number, number, number])
+    : undefined;
+}
+
+function getBasemapControlTiles(layer: GeoLibreLayer): string[] {
+  const tiles = layer.source.tiles;
+  if (Array.isArray(tiles)) {
+    const valid = tiles.filter(
+      (tile): tile is string => typeof tile === "string" && tile.length > 0,
+    );
+    if (valid.length > 0) return valid;
+  }
+  const tileUrl = stringMetadata(layer.metadata.tileUrl);
+  return tileUrl ? [tileUrl] : [];
+}
+
+function numberSource(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 function getWaybackTileUrl(layer: GeoLibreLayer): string | null {
   const rawUrl =
     stringMetadata(layer.metadata.waybackItemUrl) ??
@@ -583,6 +936,7 @@ function syncGeoJsonLayer(
 
   const visibility = layer.visible ? "visible" : "none";
   const opacity = layer.opacity;
+  const hasTextMarkers = hasTextMarkerFeatures(layer.geojson!);
 
   if (profile.hasPolygon) {
     if (layer.style.extrusionEnabled) {
@@ -672,13 +1026,7 @@ function syncGeoJsonLayer(
         type: "circle",
         source: src,
         ...styleLayerZoomRange(layer.style),
-        filter: [
-          "match",
-          ["geometry-type"],
-          ["Point", "MultiPoint"],
-          true,
-          false,
-        ],
+        filter: hasTextMarkers ? nonTextMarkerPointFilter : pointGeometryFilter,
         paint: circlePaint(layer.style, opacity),
         layout: { visibility },
       },
@@ -687,6 +1035,131 @@ function syncGeoJsonLayer(
   } else {
     removeIfExists(map, circleLayerId(layer.id));
   }
+
+  if (!layer.style.extrusionEnabled && hasTextMarkers) {
+    ensureLayer(
+      map,
+      textLayerId(layer.id),
+      {
+        id: textLayerId(layer.id),
+        type: "symbol",
+        source: src,
+        ...styleLayerZoomRange(layer.style),
+        filter: textMarkerFilter,
+        layout: {
+          "text-allow-overlap": true,
+          "text-font": textFontForMapStyle(map),
+          "text-field": [
+            "to-string",
+            [
+              "coalesce",
+              ["get", GEOMAN_TEXT_PROPERTY],
+              ["get", "text"],
+              "",
+            ],
+          ],
+          "text-ignore-placement": true,
+          "text-size": Math.max(1, styleValue(layer.style, "textSize")),
+          visibility,
+        },
+        paint: {
+          "text-color": styleValue(layer.style, "textColor"),
+          "text-halo-color": styleValue(layer.style, "textHaloColor"),
+          "text-halo-width": Math.max(
+            0,
+            styleValue(layer.style, "textHaloWidth"),
+          ),
+          "text-opacity": opacity,
+        },
+      },
+      beforeId,
+    );
+  } else {
+    removeIfExists(map, textLayerId(layer.id));
+  }
+}
+
+// Keep this predicate aligned with textMarkerFilter: any text-marker-shaped
+// point routes to the symbol layer, even with empty text, so features are
+// never excluded from the circle layer without a matching symbol entry.
+function hasTextMarkerFeatures(
+  collection: GeoJSON.FeatureCollection,
+): boolean {
+  return collection.features.some((feature) => {
+    if (
+      feature.geometry?.type !== "Point" &&
+      feature.geometry?.type !== "MultiPoint"
+    ) {
+      return false;
+    }
+    const properties = feature.properties;
+    if (!properties) return false;
+    return (
+      properties[GEOMAN_SHAPE_PROPERTY] === TEXT_MARKER_SHAPE ||
+      properties.shape === TEXT_MARKER_SHAPE
+    );
+  });
+}
+
+// getStyle() deep-clones the whole style, and syncs can fire rapidly (e.g.
+// while dragging an opacity slider), so cache the resolved font per map and
+// invalidate when a new basemap style loads.
+const textFontCache = new WeakMap<maplibregl.Map, string[]>();
+
+function textFontForMapStyle(map: maplibregl.Map): string[] {
+  const cached = textFontCache.get(map);
+  if (cached) return cached;
+  const fonts = resolveTextFontFromStyle(map);
+  textFontCache.set(map, fonts);
+  map.once("style.load", () => textFontCache.delete(map));
+  return fonts;
+}
+
+// Operators that can start a data-driven text-font expression. A bare
+// ["get", "font"] is all strings, so an every(typeof === "string") check
+// alone would mistake it for a font stack.
+const FONT_EXPRESSION_OPERATORS = new Set([
+  "literal",
+  "get",
+  "has",
+  "at",
+  "in",
+  "case",
+  "match",
+  "coalesce",
+  "step",
+  "interpolate",
+  "let",
+  "var",
+  "concat",
+  "to-string",
+  "string",
+  "array",
+  "format",
+]);
+
+function resolveTextFontFromStyle(map: maplibregl.Map): string[] {
+  for (const styleLayer of map.getStyle().layers ?? []) {
+    if (styleLayer.type !== "symbol") continue;
+    // Icon-only symbol layers may carry a glyph/sprite font unsuited to text.
+    if (!styleLayer.layout?.["text-field"]) continue;
+    const textFont = styleLayer.layout?.["text-font"];
+    if (!Array.isArray(textFont)) continue;
+    // Unwrap the ["literal", ["Font A", "Font B"]] expression form used by
+    // many popular styles.
+    const fonts =
+      textFont[0] === "literal" && Array.isArray(textFont[1])
+        ? (textFont[1] as unknown[])
+        : (textFont as unknown[]);
+    if (
+      fonts.length > 0 &&
+      fonts.every((font) => typeof font === "string") &&
+      !FONT_EXPRESSION_OPERATORS.has(fonts[0] as string)
+    ) {
+      return fonts as string[];
+    }
+  }
+  return ["Noto Sans Regular"];
 }
 
 function syncRasterTileLayer(
@@ -1208,6 +1681,13 @@ function ensureLayer(
         map.setLayoutProperty(id, key, value);
       }
     }
+    if ("filter" in spec) {
+      // setFilter invalidates the layer, so skip no-op updates.
+      const current = map.getFilter(id);
+      if (JSON.stringify(current ?? null) !== JSON.stringify(spec.filter ?? null)) {
+        map.setFilter(id, spec.filter);
+      }
+    }
     setLayerZoomRange(map, id, {
       minzoom: spec.minzoom,
       maxzoom: spec.maxzoom,
@@ -1253,6 +1733,8 @@ function removeIfExists(map: maplibregl.Map, id: string): void {
 }
 
 function moveLayer(map: maplibregl.Map, id: string, beforeId?: string): void {
+  if (!map.getLayer(id)) return;
+
   try {
     if (beforeId && beforeId !== id && map.getLayer(beforeId)) {
       map.moveLayer(id, beforeId);
@@ -1277,6 +1759,7 @@ export function removeLayerFromMap(
     fillExtrusionLayerId(layerId),
     lineLayerId(layerId),
     circleLayerId(layerId),
+    textLayerId(layerId),
     `layer-${layerId}-raster`,
     ...(layer ? vectorTileAllStyleLayerIds(layer) : []),
     vectorTileCircleLayerId(layerId),

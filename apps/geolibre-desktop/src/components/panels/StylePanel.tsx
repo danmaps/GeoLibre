@@ -15,6 +15,7 @@ import {
   Separator,
   Slider,
 } from "@geolibre/ui";
+import type { MapController } from "@geolibre/map";
 import {
   ChevronDown,
   ChevronUp,
@@ -24,9 +25,15 @@ import {
   SlidersHorizontal,
   Trash2,
 } from "lucide-react";
-import { type MouseEvent as ReactMouseEvent, useEffect, useState } from "react";
+import {
+  type MouseEvent as ReactMouseEvent,
+  type RefObject,
+  useEffect,
+  useState,
+} from "react";
 
 interface StylePanelProps {
+  mapControllerRef: RefObject<MapController | null>;
   onResizeStart: (event: ReactMouseEvent<HTMLDivElement>) => void;
 }
 
@@ -52,6 +59,27 @@ function hasExternalNativeLayers(layer: { metadata: Record<string, unknown> }) {
 
 function hasExternalDeckLayer(layer: { metadata: Record<string, unknown> }) {
   return layer.metadata.externalDeckLayer === true;
+}
+
+function hasTextMarkerFeatures(layer: {
+  geojson?: {
+    features?: Array<{
+      geometry?: { type?: string } | null;
+      properties?: Record<string, unknown> | null;
+    }>;
+  };
+}): boolean {
+  return (layer.geojson?.features ?? []).some((feature) => {
+    const geometryType = feature.geometry?.type;
+    if (geometryType !== "Point" && geometryType !== "MultiPoint") {
+      return false;
+    }
+    const properties = feature.properties;
+    return (
+      properties?.__gm_shape === "text_marker" ||
+      properties?.shape === "text_marker"
+    );
+  });
 }
 
 function supportsExtrusionControls(layer: {
@@ -689,6 +717,10 @@ function clampNumber(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+// Shared shell classes for every StylePanel return branch.
+const STYLE_PANEL_ASIDE_CLASS =
+  "relative flex max-h-[min(24rem,42vh)] supports-[max-height:1dvh]:max-h-[min(24rem,42dvh)] w-full shrink-0 flex-col border-t bg-card md:max-h-none md:w-[var(--style-panel-width)] md:border-l md:border-t-0";
+
 const MIN_LAYER_ZOOM = DEFAULT_LAYER_STYLE.minZoom;
 const MAX_LAYER_ZOOM = DEFAULT_LAYER_STYLE.maxZoom;
 
@@ -867,12 +899,16 @@ function RasterStyleSlider({
   );
 }
 
-export function StylePanel({ onResizeStart }: StylePanelProps) {
+export function StylePanel({
+  mapControllerRef,
+  onResizeStart,
+}: StylePanelProps) {
   const selectedLayerId = useAppStore((s) => s.selectedLayerId);
   const layers = useAppStore((s) => s.layers);
   const setLayerOpacity = useAppStore((s) => s.setLayerOpacity);
   const setLayerStyle = useAppStore((s) => s.setLayerStyle);
   const updateLayer = useAppStore((s) => s.updateLayer);
+  const moveLayer = useAppStore((s) => s.moveLayer);
   const [isCollapsed, setIsCollapsed] = useState(isMobileViewport);
   const [draftBeforeId, setDraftBeforeId] = useState("");
   const [draftColorExpression, setDraftColorExpression] = useState("");
@@ -1048,7 +1084,7 @@ export function StylePanel({ onResizeStart }: StylePanelProps) {
 
   if (!layer) {
     return (
-      <aside className="relative flex max-h-56 w-full shrink-0 flex-col border-t bg-card md:max-h-none md:w-[var(--style-panel-width)] md:border-l md:border-t-0">
+      <aside className={STYLE_PANEL_ASIDE_CLASS}>
         {resizeHandle}
         <div className="flex items-center justify-between border-b px-3 py-1.5">
           <span className="text-sm font-semibold">Style</span>
@@ -1074,20 +1110,29 @@ export function StylePanel({ onResizeStart }: StylePanelProps) {
   const isDeckRasterLayer =
     layer.metadata.sourceKind === "cog-url" ||
     layer.metadata.sourceKind === "geotiff-url" ||
+    layer.metadata.sourceKind === "maplibre-gl-raster" ||
     layer.metadata.sourceKind === "stac-search-cog";
   const isDeckVectorLayer = hasExternalDeckLayer(layer);
   const isRasterTileLayer = layer.metadata.tileType === "raster";
+  const isThreeDTilesLayer = layer.type === "3d-tiles";
   const hasVectorPaintControls =
+    !isThreeDTilesLayer &&
     !isRasterTileLayer &&
+    !isDeckRasterLayer &&
     (layer.type === "geojson" ||
       layer.type === "vector-tiles" ||
       layer.type === "mbtiles" ||
       hasExternalNativeLayers(layer) ||
       hasExternalDeckLayer(layer));
   const hasExtrusionControls =
-    !isRasterTileLayer && supportsExtrusionControls(layer);
+    !isThreeDTilesLayer &&
+    !isRasterTileLayer &&
+    !isDeckRasterLayer &&
+    supportsExtrusionControls(layer);
   const hasRasterPaintControls =
-    isRasterPaintLayer(layer.type) || isRasterTileLayer;
+    isRasterPaintLayer(layer.type) || isRasterTileLayer || isDeckRasterLayer;
+  const hasTextMarkerControls =
+    layer.type === "geojson" && hasTextMarkerFeatures(layer);
   const extrusionEnabled = styleValue(style, "extrusionEnabled");
   const extrusionHeightPropertyOptions = getAttributePropertyNames(layer);
   const vectorStylePropertyOptions = extrusionHeightPropertyOptions;
@@ -1287,10 +1332,24 @@ export function StylePanel({ onResizeStart }: StylePanelProps) {
       vectorStyleExpression: draftVectorStyleExpression.trim(),
     });
   };
-  const applyBeforeId = () => {
-    updateLayer(layer.id, {
-      beforeId: draftBeforeId.trim() || undefined,
-    });
+  const applyBeforeId = (value: string) => {
+    // Picking another user layer is a one-shot reorder in the layer list;
+    // beforeId metadata only works for raw MapLibre (basemap) layer ids.
+    const otherLayers = layers.filter((l) => l.id !== layer.id);
+    const targetIndex = otherLayers.findIndex((l) => l.id === value);
+    if (targetIndex >= 0) {
+      setDraftBeforeId("");
+      // Move first so the sync triggered by each store update already sees
+      // the correct array position.
+      moveLayer(layer.id, targetIndex);
+      if (layer.beforeId) updateLayer(layer.id, { beforeId: undefined });
+      return;
+    }
+    setDraftBeforeId(value);
+    const nextBeforeId = value.trim() || undefined;
+    if (nextBeforeId !== layer.beforeId) {
+      updateLayer(layer.id, { beforeId: nextBeforeId });
+    }
   };
   const applyExtrusionSettings = () => {
     if (draftAdvancedExtrusionEnabled) {
@@ -1325,20 +1384,50 @@ export function StylePanel({ onResizeStart }: StylePanelProps) {
       extrusionHeightExpression: draftHeightExpression.trim(),
     });
   };
+  // NOTE: not reactive to basemap switches — the ref does not trigger a
+  // re-render, so the list refreshes on the next store-driven render.
+  const basemapStyleLayerIds =
+    mapControllerRef.current?.getBasemapStyleLayerIds() ?? [];
+  const otherLayers = layers.filter((l) => l.id !== layer.id);
+  const orphanedBeforeId =
+    draftBeforeId &&
+    !basemapStyleLayerIds.includes(draftBeforeId) &&
+    !otherLayers.some((l) => l.id === draftBeforeId)
+      ? draftBeforeId
+      : null;
   const beforeIdControl = (
     <div className="space-y-2">
-      <Label htmlFor="beforeId">Before ID</Label>
-      <Input
+      <Label htmlFor="beforeId">Insert before</Label>
+      <Select
         id="beforeId"
         value={draftBeforeId}
-        placeholder="MapLibre layer ID"
-        onChange={(event) => setDraftBeforeId(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key !== "Enter") return;
-          event.preventDefault();
-          applyBeforeId();
-        }}
-      />
+        onChange={(event) => applyBeforeId(event.target.value)}
+      >
+        <option value="">Layer order (default)</option>
+        {orphanedBeforeId && (
+          <optgroup label="Saved (unavailable)">
+            <option value={orphanedBeforeId}>{orphanedBeforeId}</option>
+          </optgroup>
+        )}
+        {otherLayers.length > 0 && (
+          <optgroup label="Layers">
+            {[...otherLayers].reverse().map((otherLayer) => (
+              <option key={otherLayer.id} value={otherLayer.id}>
+                {otherLayer.name}
+              </option>
+            ))}
+          </optgroup>
+        )}
+        {basemapStyleLayerIds.length > 0 && (
+          <optgroup label="Basemap layers">
+            {basemapStyleLayerIds.map((styleLayerId) => (
+              <option key={styleLayerId} value={styleLayerId}>
+                {styleLayerId}
+              </option>
+            ))}
+          </optgroup>
+        )}
+      </Select>
     </div>
   );
   const minZoom = styleValue(style, "minZoom");
@@ -1638,6 +1727,53 @@ export function StylePanel({ onResizeStart }: StylePanelProps) {
         value={style.circleRadius}
         onChange={(circleRadius) => setLayerStyle(layer.id, { circleRadius })}
       />
+      {hasTextMarkerControls ? (
+        <>
+          <Separator />
+          <div className="space-y-2">
+            <Label htmlFor="textColor">Text color</Label>
+            <Input
+              id="textColor"
+              type="color"
+              value={styleValue(style, "textColor")}
+              onChange={(e) =>
+                setLayerStyle(layer.id, { textColor: e.target.value })
+              }
+            />
+          </div>
+          <NumericStyleInput
+            id="textSize"
+            label="Text size"
+            min={6}
+            max={96}
+            step={1}
+            value={styleValue(style, "textSize")}
+            onChange={(textSize) => setLayerStyle(layer.id, { textSize })}
+          />
+          <div className="space-y-2">
+            <Label htmlFor="textHaloColor">Text halo color</Label>
+            <Input
+              id="textHaloColor"
+              type="color"
+              value={styleValue(style, "textHaloColor")}
+              onChange={(e) =>
+                setLayerStyle(layer.id, { textHaloColor: e.target.value })
+              }
+            />
+          </div>
+          <NumericStyleInput
+            id="textHaloWidth"
+            label="Text halo width"
+            min={0}
+            max={8}
+            step={0.5}
+            value={styleValue(style, "textHaloWidth")}
+            onChange={(textHaloWidth) =>
+              setLayerStyle(layer.id, { textHaloWidth })
+            }
+          />
+        </>
+      ) : null}
     </>
   );
   const extrusionControls = (
@@ -1750,7 +1886,7 @@ export function StylePanel({ onResizeStart }: StylePanelProps) {
 
   if (hasRasterPaintControls) {
     return (
-      <aside className="relative flex max-h-56 w-full shrink-0 flex-col border-t bg-card md:max-h-none md:w-[var(--style-panel-width)] md:border-l md:border-t-0">
+      <aside className={STYLE_PANEL_ASIDE_CLASS}>
         {resizeHandle}
         <div className="flex items-center justify-between gap-2 border-b px-3 py-1.5">
           <span className="truncate text-sm font-semibold">
@@ -1848,7 +1984,7 @@ export function StylePanel({ onResizeStart }: StylePanelProps) {
 
   if (!hasVectorPaintControls) {
     return (
-      <aside className="relative flex max-h-56 w-full shrink-0 flex-col border-t bg-card md:max-h-none md:w-[var(--style-panel-width)] md:border-l md:border-t-0">
+      <aside className={STYLE_PANEL_ASIDE_CLASS}>
         {resizeHandle}
         <div className="flex items-center justify-between gap-2 border-b px-3 py-1.5">
           <span className="truncate text-sm font-semibold">
@@ -1878,7 +2014,7 @@ export function StylePanel({ onResizeStart }: StylePanelProps) {
   }
 
   return (
-    <aside className="relative flex max-h-56 w-full shrink-0 flex-col border-t bg-card md:max-h-none md:w-[var(--style-panel-width)] md:border-l md:border-t-0">
+    <aside className={STYLE_PANEL_ASIDE_CLASS}>
       {resizeHandle}
       <div className="flex items-center justify-between gap-2 border-b px-3 py-1.5">
         <span className="truncate text-sm font-semibold">

@@ -28,6 +28,32 @@ Open `http://localhost:5173`. The map and browser vector import support local ve
 
 Desktop filesystem dialogs, local MBTiles, local raster file reads, project save/open, and other filesystem operations require Tauri.
 
+## Run with Docker
+
+The repository includes a Dockerfile for the browser version of GeoLibre. It builds the Vite app and serves the production files with nginx:
+
+```bash
+docker build -t geolibre .
+docker run --rm -p 8080:80 geolibre
+```
+
+Open `http://localhost:8080`. The containerized browser UI supports web-capable workflows, but desktop filesystem dialogs, local MBTiles, local raster file reads, project save/open, and other Tauri-only features require the desktop app.
+
+The published image is available from GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/opengeos/geolibre:latest
+docker run --rm -p 8080:80 ghcr.io/opengeos/geolibre:latest
+```
+
+For deployments under a URL subpath, pass the app base at build time:
+
+```bash
+docker build --build-arg GEOLIBRE_APP_BASE=/geolibre/ -t geolibre .
+```
+
+The container always serves the app from its root path. The build argument only sets the URL prefix that the app expects, so subpath deployments also require a reverse proxy in front of the container that strips the prefix before forwarding requests (for example, nginx `proxy_pass http://geolibre/;` with a trailing slash).
+
 ## Run the desktop app
 
 ```bash

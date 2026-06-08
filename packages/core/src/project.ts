@@ -69,9 +69,7 @@ export function parseProject(json: string): GeoLibreProject {
   };
 }
 
-function normalizeProjectPreferences(
-  preferences: unknown,
-): ProjectPreferences {
+function normalizeProjectPreferences(preferences: unknown): ProjectPreferences {
   if (!preferences || typeof preferences !== "object") {
     return DEFAULT_PROJECT_PREFERENCES;
   }
@@ -117,9 +115,7 @@ function normalizeProjectPreferences(
   };
 }
 
-function normalizeBounds(
-  bounds: unknown,
-): ProjectPreferences["map"]["bounds"] {
+function normalizeBounds(bounds: unknown): ProjectPreferences["map"]["bounds"] {
   if (
     Array.isArray(bounds) &&
     bounds.length === 4 &&
@@ -176,12 +172,13 @@ const PROJECT_PLUGIN_CONTROL_POSITIONS = new Set<ProjectPluginControlPosition>([
   "bottom-right",
 ]);
 
-function normalizeProjectPlugins(
-  plugins: unknown,
-): ProjectPluginState | null {
+function normalizeProjectPlugins(plugins: unknown): ProjectPluginState | null {
   if (!plugins || typeof plugins !== "object") return null;
 
   const candidate = plugins as Partial<ProjectPluginState>;
+  const manifestUrls = Array.isArray(candidate.manifestUrls)
+    ? uniqueStrings(candidate.manifestUrls).filter(isAllowedPluginManifestUrl)
+    : [];
   const activePluginIds = Array.isArray(candidate.activePluginIds)
     ? uniqueStrings(candidate.activePluginIds)
     : [];
@@ -221,10 +218,27 @@ function normalizeProjectPlugins(
   }
 
   return {
+    manifestUrls,
     activePluginIds,
     mapControlPositions,
     settings,
   };
+}
+
+// Plugin manifest URLs lead to fetched and executed code, so both the
+// Settings dialog and project-file loading enforce the same scheme rule:
+// HTTPS, or HTTP on a loopback host for local development.
+export function isAllowedPluginManifestUrl(url: string): boolean {
+  try {
+    const { protocol, hostname } = new URL(url);
+    return (
+      protocol === "https:" ||
+      (protocol === "http:" &&
+        ["localhost", "127.0.0.1", "[::1]"].includes(hostname))
+    );
+  } catch {
+    return false;
+  }
 }
 
 function uniqueStrings(values: unknown[]): string[] {
@@ -308,6 +322,14 @@ export function projectFromStore(state: {
 }
 
 function prepareLayerForSave(layer: GeoLibreLayer): GeoLibreLayer {
+  // Vector layers owned by the Add Vector Layer control restore their features
+  // from their source URL/file, so any `geojson` read back from the map for the
+  // attribute table is redundant in a saved project and would only bloat it.
+  if (layer.metadata.externalNativeLayer === true && layer.geojson) {
+    const { geojson: _geojson, ...rest } = layer;
+    layer = rest;
+  }
+
   if (layer.type !== "xyz") return layer;
 
   const originalUrl =
