@@ -411,12 +411,53 @@ export async function runRasterToCog(
   return startConversion(`${baseUrl}/conversion/raster-to-cog`, request, baseUrl);
 }
 
+export interface RasterStatus {
+  available: boolean;
+  message: string;
+}
+
+export interface RasterToolRequest {
+  tool_id: string;
+  input_path: string;
+  output_path: string;
+  /** Tool parameters (azimuth, dst_crs, interval, ...). */
+  parameters?: Record<string, unknown>;
+}
+
+/** Return raster-processing (rasterio) runtime availability. */
+export async function fetchRasterStatus(
+  baseUrl = DEFAULT_SIDECAR_URL,
+): Promise<RasterStatus> {
+  let res: Response;
+  try {
+    res = await fetch(`${baseUrl}/raster/status`);
+  } catch (error) {
+    throw sidecarConnectionError(baseUrl, error);
+  }
+  if (!res.ok) {
+    throw new Error(`Raster status failed: HTTP ${res.status}`);
+  }
+  return (await res.json()) as RasterStatus;
+}
+
+/**
+ * Start a raster processing job. Raster jobs share the conversion job store,
+ * so callers poll the result with `fetchConversionJob`.
+ */
+export async function runRasterTool(
+  request: RasterToolRequest,
+  baseUrl = DEFAULT_SIDECAR_URL,
+): Promise<ConversionJob> {
+  return startConversion(`${baseUrl}/raster/run`, request, baseUrl);
+}
+
 type ConversionRequest =
   | VectorToGeoParquetRequest
   | VectorToFlatGeobufRequest
   | CsvToGeoParquetRequest
   | VectorToPmtilesRequest
-  | RasterToCogRequest;
+  | RasterToCogRequest
+  | RasterToolRequest;
 
 async function startConversion(
   url: string,
@@ -455,6 +496,63 @@ export async function fetchConversionJob(
     throw new Error(await responseErrorMessage(res, "Could not load conversion job"));
   }
   return (await res.json()) as ConversionJob;
+}
+
+export interface VectorStatus {
+  available: boolean;
+  message: string;
+}
+
+export interface VectorToolRequest {
+  tool_id: string;
+  /** Primary input layer as a GeoJSON FeatureCollection. */
+  geojson: unknown;
+  /** Optional second layer for overlay operations (clip/intersection/etc.). */
+  overlay?: unknown;
+  /** Tool parameters (distance, units, tolerance, field, ...). */
+  parameters?: Record<string, unknown>;
+}
+
+export interface VectorToolResult {
+  /** Resulting GeoJSON FeatureCollection. */
+  geojson: unknown;
+  /** Human-readable log lines describing what ran. */
+  messages: string[];
+}
+
+export async function fetchVectorStatus(
+  baseUrl = DEFAULT_SIDECAR_URL,
+): Promise<VectorStatus> {
+  let res: Response;
+  try {
+    res = await fetch(`${baseUrl}/vector/status`);
+  } catch (error) {
+    throw sidecarConnectionError(baseUrl, error);
+  }
+  if (!res.ok) {
+    throw new Error(`Vector status failed: HTTP ${res.status}`);
+  }
+  return (await res.json()) as VectorStatus;
+}
+
+export async function runVectorTool(
+  request: VectorToolRequest,
+  baseUrl = DEFAULT_SIDECAR_URL,
+): Promise<VectorToolResult> {
+  let res: Response;
+  try {
+    res = await fetch(`${baseUrl}/vector/run`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request),
+    });
+  } catch (error) {
+    throw sidecarConnectionError(baseUrl, error);
+  }
+  if (!res.ok) {
+    throw new Error(await responseErrorMessage(res, "Could not run vector tool"));
+  }
+  return (await res.json()) as VectorToolResult;
 }
 
 async function responseErrorMessage(

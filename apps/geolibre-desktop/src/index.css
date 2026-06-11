@@ -1,4 +1,8 @@
 @import "@geolibre/ui/globals.css";
+/* Supplies the custom-color/border-radius theme that @geolibre/ui's globals.css
+   relies on via @apply (background, border, etc.). globals.css is intentionally
+   config-agnostic; the consuming app provides the Tailwind config here. */
+@config "../tailwind.config.js";
 
 html,
 body,
@@ -1181,6 +1185,21 @@ body,
   min-height: 30px;
 }
 
+/*
+ * Enlarge the native number-input spinner arrows inside dialogs (e.g. the
+ * Raster/Conversion tool dialogs). The default WebKit stepper is tiny and only
+ * visible on hover; make it always visible and comfortably clickable. Scoped to
+ * [role="dialog"] so the carefully sized map-control inputs above are untouched.
+ */
+[role="dialog"] input[type="number"]::-webkit-inner-spin-button,
+[role="dialog"] input[type="number"]::-webkit-outer-spin-button {
+  opacity: 1;
+  height: 1.9rem;
+  width: 1.15rem;
+  margin-left: 0.35rem;
+  cursor: pointer;
+}
+
 .geolibre-splatting-control .maplibre-gl-splat-panel {
   background: hsl(var(--popover)) !important;
   border: 1px solid hsl(var(--border));
@@ -1854,6 +1873,14 @@ html:not(.dark) .vector-control-popup,
   --vc-shadow: 0 0 0 2px hsl(0 0% 0% / 0.4);
 
   color-scheme: dark;
+}
+
+/* The panel content scrolls vertically (overflow-y: auto), which forces
+   overflow-x to clip and cuts off the Load button's offset focus ring on
+   the right edge. Give the scroll area a little horizontal breathing room
+   so the ring is not clipped. */
+.vector-control-panel.geolibre-vector-panel .vector-control-content {
+  padding-inline: 5px;
 }
 
 /* The upstream stylesheet themes the MapLibre popup chrome around the

@@ -73,6 +73,8 @@ function fakeControl(
       calls.push({ method: "setLayerOpacity", args: [id, opacity] }),
     setLayerVisibility: (id, visible) =>
       calls.push({ method: "setLayerVisibility", args: [id, visible] }),
+    setLayerStyle: (id, style) =>
+      calls.push({ method: "setLayerStyle", args: [id, style] }),
   };
   return { control, calls };
 }
@@ -186,6 +188,77 @@ describe("createVectorStoreLayer", () => {
 
     assert.equal(layer.metadata.panelCollapsed, false);
   });
+
+  it("seeds the panel style from polygon fill/outline", () => {
+    const layer = createVectorStoreLayer(
+      vectorInfo({
+        geometryType: "polygon",
+        style: vectorStyle({
+          fillColor: "#112233",
+          fillOpacity: 0.3,
+          lineColor: "#445566",
+          lineWidth: 4,
+        }),
+      }),
+    );
+
+    assert.equal(layer.style.fillColor, "#112233");
+    assert.equal(layer.style.fillOpacity, 0.3);
+    assert.equal(layer.style.strokeColor, "#445566");
+    assert.equal(layer.style.strokeWidth, 4);
+  });
+
+  it("seeds the panel fill from the circle style for point layers", () => {
+    const layer = createVectorStoreLayer(
+      vectorInfo({
+        geometryType: "point",
+        style: vectorStyle({
+          fillColor: "#ffffff",
+          circleColor: "#abc123",
+          circleOpacity: 0.7,
+          circleRadius: 9,
+        }),
+      }),
+    );
+
+    // Points fold the circle color/opacity onto GeoLibre's shared fill fields,
+    // not the polygon fillColor.
+    assert.equal(layer.style.fillColor, "#abc123");
+    assert.equal(layer.style.fillOpacity, 0.7);
+    assert.equal(layer.style.circleRadius, 9);
+  });
+
+  it("seeds a line layer from the line style and keeps default fill", () => {
+    const layer = createVectorStoreLayer(
+      vectorInfo({
+        geometryType: "line",
+        style: vectorStyle({
+          fillColor: "#ffffff",
+          lineColor: "#0a0b0c",
+          lineWidth: 5,
+        }),
+      }),
+    );
+
+    // The non-point branch seeds stroke from lineColor; the shared fillColor
+    // tracks the control's fillColor field (irrelevant to a line, but harmless).
+    assert.equal(layer.style.strokeColor, "#0a0b0c");
+    assert.equal(layer.style.strokeWidth, 5);
+    assert.equal(layer.style.fillColor, "#ffffff");
+  });
+
+  it("seeds a mixed layer from the polygon fill (lossy collapse)", () => {
+    const layer = createVectorStoreLayer(
+      vectorInfo({
+        geometryType: "mixed",
+        style: vectorStyle({ fillColor: "#101112", circleColor: "#dddddd" }),
+      }),
+    );
+
+    // "mixed" takes the non-point branch: the shared fillColor comes from the
+    // polygon fill, so the circle color is unified with it from the first edit.
+    assert.equal(layer.style.fillColor, "#101112");
+  });
 });
 
 describe("syncVectorLayersToStore", () => {
@@ -280,6 +353,7 @@ describe("syncVectorLayersToStore", () => {
       removeLayer: () => {},
       setLayerOpacity: () => {},
       setLayerVisibility: () => {},
+      setLayerStyle: () => {},
     };
     handlers.push(() => syncVectorLayersToStore(control));
     const expand = () => {
@@ -367,6 +441,117 @@ describe("wireVectorStoreSync", () => {
     ]);
   });
 
+  it("applies panel style changes through the control", () => {
+    const { control, calls } = fakeControl([vectorInfo()]);
+    syncVectorLayersToStore(control);
+    wireVectorStoreSync(control);
+
+    useAppStore.getState().setLayerStyle("vector-1", { fillColor: "#ff0000" });
+
+    // GeoLibre's shared fillColor/strokeColor/fillOpacity/strokeWidth map onto
+    // the control's per-geometry fill/line/circle style; the unedited fields
+    // come from the style seeded off the control's own style. The color
+    // expression fields are undefined for a single-color (non-data-driven) edit.
+    const expectedStyle = {
+      fillColor: "#ff0000",
+      fillOpacity: 0.4,
+      lineColor: "#3388ff",
+      lineWidth: 2,
+      circleColor: "#ff0000",
+      circleOpacity: 0.4,
+      circleRadius: 5,
+      fillColorExpression: undefined,
+      lineColorExpression: undefined,
+      circleColorExpression: undefined,
+    };
+    assert.deepEqual(calls, [
+      { method: "setLayerStyle", args: ["vector-1", expectedStyle] },
+    ]);
+
+    // The control-seed style is kept in sync so a saved project restores the
+    // edited colors (restoreVectorLayers seeds addData from vectorState.style).
+    const stored = useAppStore.getState().layers[0];
+    assert.deepEqual(
+      (stored.metadata.vectorState as { style: unknown }).style,
+      expectedStyle,
+    );
+  });
+
+  it("pushes a categorized color expression through the control", () => {
+    const { control, calls } = fakeControl([vectorInfo()]);
+    syncVectorLayersToStore(control);
+    wireVectorStoreSync(control);
+
+    useAppStore.getState().setLayerStyle("vector-1", {
+      vectorStyleMode: "categorized",
+      vectorStyleProperty: "continent",
+      vectorStyleStops: [
+        { value: "Asia", color: "#ff0000" },
+        { value: "Europe", color: "#00ff00" },
+      ],
+    });
+
+    assert.equal(calls.length, 1);
+    const [method, args] = [calls[0].method, calls[0].args];
+    assert.equal(method, "setLayerStyle");
+    const pushed = args[1] as VectorLayerStyle;
+    // The fill (and circle) color becomes a MapLibre `match` expression on the
+    // chosen attribute, with the flat fillColor as the fallback.
+    const matchExpr = [
+      "match",
+      ["to-string", ["get", "continent"]],
+      "Asia",
+      "#ff0000",
+      "Europe",
+      "#00ff00",
+      "#3388ff",
+    ];
+    assert.deepEqual(pushed.fillColorExpression, matchExpr);
+    assert.deepEqual(pushed.circleColorExpression, matchExpr);
+    // Polygon outlines keep the flat stroke color; only line geometry takes the
+    // categorized color, expressed via a geometry-type case.
+    assert.deepEqual(pushed.lineColorExpression, [
+      "case",
+      ["==", ["geometry-type"], "Polygon"],
+      "#3388ff",
+      matchExpr,
+    ]);
+  });
+
+  it("clears the color expression when reverting to a single color", () => {
+    const { control, calls } = fakeControl([vectorInfo()]);
+    syncVectorLayersToStore(control);
+    wireVectorStoreSync(control);
+
+    useAppStore.getState().setLayerStyle("vector-1", {
+      vectorStyleMode: "categorized",
+      vectorStyleProperty: "continent",
+      vectorStyleStops: [{ value: "Asia", color: "#ff0000" }],
+    });
+    useAppStore.getState().setLayerStyle("vector-1", {
+      vectorStyleMode: "single",
+    });
+
+    // Two pushes: one applying the expression, one reverting to flat color.
+    assert.equal(calls.length, 2);
+    const reverted = calls[1].args[1] as VectorLayerStyle;
+    assert.equal(reverted.fillColorExpression, undefined);
+    assert.equal(reverted.lineColorExpression, undefined);
+    assert.equal(reverted.circleColorExpression, undefined);
+  });
+
+  it("does not touch the control for GeoLibre-only style fields", () => {
+    const { control, calls } = fakeControl([vectorInfo()]);
+    syncVectorLayersToStore(control);
+    wireVectorStoreSync(control);
+
+    // textColor has no VectorLayerStyle equivalent, so the mapped style is
+    // unchanged and no setLayerStyle is pushed.
+    useAppStore.getState().setLayerStyle("vector-1", { textColor: "#abcdef" });
+
+    assert.deepEqual(calls, []);
+  });
+
   it("drops the control layer when the panel removes the layer", () => {
     const { control, calls } = fakeControl([vectorInfo()]);
     syncVectorLayersToStore(control);
@@ -448,6 +633,53 @@ describe("savedVectorState", () => {
       sourceLayer: "roads",
       style: vectorStyle({ circleRadius: 8, circleOpacity: 0.5 }),
     });
+  });
+
+  it("restores data-driven color expressions from the persisted style", () => {
+    // A saved categorized/graduated style persists a color expression in
+    // vectorState.style; restore must hand it back so the control seeds the
+    // expression and the reopened project renders the data-driven colors.
+    const matchExpr = [
+      "match",
+      ["to-string", ["get", "continent"]],
+      "Asia",
+      "#ff0000",
+      "#3388ff",
+    ];
+    const layer = createVectorStoreLayer(vectorInfo());
+    (layer.metadata.vectorState as Record<string, unknown>).style = {
+      ...vectorStyle(),
+      fillColorExpression: matchExpr,
+      circleColorExpression: matchExpr,
+    };
+
+    const restored = savedVectorState(layer).style;
+    assert.ok(restored != null);
+    assert.deepEqual(restored.fillColorExpression, matchExpr);
+    assert.deepEqual(restored.circleColorExpression, matchExpr);
+    // No lineColorExpression was persisted, so none is restored.
+    assert.equal("lineColorExpression" in restored, false);
+  });
+
+  it("drops a malformed color expression without throwing", () => {
+    // A circular (or pathologically deep) array from a hand-edited project file
+    // would make JSON.stringify throw; the guard must reject it and keep the
+    // rest of the restore working rather than aborting it. Empty arrays are
+    // rejected too, since [] is not a valid MapLibre expression.
+    const circular: unknown[] = [];
+    circular.push(circular);
+    const layer = createVectorStoreLayer(vectorInfo());
+    (layer.metadata.vectorState as Record<string, unknown>).style = {
+      fillColor: "#123456",
+      fillColorExpression: circular,
+      lineColorExpression: [],
+    };
+
+    const restored = savedVectorState(layer).style;
+    assert.ok(restored != null);
+    assert.equal(restored.fillColor, "#123456");
+    assert.equal("fillColorExpression" in restored, false);
+    assert.equal("lineColorExpression" in restored, false);
   });
 
   it("drops malformed fields from hand-edited project files", () => {

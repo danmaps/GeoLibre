@@ -49,6 +49,24 @@ export interface GeoLibreFileDialogOptions {
   mimeType?: string;
 }
 
+/**
+ * GeoLibre's own deck.gl modules, handed to a plugin via
+ * {@link GeoLibreAppAPI.getDeckGL}. Lets an external plugin render deck.gl
+ * layers using the host's single deck.gl instance instead of bundling its own.
+ */
+export interface GeoLibreDeckGL {
+  /** `@deck.gl/core` (Deck, the Layer base classes, view/state helpers). */
+  core: typeof import("@deck.gl/core");
+  /** `@deck.gl/layers` (ArcLayer, ScatterplotLayer, GeoJsonLayer, ...). */
+  layers: typeof import("@deck.gl/layers");
+  /** `@deck.gl/geo-layers` (TileLayer, H3HexagonLayer, S2Layer, ...). */
+  geoLayers: typeof import("@deck.gl/geo-layers");
+  /** `@deck.gl/mesh-layers` (SimpleMeshLayer, ScenegraphLayer). */
+  meshLayers: typeof import("@deck.gl/mesh-layers");
+  /** `@deck.gl/mapbox` - use `mapbox.MapboxOverlay` for interleaved MapLibre rendering. */
+  mapbox: typeof import("@deck.gl/mapbox");
+}
+
 export interface GeoLibreAppAPI {
   setBasemap: (styleUrl: string) => void;
   addGeoJsonLayer: (
@@ -59,6 +77,22 @@ export interface GeoLibreAppAPI {
   getActiveBasemap: () => string;
   onBasemapChange: (callback: (styleUrl: string) => void) => () => void;
   fetchArrayBuffer?: (url: string) => Promise<ArrayBuffer>;
+  /**
+   * Resolve a fetchable URL for an asset shipped alongside an external
+   * plugin's manifest (e.g. sample data bundled in the plugin folder). The
+   * host resolves `relativePath` against the plugin's own directory. Returns
+   * null for built-in plugins, for plugins installed from the desktop
+   * filesystem (which have no URL base), or when `relativePath` escapes the
+   * plugin directory. `pluginId` should be the calling plugin's own id; since
+   * all plugins share one JS context the host cannot verify the caller, so this
+   * is a convention rather than an enforced boundary. It is not a privilege
+   * boundary: the resolved URL grants no access a plugin does not already have,
+   * since any plugin can fetch any same-origin URL directly.
+   */
+  resolvePluginAssetUrl?: (
+    pluginId: string,
+    relativePath: string,
+  ) => string | null;
   fitBounds?: (bounds: [number, number, number, number]) => void;
   getMap?: () => MapLibreMap | null;
   pickLocalDirectoryFiles?: () => Promise<File[] | null>;
@@ -107,6 +141,16 @@ export interface GeoLibreAppAPI {
     control: GeoLibreBuiltInMapControl,
     position: GeoLibreMapControlPosition,
   ) => boolean;
+  /**
+   * Resolve GeoLibre's own deck.gl modules so an external plugin can render
+   * deck.gl layers (e.g. an `ArcLayer`) on the host's single deck.gl instance.
+   * Bundling a second copy is not viable: deck.gl and luma.gl throw on a
+   * version mismatch and share global singletons, so a plugin's own copy fails
+   * to render. Always present on the GeoLibre desktop and web hosts; typed
+   * optional for forward-compatibility with host variants that may not ship
+   * deck.gl, so plugins should still call it with optional chaining.
+   */
+  getDeckGL?: () => Promise<GeoLibreDeckGL>;
 }
 
 export interface GeoLibrePlugin {

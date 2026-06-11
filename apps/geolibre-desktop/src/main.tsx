@@ -19,6 +19,7 @@ import "maplibre-gl-planetary-computer/style.css";
 import "maplibre-gl-raster/style.css";
 import "maplibre-gl-streetview/style.css";
 import "maplibre-gl-swipe/style.css";
+import "maplibre-gl-time-slider/style.css";
 import "maplibre-gl-vector/style.css";
 import "mapillary-js/dist/mapillary.css";
 import "./index.css";
@@ -27,8 +28,12 @@ import "./lib/geoagent-style";
 import "./lib/lidar-style";
 import "./lib/swipe-style";
 import { installDiagnosticsCapture } from "./lib/diagnostics";
+import { installStaleChunkReload } from "./lib/stale-chunk-reload";
 
 installDiagnosticsCapture();
+// Recover from chunks orphaned by a web redeploy (stale lazy import → 404). A
+// no-op in the desktop build, whose chunks are bundled locally.
+installStaleChunkReload();
 
 void import("./App")
   .then(({ default: App }) => {

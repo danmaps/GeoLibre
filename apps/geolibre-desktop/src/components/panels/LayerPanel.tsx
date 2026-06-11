@@ -9,6 +9,10 @@ import {
 } from "react";
 import { isDuckDBQueryLayer, useAppStore } from "@geolibre/core";
 import type { GeoLibreLayer } from "@geolibre/core";
+import {
+  canEditLayerGeometry,
+  reloadVectorControlLayer,
+} from "@geolibre/plugins";
 import type { MapController } from "@geolibre/map";
 import { isPlaceholderLayer, placeholderMessage } from "@geolibre/map";
 import {
@@ -22,6 +26,9 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
   Input,
   Label,
@@ -33,6 +40,7 @@ import {
 import {
   ChevronDown,
   ChevronUp,
+  Download,
   Eye,
   EyeOff,
   GripVertical,
@@ -42,7 +50,11 @@ import {
   MousePointerClick,
   PanelLeftClose,
   PanelLeftOpen,
+  Pencil,
+  PencilRuler,
   RefreshCw,
+  Table2,
+  TableProperties,
   Timer,
   Trash2,
   ZoomIn,
@@ -50,14 +62,30 @@ import {
 import {
   getLayerRefreshConfig,
   isRefreshableLayer,
+  isVectorControlRefreshLayer,
   MIN_REFRESH_INTERVAL_MS,
   refreshGeoJsonLayer,
   setLayerRefreshConfig,
 } from "../../lib/layer-refresh";
+import {
+  exportVectorLayer,
+  geojsonVectorSourceId,
+  resolveLayerGeojson,
+  sanitizeExportFileName,
+  type VectorExportFormat,
+} from "../../lib/vector-export";
 
 interface LayerPanelProps {
   mapControllerRef: RefObject<MapController | null>;
   onResizeStart: (event: ReactMouseEvent<HTMLDivElement>) => void;
+  /** Id of the layer currently in a geometry-edit session, or null. */
+  geometryEditLayerId: string | null;
+  /** Toggle in-place geometry editing for a layer (toggling off saves). */
+  onToggleGeometryEdit: (layerId: string) => void;
+  /** Discard the active geometry-edit session without saving. */
+  onCancelGeometryEdit: () => void;
+  /** Materialize a DuckDB query layer into an editable GeoJSON layer. */
+  onMaterializeDuckDBLayer: (layer: GeoLibreLayer) => void;
 }
 
 const BACKGROUND_SELECTION_ID = "__geolibre-background__";
@@ -129,6 +157,10 @@ function isMobileViewport(): boolean {
 export function LayerPanel({
   mapControllerRef,
   onResizeStart,
+  geometryEditLayerId,
+  onToggleGeometryEdit,
+  onCancelGeometryEdit,
+  onMaterializeDuckDBLayer,
 }: LayerPanelProps) {
   const layers = useAppStore((s) => s.layers);
   const selectedLayerId = useAppStore((s) => s.selectedLayerId);
@@ -145,6 +177,9 @@ export function LayerPanel({
   const moveLayer = useAppStore((s) => s.moveLayer);
   const removeLayer = useAppStore((s) => s.removeLayer);
   const updateLayer = useAppStore((s) => s.updateLayer);
+  const setAttributeTableOpen = useAppStore((s) => s.setAttributeTableOpen);
+  const [editingLayerId, setEditingLayerId] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState("");
   const [metadataLayer, setMetadataLayer] = useState<GeoLibreLayer | null>(
     null,
   );
@@ -163,6 +198,14 @@ export function LayerPanel({
   const [dropTargetLayerId, setDropTargetLayerId] = useState<string | null>(
     null,
   );
+  // Ending a rename (commit or cancel) clears the editing state, which
+  // unmounts the focused input. React then delivers that input's onBlur (the
+  // browser's native blur on the removed element) to commitRename from the
+  // pre-update closure, which would re-commit the edit. This ref, read
+  // synchronously by commitRename, suppresses that stray blur commit. It is
+  // reset in beginRename so a flag left set by a cancel whose blur never fired
+  // cannot leak into the next rename session.
+  const suppressBlurCommitRef = useRef(false);
   const refreshingLayerIdsRef = useRef(new Set<string>());
   const refreshTimersRef = useRef(new Map<string, LayerRefreshTimer>());
   const refreshStatusTimersRef = useRef(new Map<string, number>());
@@ -198,6 +241,37 @@ export function LayerPanel({
   const resetDragState = () => {
     setDraggedLayerId(null);
     setDropTargetLayerId(null);
+  };
+
+  const beginRename = (layer: GeoLibreLayer) => {
+    // Clear any flag left set by a prior cancel/commit whose blur never fired,
+    // so it cannot swallow the first commit of this rename session.
+    suppressBlurCommitRef.current = false;
+    setEditingLayerId(layer.id);
+    setEditingName(layer.name);
+  };
+
+  const commitRename = () => {
+    if (suppressBlurCommitRef.current || !editingLayerId) {
+      suppressBlurCommitRef.current = false;
+      return;
+    }
+    // Suppress the onBlur that fires when clearing editing state unmounts the
+    // input, so the edit is not committed a second time from the stale closure.
+    suppressBlurCommitRef.current = true;
+    const trimmed = editingName.trim();
+    const current = layers.find((l) => l.id === editingLayerId);
+    if (trimmed && current && trimmed !== current.name) {
+      updateLayer(editingLayerId, { name: trimmed });
+    }
+    setEditingLayerId(null);
+    setEditingName("");
+  };
+
+  const cancelRename = () => {
+    suppressBlurCommitRef.current = true;
+    setEditingLayerId(null);
+    setEditingName("");
   };
 
   const clearRefreshStatusTimer = useCallback((layerId: string) => {
@@ -242,6 +316,48 @@ export function LayerPanel({
       }));
 
       try {
+        if (isVectorControlRefreshLayer(layer)) {
+          const info = await reloadVectorControlLayer(layer.id);
+          if (!info) {
+            // The control is unavailable (panel never opened, or torn down
+            // and not yet replayed) or no longer knows this layer id.
+            // Automatic ticks fire on a timer the user didn't initiate, so
+            // skip silently and clear the transient note instead of surfacing
+            // an error every interval until the control comes back.
+            if (automatic) {
+              setRefreshStatuses((current) => {
+                if (!current[layer.id]) return current;
+                const next = { ...current };
+                delete next[layer.id];
+                return next;
+              });
+              return;
+            }
+            throw new Error(
+              "Could not refresh this layer. Try re-opening the Add Vector Layer panel.",
+            );
+          }
+          // reloadLayer fires `layerupdated`, which drives
+          // syncVectorLayersToStore to persist the refreshed featureCount (and
+          // bounds) into the store. We intentionally don't call updateLayer
+          // here: the metadata write is handled by that event, and a second
+          // write would risk clobbering the synced values. `info` feeds only
+          // the toast below.
+          const featureCount =
+            typeof info.featureCount === "number" ? info.featureCount : null;
+          setRefreshStatuses((current) => ({
+            ...current,
+            [layer.id]: {
+              type: "success",
+              message:
+                featureCount === null
+                  ? "Refreshed."
+                  : `Refreshed ${featureCount.toLocaleString()} features.`,
+            },
+          }));
+          scheduleStatusClear(layer.id);
+          return;
+        }
         const { geojson, featureCount } = await refreshGeoJsonLayer(layer);
         const latest = useAppStore
           .getState()
@@ -284,6 +400,57 @@ export function LayerPanel({
     [clearRefreshStatusTimer, scheduleStatusClear, updateLayer],
   );
 
+  const handleExportLayer = useCallback(
+    async (layer: GeoLibreLayer, format: VectorExportFormat) => {
+      clearRefreshStatusTimer(layer.id);
+      try {
+        const geojson = await resolveLayerGeojson(
+          layer,
+          mapControllerRef.current?.getMap() ?? undefined,
+        );
+        if (!geojson) {
+          // A source-backed (Add Vector Layer) layer whose features could not be
+          // read is usually a not-yet-ready map source, not a layer that lacks
+          // features, so the two cases get different diagnostics.
+          const message =
+            geojsonVectorSourceId(layer) !== null
+              ? "Layer data is not ready yet. Try again in a moment."
+              : "Export requires a vector layer with features.";
+          setRefreshStatuses((current) => ({
+            ...current,
+            [layer.id]: { type: "error", message },
+          }));
+          scheduleStatusClear(layer.id);
+          return;
+        }
+        const savedPath = await exportVectorLayer(
+          geojson,
+          format,
+          sanitizeExportFileName(layer.name),
+        );
+        // A null path means the user cancelled the save dialog, so no note.
+        if (savedPath !== null) {
+          setRefreshStatuses((current) => ({
+            ...current,
+            [layer.id]: { type: "success", message: "Layer exported." },
+          }));
+          scheduleStatusClear(layer.id);
+        }
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Could not export this layer.";
+        setRefreshStatuses((current) => ({
+          ...current,
+          [layer.id]: { type: "error", message },
+        }));
+        scheduleStatusClear(layer.id);
+      }
+    },
+    [clearRefreshStatusTimer, mapControllerRef, scheduleStatusClear],
+  );
+
   // Read through a ref inside interval callbacks so long-lived timers never
   // capture a stale handleRefreshLayer closure.
   const handleRefreshLayerRef = useRef(handleRefreshLayer);
@@ -297,6 +464,14 @@ export function LayerPanel({
       !layers.some((layer) => layer.id === refreshSettingsLayerId)
     ) {
       setRefreshSettingsLayerId(null);
+    }
+
+    if (
+      editingLayerId &&
+      !layers.some((layer) => layer.id === editingLayerId)
+    ) {
+      setEditingLayerId(null);
+      setEditingName("");
     }
 
     const layerIds = new Set(layers.map((layer) => layer.id));
@@ -314,7 +489,7 @@ export function LayerPanel({
       }
       return changed ? next : current;
     });
-  }, [clearRefreshStatusTimer, layers, refreshSettingsLayerId]);
+  }, [clearRefreshStatusTimer, editingLayerId, layers, refreshSettingsLayerId]);
 
   useEffect(() => {
     if (refreshSettingsIntervalMs === null) {
@@ -525,6 +700,20 @@ export function LayerPanel({
                 layer.metadata.tileType === "vector") ||
               hasNativeIdentifyLayers(layer);
             const identifyActive = identifyLayerId === layer.id;
+            const canEditGeometry = canEditLayerGeometry(layer);
+            const geometryEditActive = geometryEditLayerId === layer.id;
+            const geometryEditElsewhere =
+              geometryEditLayerId !== null && !geometryEditActive;
+            const canMaterializeDuckDB =
+              isDuckDBQueryLayer(layer) &&
+              typeof layer.metadata.query === "string";
+            // The attribute table reads features from geojson layers (including
+            // Add Vector Layer geojson-mode) and DuckDB query layers.
+            const canOpenAttributeTable =
+              layer.type === "geojson" || isDuckDBQueryLayer(layer);
+            // Export writes the layer's GeoJSON features to disk; only
+            // geojson-backed vector layers carry those features.
+            const canExportLayer = layer.type === "geojson";
             const canRefresh = isRefreshableLayer(layer);
             const refreshConfig = getLayerRefreshConfig(layer);
             const refreshStatus = refreshStatuses[layer.id];
@@ -564,7 +753,7 @@ export function LayerPanel({
                     title="Drag to reorder"
                     aria-label={`Drag ${layer.name} to reorder`}
                     className="cursor-grab rounded p-0.5 text-muted-foreground hover:bg-muted active:cursor-grabbing"
-                    onClick={(e) => e.stopPropagation()}
+                    onClick={(e: ReactMouseEvent) => e.stopPropagation()}
                     onDragStart={(e) => handleLayerDragStart(e, layer.id)}
                   >
                     <GripVertical className="h-3.5 w-3.5" />
@@ -585,9 +774,40 @@ export function LayerPanel({
                       <EyeOff className="h-3.5 w-3.5 text-muted-foreground" />
                     )}
                   </button>
-                  <span className="flex-1 truncate text-sm font-medium">
-                    {layer.name}
-                  </span>
+                  {editingLayerId === layer.id ? (
+                    <input
+                      autoFocus
+                      type="text"
+                      className="flex-1 min-w-0 rounded border border-input bg-background px-1 py-0.5 text-sm font-medium outline-none focus:ring-1 focus:ring-ring"
+                      value={editingName}
+                      aria-label={`Rename ${layer.name}`}
+                      onChange={(e) => setEditingName(e.target.value)}
+                      onClick={(e: ReactMouseEvent) => e.stopPropagation()}
+                      onFocus={(e) => e.currentTarget.select()}
+                      onBlur={commitRename}
+                      onKeyDown={(e) => {
+                        e.stopPropagation();
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          commitRename();
+                        } else if (e.key === "Escape") {
+                          e.preventDefault();
+                          cancelRename();
+                        }
+                      }}
+                    />
+                  ) : (
+                    <span
+                      className="flex-1 truncate text-sm font-medium"
+                      title="Double-click to rename"
+                      onDoubleClick={(e: ReactMouseEvent) => {
+                        e.stopPropagation();
+                        beginRename(layer);
+                      }}
+                    >
+                      {layer.name}
+                    </span>
+                  )}
                   <span className="text-[10px] uppercase text-muted-foreground">
                     {layerTypeLabel(layer)}
                   </span>
@@ -610,6 +830,38 @@ export function LayerPanel({
                     {refreshStatus.message}
                   </p>
                 )}
+                {geometryEditActive && (
+                  <div className="mt-1 flex items-center gap-1 rounded-sm bg-primary/10 px-1.5 py-1">
+                    <PencilRuler className="h-3 w-3 text-primary" />
+                    <span className="flex-1 text-[10px] font-medium text-primary">
+                      Editing geometry
+                    </span>
+                    <Button
+                      variant="default"
+                      size="sm"
+                      className="h-6 px-2 text-[10px]"
+                      title="Save geometry edits"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onToggleGeometryEdit(layer.id);
+                      }}
+                    >
+                      Save
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 px-2 text-[10px]"
+                      title="Discard geometry edits"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onCancelGeometryEdit();
+                      }}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                )}
                 <div className="mt-2 flex items-center gap-1">
                   <span className="text-[10px] text-muted-foreground">
                     Opacity
@@ -620,10 +872,10 @@ export function LayerPanel({
                     max={1}
                     step={0.05}
                     value={[layer.opacity]}
-                    onValueChange={([v]) =>
+                    onValueChange={([v]: number[]) =>
                       setLayerOpacity(layer.id, v ?? layer.opacity)
                     }
-                    onClick={(e) => e.stopPropagation()}
+                    onClick={(e: ReactMouseEvent) => e.stopPropagation()}
                   />
                 </div>
                 <div className="mt-2 flex gap-1">
@@ -671,7 +923,7 @@ export function LayerPanel({
                     size="icon"
                     className={`h-7 w-7 ${
                       identifyActive
-                        ? "border border-primary bg-primary text-primary-foreground shadow-sm hover:bg-primary/90 hover:text-primary-foreground"
+                        ? "border border-primary bg-primary text-primary-foreground shadow-xs hover:bg-primary/90 hover:text-primary-foreground"
                         : ""
                     }`}
                     title={
@@ -688,7 +940,7 @@ export function LayerPanel({
                           : "Identify features"
                         : "Identify is only available for vector and WMS layers"
                     }
-                    disabled={!canIdentify}
+                    disabled={!canIdentify || geometryEditActive}
                     onClick={(e) => {
                       e.stopPropagation();
                       if (!canIdentify) return;
@@ -710,18 +962,108 @@ export function LayerPanel({
                         }`}
                         title="Layer actions"
                         aria-label="Layer actions"
-                        onClick={(e) => e.stopPropagation()}
+                        onClick={(e: ReactMouseEvent) => e.stopPropagation()}
                       >
                         <MoreHorizontal className="h-3.5 w-3.5" />
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent
                       align="end"
-                      onClick={(e) => e.stopPropagation()}
+                      onClick={(e: ReactMouseEvent) => e.stopPropagation()}
                     >
+                      {/* Rename is always available — name is a display-only
+                          label, so no per-layer-type guard is needed here.
+                          preventDefault keeps the menu's default close from
+                          racing autoFocus on the rename input. */}
+                      <DropdownMenuItem
+                        onSelect={(e: Event) => {
+                          e.preventDefault();
+                          beginRename(layer);
+                        }}
+                      >
+                        <Pencil className="mr-2 h-3.5 w-3.5" />
+                        Rename
+                      </DropdownMenuItem>
+                      <DropdownMenuSeparator />
+                      {canMaterializeDuckDB && (
+                        <>
+                          <DropdownMenuItem
+                            onSelect={(e: Event) => {
+                              e.preventDefault();
+                              onMaterializeDuckDBLayer(layer);
+                            }}
+                          >
+                            <Table2 className="mr-2 h-3.5 w-3.5" />
+                            Materialize to editable layer
+                          </DropdownMenuItem>
+                          <DropdownMenuSeparator />
+                        </>
+                      )}
+                      {(canEditGeometry || geometryEditActive) && (
+                        <DropdownMenuItem
+                          disabled={geometryEditElsewhere}
+                          onSelect={(e: Event) => {
+                            e.preventDefault();
+                            selectLayer(layer.id);
+                            if (identifyActive) setIdentifyLayer(null);
+                            onToggleGeometryEdit(layer.id);
+                          }}
+                        >
+                          <PencilRuler className="mr-2 h-3.5 w-3.5" />
+                          {geometryEditActive
+                            ? "Finish editing geometry"
+                            : "Edit geometry"}
+                        </DropdownMenuItem>
+                      )}
+                      {canOpenAttributeTable && (
+                        <DropdownMenuItem
+                          onSelect={(e: Event) => {
+                            e.preventDefault();
+                            selectLayer(layer.id);
+                            setAttributeTableOpen(true);
+                          }}
+                        >
+                          <TableProperties className="mr-2 h-3.5 w-3.5" />
+                          Open attribute table
+                        </DropdownMenuItem>
+                      )}
+                      {canExportLayer && (
+                        <DropdownMenuSub>
+                          <DropdownMenuSubTrigger>
+                            <Download className="h-3.5 w-3.5" />
+                            Export
+                          </DropdownMenuSubTrigger>
+                          <DropdownMenuSubContent>
+                            <DropdownMenuItem
+                              onSelect={(e: Event) => {
+                                e.preventDefault();
+                                void handleExportLayer(layer, "geojson");
+                              }}
+                            >
+                              GeoJSON
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onSelect={(e: Event) => {
+                                e.preventDefault();
+                                void handleExportLayer(layer, "geoparquet");
+                              }}
+                            >
+                              GeoParquet
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onSelect={(e: Event) => {
+                                e.preventDefault();
+                                void handleExportLayer(layer, "csv");
+                              }}
+                            >
+                              CSV (attributes only)
+                            </DropdownMenuItem>
+                          </DropdownMenuSubContent>
+                        </DropdownMenuSub>
+                      )}
                       <DropdownMenuItem
                         disabled={!canRefresh || isRefreshing}
-                        onSelect={(e) => {
+                        onSelect={(e: Event) => {
                           e.preventDefault();
                           void handleRefreshLayer(layer);
                         }}
@@ -735,7 +1077,7 @@ export function LayerPanel({
                       </DropdownMenuItem>
                       <DropdownMenuItem
                         disabled={!canRefresh}
-                        onSelect={(e) => {
+                        onSelect={(e: Event) => {
                           e.preventDefault();
                           setRefreshSettingsLayerId(layer.id);
                         }}
@@ -839,8 +1181,8 @@ export function LayerPanel({
                 max={1}
                 step={0.05}
                 value={[basemapOpacity]}
-                onValueChange={([v]) => setBasemapOpacity(v ?? basemapOpacity)}
-                onClick={(e) => e.stopPropagation()}
+                onValueChange={([v]: number[]) => setBasemapOpacity(v ?? basemapOpacity)}
+                onClick={(e: ReactMouseEvent) => e.stopPropagation()}
               />
             </div>
           </div>
@@ -853,7 +1195,7 @@ export function LayerPanel({
       </p>
       <Dialog
         open={!!refreshSettingsLayerId}
-        onOpenChange={(open) => {
+        onOpenChange={(open: boolean) => {
           if (!open) setRefreshSettingsLayerId(null);
         }}
       >
@@ -958,7 +1300,7 @@ export function LayerPanel({
       </Dialog>
       <Dialog
         open={!!metadataLayer}
-        onOpenChange={(open) => {
+        onOpenChange={(open: boolean) => {
           if (!open) setMetadataLayer(null);
         }}
       >
@@ -986,7 +1328,7 @@ export function LayerPanel({
       </Dialog>
       <Dialog
         open={!!layerPendingRemoval}
-        onOpenChange={(open) => {
+        onOpenChange={(open: boolean) => {
           if (!open) setLayerPendingRemoval(null);
         }}
       >

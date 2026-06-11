@@ -1,6 +1,6 @@
 [project]
 name = "geolibre-server"
-version = "0.8.0"
+version = "1.0.0"
 description = "Optional Python processing sidecar for GeoLibre Desktop"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,21 @@ conversion = [
   "duckdb>=1.1.0",
   "rio-cogeo>=5.0.0",
   "freestiler>=0.1.0",
+]
+# Optional GeoPandas engine for the Vector processing tools. Not installed by
+# default to keep the bundled sidecar small; the desktop app falls back to the
+# client-side (Turf.js) engine when this is absent.
+vector = [
+  "geopandas>=1.0",
+  "shapely>=2.0",
+]
+# Raster processing tools (hillshade, slope, reproject, polygonize, contour...).
+# rasterio + numpy already arrive via the `conversion` extra (rio-cogeo); they
+# are listed here too so the raster feature can be installed on its own.
+raster = [
+  "rasterio>=1.3.0",
+  "numpy>=1.24",
+  "contourpy>=1.2.0",
 ]
 # Future geospatial stack (not required for MVP UI):
 # geo = [

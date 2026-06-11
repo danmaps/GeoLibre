@@ -8,6 +8,8 @@ import type {
   WarningHandlerWithDefault,
 } from "rollup";
 import { defineConfig, type Plugin } from "vite";
+import { bundledPlugins } from "./vite-plugins/bundled-plugins";
+import { copyVectorOps } from "./vite-plugins/copy-vector-ops";
 
 const GEOAGENT_BROWSER_BUNDLE = "maplibre-gl-geoagent/dist/browser-";
 const EARTH_ENGINE_CONTROL_BUNDLE = "maplibre-gl-earth-engine/dist/";
@@ -67,6 +69,21 @@ function onwarn(
       warning.id.includes(EARTH_ENGINE_BROWSER_BUNDLE))
   ) {
     return;
+  }
+
+  // Prebuilt third-party bundles (e.g. maplibre-gl-lidar's Emscripten/WASM
+  // glue, a UMD lib inside maplibre-gl-components) assign to `module.exports`
+  // behind `typeof module` guards. Rolldown flags this as a CommonJS variable
+  // in an ESM file, but the guard makes it a no-op in the browser. Silence it
+  // for vendored files only; a real occurrence in our own source still warns.
+  if (warning.code === "COMMONJS_VARIABLE_IN_ESM") {
+    const file =
+      (typeof warning.id === "string" ? warning.id : undefined) ??
+      warning.loc?.file ??
+      "";
+    if (file.includes("/node_modules/") || file.includes("\\node_modules\\")) {
+      return;
+    }
   }
 
   defaultHandler(warning);
@@ -303,6 +320,14 @@ export default defineConfig({
   plugins: [
     stripDuckDbWorkerSourcemapPlugin(),
     projectUrlQueryPlugin(),
+    bundledPlugins(path.resolve(__dirname, "public/plugins")),
+    copyVectorOps(
+      path.resolve(
+        __dirname,
+        "../../backend/geolibre_server/geolibre_server/vector_ops.py",
+      ),
+      path.resolve(__dirname, "src/lib/pyodide/vector_ops.generated.py"),
+    ),
     react(),
     wmsProxyPlugin(),
     selectiveJsMinifyPlugin(),
@@ -323,9 +348,6 @@ export default defineConfig({
   },
   envPrefix: ["VITE_", "TAURI_"],
   optimizeDeps: {
-    esbuildOptions: {
-      target: "esnext",
-    },
     exclude: RADIX_OPTIMIZE_EXCLUDES,
   },
   build: {

@@ -1,4 +1,5 @@
 import {
+  DEFAULT_PROJECT_NAME,
   projectFromStore,
   projectPathLabel,
   serializeProject,
@@ -67,6 +68,7 @@ import {
   subscribeSearchPlacesPanel,
   subscribeViewStatePanel,
   toggleEarthEnginePanel,
+  EFFECTS_PLUGIN_ID,
   WEB_SERVICE_PLUGIN_IDS,
   type GeoLibreMapControlPosition,
 } from "@geolibre/plugins";
@@ -97,6 +99,7 @@ import {
   CircleHelp,
   Database,
   FilePen,
+  Share2,
   FilePlus2,
   FileText,
   Folder,
@@ -141,13 +144,14 @@ import { resolveProjectXyzLayers } from "../../lib/xyz-url";
 import { AddDataDialog, type AddDataKind } from "./AddDataDialog";
 import { AboutDialog } from "./AboutDialog";
 import { NewProjectDialog } from "./NewProjectDialog";
-import { SettingsDialog, type SettingsDialogHandle } from "./SettingsDialog";
+import { ManagePluginsDialog } from "./ManagePluginsDialog";
+import { ShareProjectDialog } from "./ShareProjectDialog";
+import { SettingsDialog } from "./SettingsDialog";
 
 interface TopToolbarProps {
   compact?: boolean;
   diagnosticsErrorCount: number;
   mapControllerRef: React.RefObject<MapController | null>;
-  settingsDialogRef?: React.Ref<SettingsDialogHandle>;
   showLabels?: boolean;
   showProjectInfo?: boolean;
   themeMode: ThemeMode;
@@ -236,7 +240,6 @@ export function TopToolbar({
   compact = false,
   diagnosticsErrorCount,
   mapControllerRef,
-  settingsDialogRef,
   showLabels = true,
   showProjectInfo = true,
   themeMode,
@@ -246,6 +249,8 @@ export function TopToolbar({
   const loadProject = useAppStore((s) => s.loadProject);
   const setProcessingOpen = useAppStore((s) => s.setProcessingOpen);
   const setConversionOpen = useAppStore((s) => s.setConversionOpen);
+  const setVectorToolOpen = useAppStore((s) => s.setVectorToolOpen);
+  const setRasterToolOpen = useAppStore((s) => s.setRasterToolOpen);
   const setSqlWorkspaceOpen = useAppStore((s) => s.setSqlWorkspaceOpen);
   const projectName = useAppStore((s) => s.projectName);
   const projectPath = useAppStore((s) => s.projectPath);
@@ -270,6 +275,8 @@ export function TopToolbar({
   const [addDataKind, setAddDataKind] = useState<AddDataKind | null>(null);
   const [newProjectDialogOpen, setNewProjectDialogOpen] = useState(false);
   const [projectUrlDialogOpen, setProjectUrlDialogOpen] = useState(false);
+  const [managePluginsOpen, setManagePluginsOpen] = useState(false);
+  const [shareDialogOpen, setShareDialogOpen] = useState(false);
   const [projectUrl, setProjectUrl] = useState("");
   const [projectUrlError, setProjectUrlError] = useState<string | null>(null);
   const [projectUrlLoading, setProjectUrlLoading] = useState(false);
@@ -388,11 +395,13 @@ export function TopToolbar({
     }
   };
 
-  const saveProject = async (options?: {
-    saveAs?: boolean;
-  }): Promise<boolean> => {
+  // Build the current project from live store + map state and serialize it.
+  // Shared by Save/Save As and the Share action so they all capture identical
+  // project content (including the current map view and plugin state).
+  const buildCurrentProject = (nameOverride?: string) => {
     const state = useAppStore.getState();
-    const defaultProjectName = state.projectName.trim() || "Untitled Project";
+    const defaultProjectName =
+      nameOverride?.trim() || state.projectName.trim() || DEFAULT_PROJECT_NAME;
     const pluginManifestUrls = mergeStringLists(
       state.projectPlugins?.manifestUrls ?? [],
       useDesktopSettingsStore.getState().desktopSettings.pluginManifestUrls,
@@ -411,13 +420,25 @@ export function TopToolbar({
       },
       metadata: state.metadata,
     });
-    const content = serializeProject(project);
+    return {
+      project,
+      defaultProjectName,
+      content: serializeProject(project),
+      // Expose the path read from this same snapshot so callers don't take a
+      // second `getState()` read that could be misread as a separate instant.
+      projectPath: state.projectPath,
+    };
+  };
+
+  const saveProject = async (options?: {
+    saveAs?: boolean;
+  }): Promise<boolean> => {
+    const { project, defaultProjectName, content, projectPath } =
+      buildCurrentProject();
     // Projects opened from a URL have no writable path, so both Save and
     // Save As fall back to the save dialog for them.
     const existingLocalPath =
-      state.projectPath && !isHttpUrl(state.projectPath)
-        ? state.projectPath
-        : null;
+      projectPath && !isHttpUrl(projectPath) ? projectPath : null;
     let path: string | null;
     try {
       path =
@@ -768,6 +789,10 @@ export function TopToolbar({
             <FilePen className="mr-2 h-3.5 w-3.5" />
             Save As...
           </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setShareDialogOpen(true)}>
+            <Share2 className="mr-2 h-3.5 w-3.5" />
+            Share...
+          </DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem onSelect={handleTogglePrintPanel}>
             <Printer className="mr-2 h-3.5 w-3.5" />
@@ -929,6 +954,107 @@ export function TopToolbar({
               </DropdownMenuItem>
             </DropdownMenuSubContent>
           </DropdownMenuSub>
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>Vector</DropdownMenuSubTrigger>
+            <DropdownMenuSubContent>
+              <DropdownMenuLabel className="text-xs text-muted-foreground">
+                Geometry
+              </DropdownMenuLabel>
+              <DropdownMenuItem onSelect={() => setVectorToolOpen("buffer")}>
+                Buffer
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setVectorToolOpen("centroids")}>
+                Centroids
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => setVectorToolOpen("convex-hull")}
+              >
+                Convex hull
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setVectorToolOpen("dissolve")}>
+                Dissolve
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => setVectorToolOpen("bounding-box")}
+              >
+                Bounding box
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setVectorToolOpen("simplify")}>
+                Simplify
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel className="text-xs text-muted-foreground">
+                Overlay
+              </DropdownMenuLabel>
+              <DropdownMenuItem onSelect={() => setVectorToolOpen("clip")}>
+                Clip
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => setVectorToolOpen("intersection")}
+              >
+                Intersection
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => setVectorToolOpen("difference")}
+              >
+                Difference
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setVectorToolOpen("union")}>
+                Union
+              </DropdownMenuItem>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>Raster</DropdownMenuSubTrigger>
+            <DropdownMenuSubContent>
+              <DropdownMenuLabel className="text-xs text-muted-foreground">
+                Terrain
+              </DropdownMenuLabel>
+              <DropdownMenuItem onSelect={() => setRasterToolOpen("hillshade")}>
+                Hillshade
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setRasterToolOpen("slope")}>
+                Slope
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setRasterToolOpen("aspect")}>
+                Aspect
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel className="text-xs text-muted-foreground">
+                Reproject
+              </DropdownMenuLabel>
+              <DropdownMenuItem onSelect={() => setRasterToolOpen("reproject")}>
+                Reproject
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setRasterToolOpen("resample")}>
+                Resample
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel className="text-xs text-muted-foreground">
+                Clip
+              </DropdownMenuLabel>
+              <DropdownMenuItem
+                onSelect={() => setRasterToolOpen("clip-extent")}
+              >
+                Clip by extent
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setRasterToolOpen("clip-mask")}>
+                Clip by mask layer
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel className="text-xs text-muted-foreground">
+                Raster to Vector
+              </DropdownMenuLabel>
+              <DropdownMenuItem
+                onSelect={() => setRasterToolOpen("polygonize")}
+              >
+                Polygonize
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setRasterToolOpen("contour")}>
+                Contour
+              </DropdownMenuItem>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
           <DropdownMenuItem onSelect={handleOpenPlanetaryComputerPanel}>
             Planetary Computer
           </DropdownMenuItem>
@@ -962,6 +1088,12 @@ export function TopToolbar({
               {controlsVisible[control.id] ? " ✓" : ""}
             </DropdownMenuItem>
           ))}
+          <DropdownMenuItem
+            onClick={() => toggle(EFFECTS_PLUGIN_ID, appApi)}
+          >
+            Atmosphere Effects
+            {isActive(EFFECTS_PLUGIN_ID) ? " ✓" : ""}
+          </DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem onSelect={handleToggleSearchPlacesPanel}>
             Search
@@ -1053,7 +1185,7 @@ export function TopToolbar({
                         <DropdownMenuRadioItem
                           key={position.value}
                           value={position.value}
-                          onSelect={(event) => event.preventDefault()}
+                          onSelect={(event: Event) => event.preventDefault()}
                         >
                           {position.label}
                         </DropdownMenuRadioItem>
@@ -1072,6 +1204,9 @@ export function TopToolbar({
             // above Esri Wayback).
             let webServicesRendered = false;
             return plugins.map((p) => {
+              // Atmosphere Effects is toggled from the Controls menu instead, so
+              // it is omitted here to avoid a duplicate toggle.
+              if (p.id === EFFECTS_PLUGIN_ID) return null;
               if (!WEB_SERVICE_PLUGIN_ID_SET.has(p.id)) {
                 return renderPluginMenuItem(p);
               }
@@ -1095,12 +1230,35 @@ export function TopToolbar({
         </DropdownMenuContent>
       </DropdownMenu>
       <SettingsDialog
-        ref={settingsDialogRef}
         buttonClassName={toolbarButtonClass}
         buttonSize={toolbarButtonSize}
         iconClassName={toolbarIconClassName}
         mapControllerRef={mapControllerRef}
         showLabels={showLabels}
+        onOpenManagePlugins={() => setManagePluginsOpen(true)}
+      />
+      <ManagePluginsDialog
+        open={managePluginsOpen}
+        onOpenChange={setManagePluginsOpen}
+        mapControllerRef={mapControllerRef}
+      />
+      <ShareProjectDialog
+        open={shareDialogOpen}
+        onOpenChange={setShareDialogOpen}
+        currentTitle={projectName}
+        getProject={(title) => {
+          const { content, defaultProjectName } = buildCurrentProject(title);
+          // Strip path separators, control chars, and other characters that are
+          // illegal in filenames so the server gets a predictable name.
+          const safeName = defaultProjectName.replace(
+            // Includes U+007F (DEL) alongside the C0 control range; both are
+            // non-printing and rejected by some filesystems and HTTP servers.
+            // eslint-disable-next-line no-control-regex
+            /[\u0000-\u001f\u007f/\\:*?"<>|]/g,
+            "_",
+          );
+          return { content, filename: `${safeName}.geolibre.json` };
+        }}
       />
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
@@ -1150,13 +1308,13 @@ export function TopToolbar({
       <AddDataDialog
         kind={addDataKind}
         mapControllerRef={mapControllerRef}
-        onOpenChange={(open) => {
+        onOpenChange={(open: boolean) => {
           if (!open) setAddDataKind(null);
         }}
       />
       <Dialog
         open={projectUrlDialogOpen}
-        onOpenChange={(open) => {
+        onOpenChange={(open: boolean) => {
           setProjectUrlDialogOpen(open);
           if (!open) {
             projectUrlAbortRef.current?.abort();
@@ -1208,7 +1366,7 @@ export function TopToolbar({
       </Dialog>
       <Dialog
         open={actionError !== null}
-        onOpenChange={(open) => {
+        onOpenChange={(open: boolean) => {
           if (!open) setActionError(null);
         }}
       >

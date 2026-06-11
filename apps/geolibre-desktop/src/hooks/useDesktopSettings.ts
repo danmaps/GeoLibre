@@ -9,6 +9,16 @@ export interface DesktopSettings {
   additionalPluginDirectories: string[];
   layout: DesktopLayoutSettings;
   pluginManifestUrls: string[];
+  /**
+   * Personal API token for uploading projects to share.geolibre.app. Stored in
+   * the same localStorage-backed settings as everything else, so on the web
+   * build it shares the exposure surface of any other localStorage entry (a
+   * same-origin script could read it). This is the well-understood "PAT in local
+   * storage" trade-off; the token is short-lived/revocable and scoped to one
+   * service. Moving it to OS secure storage on desktop is a possible future
+   * hardening (see PR #190 review).
+   */
+  shareToken: string;
 }
 
 export interface DesktopLayoutSettings {
@@ -36,6 +46,7 @@ const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   additionalPluginDirectories: [],
   layout: DEFAULT_DESKTOP_LAYOUT_SETTINGS,
   pluginManifestUrls: [],
+  shareToken: "",
 };
 
 function normalizeDesktopSettings(settings: unknown): DesktopSettings {
@@ -54,6 +65,8 @@ function normalizeDesktopSettings(settings: unknown): DesktopSettings {
     pluginManifestUrls: normalizeStringList(candidate.pluginManifestUrls).filter(
       isAllowedPluginManifestUrl,
     ),
+    shareToken:
+      typeof candidate.shareToken === "string" ? candidate.shareToken.trim() : "",
   };
 }
 

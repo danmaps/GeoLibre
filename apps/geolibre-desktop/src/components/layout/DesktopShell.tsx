@@ -1,10 +1,18 @@
-import { useAppStore } from "@geolibre/core";
+import { useAppStore, type GeoLibreLayer } from "@geolibre/core";
+import type { FeatureCollection } from "geojson";
 import type { MapController, MapDiagnosticEvent } from "@geolibre/map";
 import { MapCanvas } from "@geolibre/map";
 import {
+  addRasterToMap,
+  EFFECTS_PLUGIN_ID,
+  endLayerGeometryEdit,
+  getGeometryEditTargetLayerId,
+  restoreEffects,
   restoreRasterLayers,
   restoreThreeDTilesLayers,
   restoreVectorLayers,
+  startLayerGeometryEdit,
+  subscribeGeometryEdit,
 } from "@geolibre/plugins";
 import {
   type CSSProperties,
@@ -16,11 +24,16 @@ import {
   useEffect,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
+import { runSqlQuery } from "../../lib/sql-workspace";
 import {
   isTauri,
+  loadDroppedRasterFiles,
+  loadDroppedRasterPaths,
   loadDroppedVectorFiles,
   loadDroppedVectorPaths,
+  type DroppedRaster,
 } from "../../lib/tauri-io";
 import {
   createAppAPI,
@@ -29,6 +42,7 @@ import {
 } from "../../hooks/usePlugins";
 import { registerMbtilesProtocol } from "../../lib/mbtiles";
 import { registerXyzTileProtocol } from "../../lib/xyz-url";
+import { useEmbedBridge } from "../../hooks/useEmbedBridge";
 import {
   appendDiagnostic,
   useDiagnosticsSnapshot,
@@ -69,6 +83,34 @@ const ConversionDialog = lazy(() =>
       console.error("Failed to load ConversionDialog", error);
       const Fallback = (() =>
         null) as unknown as typeof import("../processing/ConversionDialog").ConversionDialog;
+      return { default: Fallback };
+    }),
+);
+
+const VectorToolsDialog = lazy(() =>
+  import("../processing/VectorToolsDialog")
+    .then((module) => ({
+      default: module.VectorToolsDialog,
+    }))
+    .catch((error) => {
+      // Same chunk-load fallback rationale as ProcessingDialog above.
+      console.error("Failed to load VectorToolsDialog", error);
+      const Fallback = (() =>
+        null) as unknown as typeof import("../processing/VectorToolsDialog").VectorToolsDialog;
+      return { default: Fallback };
+    }),
+);
+
+const RasterToolsDialog = lazy(() =>
+  import("../processing/RasterToolsDialog")
+    .then((module) => ({
+      default: module.RasterToolsDialog,
+    }))
+    .catch((error) => {
+      // Same chunk-load fallback rationale as ProcessingDialog above.
+      console.error("Failed to load RasterToolsDialog", error);
+      const Fallback = (() =>
+        null) as unknown as typeof import("../processing/RasterToolsDialog").RasterToolsDialog;
       return { default: Fallback };
     }),
 );
@@ -134,15 +176,24 @@ export function DesktopShell({
   const mapControllerRef = useRef<MapController | null>(null);
   const dragDepthRef = useRef(0);
   const dropMessageTimeoutRef = useRef<number | null>(null);
+  const materializingRef = useRef(false);
+  const togglingGeometryEditRef = useRef(false);
   const addGeoJsonLayer = useAppStore((s) => s.addGeoJsonLayer);
   const projectGeneration = useAppStore((s) => s.projectGeneration);
+  const geometryEditLayerId = useSyncExternalStore(
+    subscribeGeometryEdit,
+    getGeometryEditTargetLayerId,
+  );
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [mapReadyGeneration, setMapReadyGeneration] = useState(0);
   const [dropMessage, setDropMessage] = useState<string | null>(null);
   const [dropError, setDropError] = useState<string | null>(null);
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const diagnostics = useDiagnosticsSnapshot();
-  const externalPluginsReady = useExternalPluginsReady();
+  const externalPluginsReady = useExternalPluginsReady(mapControllerRef);
+  // Sync the project with an embedding host (the GeoLibre Jupyter widget) over
+  // postMessage. Inert when the app is not embedded.
+  useEmbedBridge(mapControllerRef);
   const [layerPanelWidth, setLayerPanelWidth] = useState(
     DEFAULT_SIDE_PANEL_WIDTH,
   );
@@ -165,6 +216,128 @@ export function DesktopShell({
       setDropError(null);
     }, 4000);
   }, []);
+
+  const ensureLayerGeojsonFromSource = useCallback(async (layerId: string) => {
+    const layer = useAppStore
+      .getState()
+      .layers.find((candidate) => candidate.id === layerId);
+    if (!layer || layer.geojson) return;
+    const sourceIds = layer.metadata.sourceIds;
+    const sourceId = Array.isArray(sourceIds) ? sourceIds[0] : undefined;
+    if (typeof sourceId !== "string") return;
+    const source = mapControllerRef.current?.getMap()?.getSource(sourceId) as
+      | { getData?: () => Promise<unknown> }
+      | undefined;
+    if (!source || typeof source.getData !== "function") return;
+    try {
+      const data = await source.getData();
+      if (
+        data &&
+        typeof data === "object" &&
+        (data as { type?: string }).type === "FeatureCollection"
+      ) {
+        useAppStore
+          .getState()
+          .updateLayer(layerId, { geojson: data as FeatureCollection });
+      }
+    } catch {
+      // Best effort; startLayerGeometryEdit will fail and surface an error.
+    }
+  }, []);
+
+  const handleToggleGeometryEdit = useCallback(
+    async (layerId: string) => {
+      const appAPI = createAppAPI(mapControllerRef);
+      if (getGeometryEditTargetLayerId() === layerId) {
+        await endLayerGeometryEdit(appAPI, { save: true });
+        return;
+      }
+      // Guard against concurrent invocations: this handler awaits before it sets
+      // the session target, so two rapid clicks could otherwise both pass the
+      // check above and race into startLayerGeometryEdit for different layers.
+      if (togglingGeometryEditRef.current) return;
+      togglingGeometryEditRef.current = true;
+      // Clear any stale error from a previous failed attempt.
+      setDropError(null);
+      try {
+        // Add Vector Layer (geojson-mode) layers keep their features in a
+        // MapLibre source rather than in `layer.geojson`. Read them back once so
+        // the editor has features to load. (Plain geojson layers already have
+        // `geojson`.)
+        await ensureLayerGeojsonFromSource(layerId);
+        const manager = getPluginManager();
+        if (!manager.isActive("maplibre-gl-geo-editor")) {
+          manager.activate("maplibre-gl-geo-editor", appAPI);
+          if (!manager.isActive("maplibre-gl-geo-editor")) {
+            setDropError(
+              "Could not activate the geometry editor. Try again once the map has fully loaded.",
+            );
+            clearDropMessageLater();
+            return;
+          }
+        }
+        const started = await startLayerGeometryEdit(appAPI, layerId);
+        if (!started) {
+          setDropError(
+            "Could not start geometry editing for this layer. Its data may still be loading.",
+          );
+          clearDropMessageLater();
+        }
+      } finally {
+        togglingGeometryEditRef.current = false;
+      }
+    },
+    [clearDropMessageLater, ensureLayerGeojsonFromSource],
+  );
+
+  const handleCancelGeometryEdit = useCallback(() => {
+    void endLayerGeometryEdit(createAppAPI(mapControllerRef), { save: false });
+  }, []);
+
+  const handleMaterializeDuckDBLayer = useCallback(
+    async (layer: GeoLibreLayer) => {
+      // Guard against concurrent triggers (double-click, or two layers in quick
+      // succession) so we do not add duplicate materialized layers.
+      if (materializingRef.current) return;
+      const query =
+        typeof layer.metadata.query === "string" ? layer.metadata.query : null;
+      if (!query) {
+        setDropError("This DuckDB layer has no stored query to materialize.");
+        clearDropMessageLater();
+        return;
+      }
+      materializingRef.current = true;
+      setDropError(null);
+      setDropMessage("Materializing DuckDB layer...");
+      try {
+        // The query is the layer's own stored SQL from the user's project; it is
+        // intentionally run unrestricted against the in-memory DuckDB instance.
+        const result = await runSqlQuery(query, useAppStore.getState().layers);
+        if (!result.geojson) {
+          throw new Error("The query did not return a geometry column.");
+        }
+        const id = addGeoJsonLayer(`${layer.name} (editable)`, result.geojson);
+        const created = useAppStore
+          .getState()
+          .layers.find((candidate) => candidate.id === id);
+        if (created) mapControllerRef.current?.fitLayer(created);
+        setDropMessage(
+          `Materialized ${result.geojson.features.length.toLocaleString()} features.`,
+        );
+      } catch (error) {
+        setDropMessage(null);
+        setDropError(
+          error instanceof Error
+            ? error.message
+            : "Could not materialize this layer.",
+        );
+      } finally {
+        materializingRef.current = false;
+        clearDropMessageLater();
+      }
+    },
+    [addGeoJsonLayer, clearDropMessageLater],
+  );
 
   useEffect(() => {
     if (isTauri()) {
@@ -193,6 +366,10 @@ export function DesktopShell({
     restoreThreeDTilesLayers(appAPI);
     restoreRasterLayers(appAPI);
     restoreVectorLayers(appAPI);
+    // activeByDefault plugins are marked active without activate() being
+    // called, so the effects engine must be kicked explicitly to match the
+    // restored active state (idempotent).
+    restoreEffects(appAPI, pluginManager.isActive(EFFECTS_PLUGIN_ID));
     const search = window.location.search;
     void pluginManager
       .handleUrlParameters(
@@ -246,17 +423,36 @@ export function DesktopShell({
     [addGeoJsonLayer],
   );
 
-  const finishVectorDrop = useCallback(
-    (importedLayers: ImportedVectorLayer[]) => {
-      if (!importedLayers.length) {
-        throw new Error("Drop a supported vector file.");
+  const addDroppedRasters = useCallback(
+    async (rasters: DroppedRaster[]): Promise<number> => {
+      if (!rasters.length) return 0;
+      const appAPI = createAppAPI(mapControllerRef);
+      for (const raster of rasters) {
+        await addRasterToMap(appAPI, raster.source, { name: raster.name });
       }
-      addImportedVectorLayers(importedLayers);
-      setDropMessage(
-        `Added ${importedLayers.length} vector layer${
-          importedLayers.length === 1 ? "" : "s"
-        }.`,
-      );
+      return rasters.length;
+    },
+    [],
+  );
+
+  const finishDrop = useCallback(
+    (importedLayers: ImportedVectorLayer[], rasterCount: number) => {
+      if (!importedLayers.length && !rasterCount) {
+        throw new Error("Drop a supported vector or raster file.");
+      }
+      if (importedLayers.length) addImportedVectorLayers(importedLayers);
+      const parts: string[] = [];
+      if (importedLayers.length) {
+        parts.push(
+          `${importedLayers.length} vector layer${
+            importedLayers.length === 1 ? "" : "s"
+          }`,
+        );
+      }
+      if (rasterCount) {
+        parts.push(`${rasterCount} raster layer${rasterCount === 1 ? "" : "s"}`);
+      }
+      setDropMessage(`Added ${parts.join(" and ")}.`);
     },
     [addImportedVectorLayers],
   );
@@ -283,10 +479,14 @@ export function DesktopShell({
 
           setIsDraggingFiles(false);
           setDropError(null);
-          setDropMessage("Importing vector data...");
+          setDropMessage("Importing data...");
 
           try {
-            finishVectorDrop(await loadDroppedVectorPaths(event.payload.paths));
+            const paths = event.payload.paths;
+            const rasterCount = await addDroppedRasters(
+              await loadDroppedRasterPaths(paths),
+            );
+            finishDrop(await loadDroppedVectorPaths(paths), rasterCount);
           } catch (error) {
             setDropMessage(null);
             setDropError(
@@ -314,7 +514,7 @@ export function DesktopShell({
       disposed = true;
       unlisten?.();
     };
-  }, [clearDropMessageLater, finishVectorDrop]);
+  }, [clearDropMessageLater, finishDrop, addDroppedRasters]);
 
   const handleDragEnter = useCallback((event: DragEvent<HTMLDivElement>) => {
     if (!hasDroppedFiles(event)) return;
@@ -343,13 +543,14 @@ export function DesktopShell({
       dragDepthRef.current = 0;
       setIsDraggingFiles(false);
       setDropError(null);
-      setDropMessage("Importing vector data...");
+      setDropMessage("Importing data...");
 
       try {
-        const importedLayers = await loadDroppedVectorFiles(
-          event.dataTransfer.files,
+        const files = event.dataTransfer.files;
+        const rasterCount = await addDroppedRasters(
+          loadDroppedRasterFiles(files),
         );
-        finishVectorDrop(importedLayers);
+        finishDrop(await loadDroppedVectorFiles(files), rasterCount);
       } catch (error) {
         setDropMessage(null);
         setDropError(
@@ -359,7 +560,7 @@ export function DesktopShell({
         clearDropMessageLater();
       }
     },
-    [clearDropMessageLater, finishVectorDrop],
+    [clearDropMessageLater, finishDrop, addDroppedRasters],
   );
 
   const startLayerPanelResize = useCallback(
@@ -521,6 +722,10 @@ export function DesktopShell({
           <LayerPanel
             mapControllerRef={mapControllerRef}
             onResizeStart={startLayerPanelResize}
+            geometryEditLayerId={geometryEditLayerId}
+            onToggleGeometryEdit={handleToggleGeometryEdit}
+            onCancelGeometryEdit={handleCancelGeometryEdit}
+            onMaterializeDuckDBLayer={handleMaterializeDuckDBLayer}
           />
         ) : null}
         <main
@@ -564,6 +769,12 @@ export function DesktopShell({
         <ConversionDialog />
       </Suspense>
       <Suspense fallback={null}>
+        <VectorToolsDialog mapControllerRef={mapControllerRef} />
+      </Suspense>
+      <Suspense fallback={null}>
+        <RasterToolsDialog />
+      </Suspense>
+      <Suspense fallback={null}>
         <SqlWorkspaceDialog />
       </Suspense>
       <div
@@ -573,7 +784,7 @@ export function DesktopShell({
       {isDraggingFiles ? (
         <div className="pointer-events-none absolute inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-sm">
           <div className="rounded-md border bg-background px-4 py-3 text-sm font-medium shadow-lg">
-            Drop vector files to add layers
+            Drop vector or raster files to add layers
           </div>
         </div>
       ) : null}

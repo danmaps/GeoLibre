@@ -86,6 +86,7 @@ export {
   restoreThreeDTilesLayers,
 } from "./plugins/maplibre-3d-tiles";
 export {
+  addRasterToMap,
   closeRasterLayerPanel,
   openRasterLayerPanel,
   restoreRasterLayers,
@@ -93,15 +94,28 @@ export {
 export {
   closeVectorLayerPanel,
   openVectorLayerPanel,
+  reloadVectorControlLayer,
   restoreVectorLayers,
 } from "./plugins/maplibre-vector";
 // The raster-layer-sync and vector-layer-sync internals are not
 // re-exported: the app drives the panels through the functions above, and
 // the tests import the sync helpers from the module paths directly.
+export {
+  EFFECTS_PLUGIN_ID,
+  maplibreEffectsPlugin,
+  restoreEffects,
+} from "./plugins/maplibre-effects";
 export { maplibreEnviroAtlasPlugin } from "./plugins/maplibre-enviroatlas";
 export { maplibreEsriWaybackPlugin } from "./plugins/maplibre-esri-wayback";
 export { maplibreFemaWmsPlugin } from "./plugins/maplibre-fema-wms";
-export { maplibreGeoEditorPlugin } from "./plugins/maplibre-geo-editor";
+export {
+  maplibreGeoEditorPlugin,
+  canEditLayerGeometry,
+  startLayerGeometryEdit,
+  endLayerGeometryEdit,
+  getGeometryEditTargetLayerId,
+  subscribeGeometryEdit,
+} from "./plugins/maplibre-geo-editor";
 export { maplibreGeoAgentPlugin } from "./plugins/maplibre-geoagent";
 export { maplibreLidarPlugin } from "./plugins/maplibre-lidar";
 export { maplibreNasaEarthdataPlugin } from "./plugins/maplibre-nasa-earthdata";
@@ -109,6 +123,7 @@ export { maplibreNationalMapPlugin } from "./plugins/maplibre-national-map";
 export { maplibreOvertureMapsPlugin } from "./plugins/maplibre-overture-maps";
 export { maplibreStreetViewPlugin } from "./plugins/maplibre-streetview";
 export { maplibreSwipePlugin } from "./plugins/maplibre-swipe";
+export { maplibreTimeSliderPlugin } from "./plugins/maplibre-time-slider";
 export {
   sampleGeoJsonPlugin,
   setSampleGeoJson,

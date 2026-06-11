@@ -14,10 +14,11 @@ import shp from "shpjs";
 import { parseDelimitedTextFields } from "./delimited-text";
 import type { DuckDbVectorFile } from "./duckdb-vector-loader";
 import { parseGpxLayer } from "./gpx";
+import { isTauri } from "./is-tauri";
 
-export function isTauri(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-}
+// Re-exported so existing `import { isTauri } from "./tauri-io"` consumers keep
+// working; the implementation lives in the lightweight ./is-tauri module.
+export { isTauri };
 
 function browserSafeFileName(path: string): string {
   return path.split(/[/\\]/).pop() || "project.geolibre.json";
@@ -124,6 +125,14 @@ const NON_VECTOR_SIDECAR_EXTENSIONS = [
   "mxs",
 ];
 
+/** GeoTIFF/COG extensions handled by the map drag and drop raster path. */
+const RASTER_DROP_EXTENSIONS = ["tif", "tiff"];
+
+/** Whether a filename looks like a raster the map can load (GeoTIFF/COG). */
+export function isRasterFileName(name: string): boolean {
+  return RASTER_DROP_EXTENSIONS.includes(fileExtension(name));
+}
+
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
@@ -156,6 +165,8 @@ function isVectorFileName(path: string): boolean {
   if (isGeoLibreProjectFile(path)) return false;
   if (browserSafeFileName(path).toLowerCase().endsWith(".shp.xml"))
     return false;
+  // Rasters are handled by the raster drop path, not the DuckDB vector loader.
+  if (isRasterFileName(path)) return false;
   return !NON_VECTOR_SIDECAR_EXTENSIONS.includes(fileExtension(path));
 }
 
@@ -1001,6 +1012,49 @@ export async function loadDroppedVectorFiles(
   }
 
   return layers;
+}
+
+export interface DroppedRaster {
+  name: string;
+  /**
+   * The GeoTIFF/COG as a File. The raster control accepts a File directly and
+   * manages its object URL, matching how the Add Raster panel loads local files.
+   */
+  source: File;
+}
+
+function fileBaseName(path: string): string {
+  return path.split(/[\\/]/).pop() || path;
+}
+
+/** Collect dropped browser File objects that are rasters the map can load. */
+export function loadDroppedRasterFiles(
+  droppedFiles: FileList | File[],
+): DroppedRaster[] {
+  return Array.from(droppedFiles)
+    .filter((file) => isRasterFileName(file.name))
+    .map((file) => ({ name: file.name, source: file }));
+}
+
+/**
+ * Read dropped raster file paths (Tauri) into File objects the control can load.
+ * There is no asset-protocol scope configured, so the bytes are read and wrapped
+ * in a File, matching how local vector files are loaded.
+ */
+export async function loadDroppedRasterPaths(
+  paths: string[],
+): Promise<DroppedRaster[]> {
+  const rasterPaths = paths.filter(isRasterFileName);
+  const rasters: DroppedRaster[] = [];
+  for (const path of rasterPaths) {
+    const bytes = await readFile(path);
+    const name = fileBaseName(path);
+    rasters.push({
+      name,
+      source: new File([bytes], name, { type: "image/tiff" }),
+    });
+  }
+  return rasters;
 }
 
 export async function loadDroppedVectorPaths(

@@ -1,8 +1,15 @@
 import {
   DEFAULT_LAYER_STYLE,
+  isVectorColorExpression,
+  vectorCircleColorValue,
+  vectorFillColorValue,
+  vectorLineColorValue,
   type GeoLibreLayer,
+  type LayerStyle,
+  type VectorColorValue,
   useAppStore,
 } from "@geolibre/core";
+import type { PropertyValueSpecification } from "maplibre-gl";
 import type {
   VectorLayerInfo,
   VectorLayerOptions,
@@ -10,6 +17,12 @@ import type {
 } from "maplibre-gl-vector";
 
 export const VECTOR_SOURCE_KIND = "maplibre-gl-vector";
+
+// Upper bound on a restored color expression's serialized size. Generous for a
+// real categorized/graduated style (hundreds of stops are well under this) but
+// blocks a hand-edited project file from smuggling a large blob into a paint
+// property, matching the length caps on restored color strings.
+const MAX_COLOR_EXPRESSION_CHARS = 20_000;
 
 /**
  * The slice of the maplibre-gl-vector VectorControl surface the store sync
@@ -22,6 +35,7 @@ export type VectorSyncableControl = {
   removeLayer: (id: string) => void;
   setLayerOpacity: (id: string, opacity: number) => void;
   setLayerVisibility: (id: string, visible: boolean) => void;
+  setLayerStyle: (id: string, style: Partial<VectorLayerStyle>) => void;
 };
 
 let syncedControl: VectorSyncableControl | null = null;
@@ -80,7 +94,10 @@ export function createVectorStoreLayer(
     },
     visible: info.visible,
     opacity: info.opacity,
-    style: { ...DEFAULT_LAYER_STYLE },
+    // Seed the panel style from the control's own style so the Style panel
+    // reflects what is actually rendered, and so an edit to one field does
+    // not reset the others back to GeoLibre defaults.
+    style: { ...DEFAULT_LAYER_STYLE, ...vectorStyleToLayerStyle(info) },
     metadata: {
       customLayerType: vectorCustomLayerType(info.geometryType),
       externalNativeLayer: true,
@@ -217,6 +234,32 @@ export function wireVectorStoreSync(control: VectorSyncableControl): void {
         }
         if (current.opacity !== layer.opacity) {
           activeControl.setLayerOpacity(layer.id, current.opacity);
+        }
+        const nextStyle = layerStyleToVectorStyle(current.style);
+        if (!vectorStylesEqual(layerStyleToVectorStyle(layer.style), nextStyle)) {
+          activeControl.setLayerStyle(layer.id, nextStyle);
+          // Keep the persisted control-seed style in sync so a saved project
+          // restores the user-edited colors: restoreVectorLayers seeds the
+          // control's addData from metadata.vectorState.style. (The control's
+          // layerupdated event would normally refresh this via
+          // syncVectorLayersToStore, but the suspension around this push
+          // suppresses it.)
+          const vectorState = current.metadata.vectorState;
+          if (
+            vectorState &&
+            typeof vectorState === "object" &&
+            !Array.isArray(vectorState)
+          ) {
+            useAppStore.getState().updateLayer(layer.id, {
+              metadata: {
+                ...current.metadata,
+                vectorState: {
+                  ...(vectorState as Record<string, unknown>),
+                  style: nextStyle,
+                },
+              },
+            });
+          }
         }
       }
     });
@@ -391,7 +434,153 @@ function savedVectorStyle(raw: unknown): Partial<VectorLayerStyle> | null {
     style.circleOpacity = candidate.circleOpacity;
   }
 
+  // Restore the data-driven color expressions so a saved categorized/graduated/
+  // expression style renders on reload: restoreVectorLayers seeds the control's
+  // addData from this style, and the post-load sync does not re-push (the
+  // recomputed expression matches the persisted one). Bounded like the color
+  // strings above: an array passes only when its serialized form stays small,
+  // so a hand-edited project file cannot smuggle a multi-kilobyte (or deeply
+  // nested) blob into a paint property. Real categorized/graduated expressions
+  // are far under this cap, and MapLibre validates the expression contents.
+  const colorExpression = (
+    value: unknown,
+  ): value is PropertyValueSpecification<string> => {
+    if (!Array.isArray(value) || value.length === 0) return false;
+    try {
+      return JSON.stringify(value).length <= MAX_COLOR_EXPRESSION_CHARS;
+    } catch {
+      // A circular or pathologically deep array makes JSON.stringify throw;
+      // reject it so a hand-edited project file cannot break restore.
+      return false;
+    }
+  };
+  if (colorExpression(candidate.fillColorExpression)) {
+    style.fillColorExpression = candidate.fillColorExpression;
+  }
+  if (colorExpression(candidate.lineColorExpression)) {
+    style.lineColorExpression = candidate.lineColorExpression;
+  }
+  if (colorExpression(candidate.circleColorExpression)) {
+    style.circleColorExpression = candidate.circleColorExpression;
+  }
+
   return Object.keys(style).length > 0 ? style : null;
+}
+
+/**
+ * Maps GeoLibre's shared LayerStyle onto the control's per-geometry
+ * VectorLayerStyle. GeoLibre exposes one fillColor/strokeColor/fillOpacity/
+ * strokeWidth for every geometry, so the fill fields also drive point circles
+ * and the stroke fields drive lines and polygon outlines; the control applies
+ * only the fields relevant to each layer's actual geometry.
+ *
+ * The collapse is intentionally lossy: circleColor/circleOpacity always track
+ * fillColor/fillOpacity. Single-geometry layers round-trip cleanly; a "mixed"
+ * layer's point circles unify with its fill from the first panel edit onward,
+ * since GeoLibre has no separate point-fill control.
+ *
+ * Categorized/graduated/expression style modes produce a data-driven MapLibre
+ * color expression that a flat color cannot represent, so it is carried in the
+ * control's optional *ColorExpression fields (the flat colors remain the
+ * fallback). The expression fields are always set — to the expression in a
+ * data-driven mode, or to undefined in `single` mode — so reverting to a single
+ * color clears any previously pushed expression on the control.
+ *
+ * @param style - The GeoLibre layer style.
+ * @returns The equivalent control style patch.
+ */
+function layerStyleToVectorStyle(style: LayerStyle): VectorLayerStyle {
+  return {
+    fillColor: style.fillColor,
+    fillOpacity: style.fillOpacity,
+    lineColor: style.strokeColor,
+    lineWidth: style.strokeWidth,
+    // circleColor/circleOpacity intentionally track fillColor/fillOpacity (see
+    // the doc comment): one fill edit drives both polygon fills and point
+    // circles on mixed layers. Pure polygon/line layers ignore these fields;
+    // pure point layers ignore fillColor/fillOpacity instead.
+    circleColor: style.fillColor,
+    circleOpacity: style.fillOpacity,
+    circleRadius: style.circleRadius,
+    fillColorExpression: colorExpressionField(vectorFillColorValue(style)),
+    lineColorExpression: colorExpressionField(vectorLineColorValue(style)),
+    circleColorExpression: colorExpressionField(vectorCircleColorValue(style)),
+  };
+}
+
+/**
+ * Narrows a computed vector color to the control's expression field: the
+ * expression when the style mode is data-driven, or undefined when it resolves
+ * to a flat color (so the control falls back to fillColor/lineColor/circleColor).
+ *
+ * @param value - A color value from the @geolibre/core color builders.
+ * @returns The expression, or undefined for a flat color.
+ */
+function colorExpressionField(
+  value: VectorColorValue,
+): PropertyValueSpecification<string> | undefined {
+  return isVectorColorExpression(value)
+    ? (value as PropertyValueSpecification<string>)
+    : undefined;
+}
+
+/**
+ * Seeds a GeoLibre LayerStyle from the control's VectorLayerStyle so the Style
+ * panel reflects what the control actually rendered. Collapses the control's
+ * per-geometry colors onto GeoLibre's shared fields, choosing the fill source
+ * by geometry (point circles use the circle fill; everything else the polygon
+ * fill).
+ *
+ * @param info - The control layer snapshot.
+ * @returns A partial GeoLibre style to overlay on the defaults.
+ */
+function vectorStyleToLayerStyle(info: VectorLayerInfo): Partial<LayerStyle> {
+  const style = info.style;
+  // Only emit fields the control actually provided; otherwise a missing value
+  // would spread an explicit `undefined` over DEFAULT_LAYER_STYLE at the seed
+  // site and clobber a valid default.
+  const seed: Partial<LayerStyle> = {};
+  if (style.lineColor !== undefined) seed.strokeColor = style.lineColor;
+  if (style.lineWidth !== undefined) seed.strokeWidth = style.lineWidth;
+  if (style.circleRadius !== undefined) seed.circleRadius = style.circleRadius;
+
+  const [fillColor, fillOpacity] =
+    info.geometryType === "point"
+      ? [style.circleColor, style.circleOpacity]
+      : [style.fillColor, style.fillOpacity];
+  if (fillColor !== undefined) seed.fillColor = fillColor;
+  if (fillOpacity !== undefined) seed.fillOpacity = fillOpacity;
+
+  return seed;
+}
+
+/**
+ * Shallow equality over the control style fields, so a no-op style change in
+ * the store does not push a redundant setLayerStyle at the control.
+ *
+ * @param left - First control style.
+ * @param right - Second control style.
+ * @returns True when every field matches.
+ */
+function vectorStylesEqual(
+  left: VectorLayerStyle,
+  right: VectorLayerStyle,
+): boolean {
+  return (
+    left.fillColor === right.fillColor &&
+    left.fillOpacity === right.fillOpacity &&
+    left.lineColor === right.lineColor &&
+    left.lineWidth === right.lineWidth &&
+    left.circleColor === right.circleColor &&
+    left.circleOpacity === right.circleOpacity &&
+    left.circleRadius === right.circleRadius &&
+    // Color expressions are arrays (or undefined), so compare them deeply: a
+    // categorized/graduated stop change reuses the same flat colors but yields
+    // a different expression, which must still register as a style change.
+    valuesEqual(left.fillColorExpression, right.fillColorExpression) &&
+    valuesEqual(left.lineColorExpression, right.lineColorExpression) &&
+    valuesEqual(left.circleColorExpression, right.circleColorExpression)
+  );
 }
 
 function vectorCustomLayerType(

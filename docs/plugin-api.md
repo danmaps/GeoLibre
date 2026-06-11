@@ -28,8 +28,14 @@ export interface GeoLibrePlugin {
   name: string;
   version: string;
   activeByDefault?: boolean;
+  /** At least one name is required for handleUrlParameters to be called. */
+  urlParameterNames?: string[];
   activate: (app: GeoLibreAppAPI) => boolean | void;
   deactivate: (app: GeoLibreAppAPI) => void;
+  handleUrlParameters?: (
+    app: GeoLibreAppAPI,
+    params: URLSearchParams,
+  ) => void | Promise<void>;
   getMapControlPosition?: () => GeoLibreMapControlPosition;
   setMapControlPosition?: (
     app: GeoLibreAppAPI,
@@ -37,6 +43,16 @@ export interface GeoLibrePlugin {
   ) => boolean | void;
   getProjectState?: () => unknown;
   applyProjectState?: (app: GeoLibreAppAPI, state: unknown) => boolean | void;
+}
+
+// Resolved by app.getDeckGL(): GeoLibre's own deck.gl modules, so a plugin
+// renders on the host's single instance instead of bundling its own copy.
+export interface GeoLibreDeckGL {
+  core: typeof import("@deck.gl/core");
+  layers: typeof import("@deck.gl/layers");
+  geoLayers: typeof import("@deck.gl/geo-layers");
+  meshLayers: typeof import("@deck.gl/mesh-layers");
+  mapbox: typeof import("@deck.gl/mapbox");
 }
 
 export interface GeoLibreAppAPI {
@@ -67,6 +83,7 @@ export interface GeoLibreAppAPI {
     control: GeoLibreBuiltInMapControl,
     position: GeoLibreMapControlPosition,
   ) => boolean;
+  getDeckGL?: () => Promise<GeoLibreDeckGL>;
 }
 ```
 
@@ -117,7 +134,9 @@ Map control plugins can optionally expose `getMapControlPosition()` and `setMapC
 
 Plugins with serializable runtime settings can expose `getProjectState()` and `applyProjectState()` so GeoLibre can save and restore those settings in the project file. A wrapper should use these hooks to adapt upstream control APIs such as `getState()` without requiring every upstream package to implement a GeoLibre-specific interface.
 
-Plugins can also declare URL query parameters and handle them when GeoLibre opens. URL parameter handlers run after the map is ready, external plugins are loaded, and project plugin state has been restored. GeoLibre calls handlers only for active plugins whose declared parameter names are present in the URL, and it suppresses repeated handling of the same URL context for the same plugin. Parameter names are case-sensitive, as URL query parameters are: declaring `exampleGeoJson` will not match `?ExampleGeoJson=…`.
+Plugins that render with deck.gl should call `app.getDeckGL()` (returns a promise) to obtain GeoLibre's own deck.gl modules — `core`, `layers`, `geoLayers`, `meshLayers`, and `mapbox` (use `mapbox.MapboxOverlay` for interleaved MapLibre rendering). Render on the host's single deck.gl instance rather than bundling a second copy: deck.gl and luma.gl throw on a version mismatch and share global singletons, so a bundled copy fails to render. Call it with optional chaining (`app.getDeckGL?.()`) since a host variant may not ship deck.gl.
+
+Plugins can also declare URL query parameters and handle them when GeoLibre opens. URL parameter handlers run after the map is ready, external plugins are loaded, and project plugin state has been restored. GeoLibre calls handlers for plugins whose declared parameter names are present in the URL, and it suppresses repeated handling of the same URL context for the same plugin. If a matching plugin is registered (installed) but inactive, GeoLibre first attempts to activate it via `PluginManager.activate`; the handler runs only if activation succeeds (an `activate()` that returns `false` or throws leaves the plugin inactive and skips dispatch). Parameter names are case-sensitive, as URL query parameters are: declaring `exampleGeoJson` will not match `?ExampleGeoJson=…`.
 
 ```typescript
 import type { GeoLibreAppAPI, GeoLibrePlugin } from "@geolibre/plugins";
@@ -163,7 +182,7 @@ For example:
 https://viewer.geolibre.app/?url=https://example.com/project.geolibre.json&exampleGeoJson=https://example.com/data.geojson
 ```
 
-A URL parameter does not activate an inactive plugin by itself. For external plugins, include the plugin manifest URL and active plugin ID in the project `plugins` state, or have the user enable the plugin before relying on its URL handler.
+A URL parameter activates only an already-registered (installed) plugin that owns it; it never loads a plugin from the URL. For external plugins, include the plugin manifest URL in the project `plugins` state (so the plugin is registered) before relying on its URL handler — the matching parameter then activates and dispatches it even if it is not in the active set.
 
 ## External plugins
 
@@ -179,7 +198,9 @@ The Plugins settings section can also add local development directories outside 
 
 For the web app, use manifest URLs. GeoLibre fetches the manifest, resolves `entry` and `style` relative to the manifest URL, then loads the bundled ESM entry. Browser loading requires HTTPS except for `localhost` and depends on the host allowing CORS.
 
-To include an external plugin folder in a GeoLibre web build, place the built plugin bundle under the Vite public directory:
+### Bundled plugins (baked into the build)
+
+To ship an external plugin as part of GeoLibre — loaded automatically, with no Settings entry and no manifest URL — drop its built bundle into the Vite public directory, one folder per plugin id:
 
 ```text
 apps/geolibre-desktop/public/plugins/example-plugin/
@@ -188,13 +209,13 @@ apps/geolibre-desktop/public/plugins/example-plugin/
   dist/style.css
 ```
 
-Vite copies files from `public/` into the final web build, so the manifest URL becomes:
+This is the **same content a manifest URL would serve**. A drop-in is all that is required — no source edits per plugin. The `bundledPlugins()` Vite plugin (`apps/geolibre-desktop/vite-plugins/bundled-plugins.ts`) scans `public/plugins/` at build and dev-server start, exposes the discovered manifest paths through the `virtual:bundled-plugins` module, and `usePlugins.ts` loads them through the normal external-plugin path (fetch → blob import → register). Discovery happens at build time, so restart the dev server or rebuild after adding, updating, or removing a plugin folder.
 
-```text
-/plugins/example-plugin/plugin.json
-```
+The same folder serves **both** the web and desktop builds: the desktop app bundles the identical frontend (`frontendDist` in `tauri.conf.json`) and serves it from `tauri://localhost`, which is same-origin and allowed by the desktop CSP (`connect-src 'self'`, `script-src ... blob:`). Bundled manifest URLs are injected at load time rather than stored in Settings, so a baked-in plugin always loads and cannot be removed by a user; they are deduplicated by plugin id against any user/project plugin of the same id.
 
-This works in both development and production web builds. The browser still cannot scan `/plugins/` at runtime, so each bundled plugin must be loaded by an explicit manifest URL, such as one entered in Settings > Plugins. Manifest URLs are saved in the project `plugins.manifestUrls` array so reloading a shared project can fetch its external plugins before restoring active plugin state. For plugins that should always ship as part of GeoLibre without user configuration, prefer registering them as built-in plugins.
+Private plugins should be git-ignored under `public/plugins/` (see that folder's `.gitignore`) and copied in at build/deploy time (for example in CI before `npm run build`, or by a plugin repo's own install script) so their code stays out of GeoLibre's history. The discovery code is generic and committed; only the plugin payload is excluded.
+
+If instead you want a plugin compiled into the main JS bundle (no `plugin.json`, no fetch), register it as a built-in plugin (see "Add a plugin" in the repository README).
 
 ```json
 {
@@ -217,6 +238,31 @@ The optional `style` CSS is injected globally into the host document, not scoped
 
 When using the template, update `geolibre-plugin/plugin.json` and `src/geolibre.ts` together so `id`, `name`, and `version` stay in sync. Run `npm run package:geolibre`, then either copy the generated zip into the desktop app data `plugins/` directory, add the template's `geolibre-plugin/` directory in Settings > Plugins for local development, or host the `geolibre-plugin/` directory and add its `plugin.json` URL.
 
-## Future plugin work
+### Plugin marketplace
 
-- Sandboxed worker plugins
+The Settings menu's **Manage Plugins** entry opens a standalone dialog (modeled on QGIS's plugin manager) with **All**, **Installed**, **Not installed**, **Upgradeable**, and **Settings** sections. The first four list curated registry plugins so users can install, update, and uninstall them without hand-entering manifest URLs; the Settings section manages additional local plugin directories and manual manifest URLs. Actions apply immediately (install/uninstall/update are live; uninstall asks for confirmation). It is a thin layer over the manifest-URL loader above: installing an entry records its manifest URL in the plugin manifest URL list, and the existing loader fetches and registers it. It introduces no new trust path.
+
+The registry is JSON, fetched from `VITE_GEOLIBRE_PLUGIN_REGISTRY_URL` or, by default, the hosted registry at `https://plugins.geolibre.app/plugin-registry.json` (the [opengeos/geolibre-plugins](https://github.com/opengeos/geolibre-plugins) repo, published to GitHub Pages with CORS enabled). It is an array, or an object with a `plugins` array, of entries:
+
+```json
+{
+  "version": 1,
+  "plugins": [
+    {
+      "id": "example-plugin",
+      "name": "Example Plugin",
+      "version": "1.0.0",
+      "description": "Optional short description",
+      "author": "Example Author",
+      "homepage": "https://github.com/example/example-plugin",
+      "manifestUrl": "https://example.com/example-plugin/plugin.json",
+      "categories": ["Example"],
+      "minGeoLibreVersion": "1.0.0"
+    }
+  ]
+}
+```
+
+`id`, `name`, `version`, and `manifestUrl` are required; the rest are optional. A relative `manifestUrl` is resolved against the registry location, so a plugin hosted alongside the registry (e.g. `sample/plugin.json`) can be listed with a relative path. `minGeoLibreVersion` gates installation against the running app version. Curate the registry and host plugin bundles in the [opengeos/geolibre-plugins](https://github.com/opengeos/geolibre-plugins) repo, which ships a `sample/` template.
+
+Uninstalling prompts for confirmation, then unregisters the plugin at runtime (deactivating any active map control) so the Plugins menu updates without a reload. When a registry entry advertises a newer `version` than the loaded plugin, the marketplace shows an Update action that re-fetches the manifest URL and re-registers the published version in place; the new version is fetched and validated before the old one is removed, so a failed update leaves the installed plugin intact.
