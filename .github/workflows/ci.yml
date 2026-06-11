@@ -25,28 +25,33 @@ jobs:
           persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: package-lock.json
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: backend/geolibre_server/pyproject.toml
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with:
-          toolchain: stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: actions/cache@v4
         with:
-          workspaces: apps/geolibre-desktop/src-tauri -> target
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/geolibre-desktop/src-tauri/target
+          key: rust-${{ runner.os }}-${{ hashFiles('apps/geolibre-desktop/src-tauri/Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-
 
       - name: Install Linux desktop dependencies
         run: |
