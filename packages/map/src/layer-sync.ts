@@ -124,6 +124,16 @@ export function syncLayer(
     return;
   }
 
+  if (layer.type === "geojson" && !layer.geojson) {
+    const dataUrl =
+      (layer.source.data as string | undefined) ??
+      (typeof layer.sourcePath === "string" ? layer.sourcePath : undefined);
+    if (typeof dataUrl === "string" && /^https?:\/\//.test(dataUrl)) {
+      syncGeoJsonUrlLayer(map, layer, dataUrl, beforeId);
+      return;
+    }
+  }
+
   if (
     layer.type === "raster" ||
     layer.type === "wms" ||
@@ -915,6 +925,74 @@ function setExternalNativeLayerPaint(
       // properties that do not apply to a specific native layer type.
     }
   }
+}
+
+function syncGeoJsonUrlLayer(
+  map: maplibregl.Map,
+  layer: GeoLibreLayer,
+  dataUrl: string,
+  beforeId?: string,
+): void {
+  const src = sourceId(layer.id);
+  const visibility = layer.visible ? "visible" : "none";
+  const opacity = layer.opacity;
+
+  if (!map.getSource(src)) {
+    map.addSource(src, { type: "geojson", data: dataUrl });
+  }
+
+  ensureLayer(
+    map,
+    fillLayerId(layer.id),
+    {
+      id: fillLayerId(layer.id),
+      type: "fill",
+      source: src,
+      ...styleLayerZoomRange(layer.style),
+      filter: ["match", ["geometry-type"], ["Polygon", "MultiPolygon"], true, false],
+      paint: fillPaint(layer.style, opacity),
+      layout: { visibility },
+    },
+    beforeId,
+  );
+
+  if (!layer.style.extrusionEnabled) {
+    ensureLayer(
+      map,
+      lineLayerId(layer.id),
+      {
+        id: lineLayerId(layer.id),
+        type: "line",
+        source: src,
+        ...styleLayerZoomRange(layer.style),
+        filter: [
+          "match",
+          ["geometry-type"],
+          ["LineString", "MultiLineString", "Polygon", "MultiPolygon"],
+          true,
+          false,
+        ],
+        paint: linePaint(layer.style, opacity),
+        layout: { visibility },
+      },
+      beforeId,
+    );
+  }
+
+  ensureLayer(
+    map,
+    circleLayerId(layer.id),
+    {
+      id: circleLayerId(layer.id),
+      type: "circle",
+      source: src,
+      ...styleLayerZoomRange(layer.style),
+      filter: ["match", ["geometry-type"], ["Point", "MultiPoint"], true, false],
+      paint: circlePaint(layer.style, opacity),
+      layout: { visibility },
+    },
+    beforeId,
+  );
 }
 
 function syncGeoJsonLayer(

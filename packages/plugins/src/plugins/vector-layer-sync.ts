@@ -1,15 +1,9 @@
 import {
   DEFAULT_LAYER_STYLE,
-  isVectorColorExpression,
-  vectorCircleColorValue,
-  vectorFillColorValue,
-  vectorLineColorValue,
   type GeoLibreLayer,
   type LayerStyle,
-  type VectorColorValue,
   useAppStore,
 } from "@geolibre/core";
-import type { PropertyValueSpecification } from "maplibre-gl";
 import type {
   VectorLayerInfo,
   VectorLayerOptions,
@@ -17,12 +11,6 @@ import type {
 } from "maplibre-gl-vector";
 
 export const VECTOR_SOURCE_KIND = "maplibre-gl-vector";
-
-// Upper bound on a restored color expression's serialized size. Generous for a
-// real categorized/graduated style (hundreds of stops are well under this) but
-// blocks a hand-edited project file from smuggling a large blob into a paint
-// property, matching the length caps on restored color strings.
-const MAX_COLOR_EXPRESSION_CHARS = 20_000;
 
 /**
  * The slice of the maplibre-gl-vector VectorControl surface the store sync
@@ -434,36 +422,6 @@ function savedVectorStyle(raw: unknown): Partial<VectorLayerStyle> | null {
     style.circleOpacity = candidate.circleOpacity;
   }
 
-  // Restore the data-driven color expressions so a saved categorized/graduated/
-  // expression style renders on reload: restoreVectorLayers seeds the control's
-  // addData from this style, and the post-load sync does not re-push (the
-  // recomputed expression matches the persisted one). Bounded like the color
-  // strings above: an array passes only when its serialized form stays small,
-  // so a hand-edited project file cannot smuggle a multi-kilobyte (or deeply
-  // nested) blob into a paint property. Real categorized/graduated expressions
-  // are far under this cap, and MapLibre validates the expression contents.
-  const colorExpression = (
-    value: unknown,
-  ): value is PropertyValueSpecification<string> => {
-    if (!Array.isArray(value) || value.length === 0) return false;
-    try {
-      return JSON.stringify(value).length <= MAX_COLOR_EXPRESSION_CHARS;
-    } catch {
-      // A circular or pathologically deep array makes JSON.stringify throw;
-      // reject it so a hand-edited project file cannot break restore.
-      return false;
-    }
-  };
-  if (colorExpression(candidate.fillColorExpression)) {
-    style.fillColorExpression = candidate.fillColorExpression;
-  }
-  if (colorExpression(candidate.lineColorExpression)) {
-    style.lineColorExpression = candidate.lineColorExpression;
-  }
-  if (colorExpression(candidate.circleColorExpression)) {
-    style.circleColorExpression = candidate.circleColorExpression;
-  }
-
   return Object.keys(style).length > 0 ? style : null;
 }
 
@@ -495,33 +453,10 @@ function layerStyleToVectorStyle(style: LayerStyle): VectorLayerStyle {
     fillOpacity: style.fillOpacity,
     lineColor: style.strokeColor,
     lineWidth: style.strokeWidth,
-    // circleColor/circleOpacity intentionally track fillColor/fillOpacity (see
-    // the doc comment): one fill edit drives both polygon fills and point
-    // circles on mixed layers. Pure polygon/line layers ignore these fields;
-    // pure point layers ignore fillColor/fillOpacity instead.
     circleColor: style.fillColor,
     circleOpacity: style.fillOpacity,
     circleRadius: style.circleRadius,
-    fillColorExpression: colorExpressionField(vectorFillColorValue(style)),
-    lineColorExpression: colorExpressionField(vectorLineColorValue(style)),
-    circleColorExpression: colorExpressionField(vectorCircleColorValue(style)),
   };
-}
-
-/**
- * Narrows a computed vector color to the control's expression field: the
- * expression when the style mode is data-driven, or undefined when it resolves
- * to a flat color (so the control falls back to fillColor/lineColor/circleColor).
- *
- * @param value - A color value from the @geolibre/core color builders.
- * @returns The expression, or undefined for a flat color.
- */
-function colorExpressionField(
-  value: VectorColorValue,
-): PropertyValueSpecification<string> | undefined {
-  return isVectorColorExpression(value)
-    ? (value as PropertyValueSpecification<string>)
-    : undefined;
 }
 
 /**
@@ -573,13 +508,7 @@ function vectorStylesEqual(
     left.lineWidth === right.lineWidth &&
     left.circleColor === right.circleColor &&
     left.circleOpacity === right.circleOpacity &&
-    left.circleRadius === right.circleRadius &&
-    // Color expressions are arrays (or undefined), so compare them deeply: a
-    // categorized/graduated stop change reuses the same flat colors but yields
-    // a different expression, which must still register as a style change.
-    valuesEqual(left.fillColorExpression, right.fillColorExpression) &&
-    valuesEqual(left.lineColorExpression, right.lineColorExpression) &&
-    valuesEqual(left.circleColorExpression, right.circleColorExpression)
+    left.circleRadius === right.circleRadius
   );
 }
 

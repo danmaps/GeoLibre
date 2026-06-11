@@ -107,10 +107,11 @@ export function closeVectorLayerPanel(app: GeoLibreAppAPI): void {
 }
 
 /**
- * Re-fetches a URL-backed Add Vector Layer layer in place through the
- * control's reloadLayer API, preserving the layer id. Returns the refreshed
- * layer info, or undefined when the control singleton is null (not yet
- * created or already removed) or the layer id is unknown to the control.
+ * Re-fetches a URL-backed Add Vector Layer layer in place by removing it and
+ * re-adding it with the same id and options, preserving the layer id.
+ * Returns the refreshed layer info, or undefined when the control singleton is
+ * null (not yet created or already removed), the layer id is unknown to the
+ * control, or the layer is not URL-backed.
  *
  * @param id - The store/control layer id.
  * @returns The refreshed layer info, or undefined.
@@ -119,7 +120,21 @@ export async function reloadVectorControlLayer(
   id: string,
 ): Promise<VectorLayerInfo | undefined> {
   if (!vectorControl) return undefined;
-  return vectorControl.reloadLayer(id);
+  const existing = vectorControl.getLayer(id);
+  if (!existing || existing.source.kind !== "url") return undefined;
+  const url = existing.source.url;
+  vectorControl.removeLayer(id);
+  return vectorControl.addData(url, {
+    id,
+    name: existing.name,
+    style: existing.style,
+    visible: existing.visible,
+    opacity: existing.opacity,
+    beforeId: existing.beforeId,
+    sourceLayer: existing.sourceLayer,
+    format: existing.format,
+    fitBounds: false,
+  });
 }
 
 /**
