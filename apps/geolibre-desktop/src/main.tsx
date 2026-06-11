@@ -29,20 +29,27 @@ import "./lib/lidar-style";
 import "./lib/swipe-style";
 import { installDiagnosticsCapture } from "./lib/diagnostics";
 import { installStaleChunkReload } from "./lib/stale-chunk-reload";
+import { handleOAuthCallbackIfNeeded } from "./lib/arcgis-oauth";
 
 installDiagnosticsCapture();
 // Recover from chunks orphaned by a web redeploy (stale lazy import → 404). A
 // no-op in the desktop build, whose chunks are bundled locally.
 installStaleChunkReload();
 
-void import("./App")
-  .then(({ default: App }) => {
-    ReactDOM.createRoot(document.getElementById("root")!).render(
-      <React.StrictMode>
-        <App />
-      </React.StrictMode>,
-    );
-  })
-  .catch((error: unknown) => {
-    console.error("Failed to start GeoLibre", error);
-  });
+// If this page is the OAuth redirect target inside the popup, post the code
+// back to the opener and close — don't render the full app.
+if (handleOAuthCallbackIfNeeded()) {
+  // Nothing more to do; the popup closes itself after postMessage.
+} else {
+  void import("./App")
+    .then(({ default: App }) => {
+      ReactDOM.createRoot(document.getElementById("root")!).render(
+        <React.StrictMode>
+          <App />
+        </React.StrictMode>,
+      );
+    })
+    .catch((error: unknown) => {
+      console.error("Failed to start GeoLibre", error);
+    });
+}
