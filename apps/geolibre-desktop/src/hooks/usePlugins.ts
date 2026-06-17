@@ -6,6 +6,8 @@ import {
 import {
   maplibreBasemapControlPlugin,
   maplibreComponentsPlugin,
+  maplibreDeckGlVizPlugin,
+  maplibreDirectionsPlugin,
   maplibreEffectsPlugin,
   maplibreEnviroAtlasPlugin,
   maplibreEsriWaybackPlugin,
@@ -17,6 +19,7 @@ import {
   maplibreNasaEarthdataPlugin,
   maplibreNationalMapPlugin,
   maplibreOvertureMapsPlugin,
+  maplibreReverseGeocodePlugin,
   maplibreStreetViewPlugin,
   maplibreSwipePlugin,
   maplibreTimeSliderPlugin,
@@ -41,6 +44,7 @@ import {
   resolvePluginAssetUrlForLoadedPlugin,
   unloadRemovedUrlPlugins,
 } from "../lib/external-plugins";
+import { appendDiagnostic } from "../lib/diagnostics";
 import { mergeStringLists } from "../lib/string-lists";
 import {
   openLocalDataFileWithFallback,
@@ -49,6 +53,22 @@ import {
 import { useDesktopSettingsStore } from "./useDesktopSettings";
 
 const RASTER_PROXY_PATH = "/__geolibre_raster_proxy";
+
+/** Records a plugin failure in the diagnostics panel without crashing the app. */
+function reportPluginError(
+  pluginId: string,
+  action: string,
+  error: unknown,
+): void {
+  const normalized = error instanceof Error ? error : new Error(String(error));
+  appendDiagnostic({
+    category: "runtime",
+    level: "error",
+    message: `Plugin "${pluginId}" failed to ${action}: ${normalized.message}`,
+    detail: normalized.stack,
+    source: `plugin:${pluginId}`,
+  });
+}
 
 interface TauriRuntimeWindow extends Window {
   __TAURI_INTERNALS__?: unknown;
@@ -73,6 +93,9 @@ manager.registerAll([
   maplibreStreetViewPlugin,
   maplibreSwipePlugin,
   maplibreEffectsPlugin,
+  maplibreDirectionsPlugin,
+  maplibreReverseGeocodePlugin,
+  maplibreDeckGlVizPlugin,
   maplibreComponentsPlugin,
 ]);
 
@@ -154,7 +177,20 @@ export function usePluginRegistry() {
     getProjectState: () => manager.getProjectState(),
     toggle: (id: string, appApi: ReturnType<typeof createAppAPI>) => {
       const before = JSON.stringify(projectPluginStateSnapshot());
-      manager.toggle(id, appApi);
+      // Plugin controls are imperative MapLibre code, so a throw here escapes
+      // React's error boundaries. Contain it so one bad plugin can't break the
+      // toggle handler — surface it in diagnostics instead. Return without
+      // persisting so a half-applied failure is not written to the project.
+      try {
+        manager.toggle(id, appApi);
+      } catch (error) {
+        // Known limitation: if toggle throws after a partial mutation (e.g. the
+        // control attached but a later step failed), the in-memory PluginManager
+        // state may be inconsistent. Project persistence is protected by the
+        // early return below; in-memory state is not rolled back.
+        reportPluginError(id, "toggle", error);
+        return;
+      }
       persistProjectPluginState(before);
     },
     setMapControlPosition: (
@@ -163,7 +199,12 @@ export function usePluginRegistry() {
       position: GeoLibreMapControlPosition,
     ) => {
       const before = JSON.stringify(projectPluginStateSnapshot());
-      manager.setMapControlPosition(id, appApi, position);
+      try {
+        manager.setMapControlPosition(id, appApi, position);
+      } catch (error) {
+        reportPluginError(id, "reposition", error);
+        return;
+      }
       persistProjectPluginState(before);
     },
   };
@@ -410,16 +451,20 @@ export function createAppAPI(
         (cached ??= Promise.all([
           import("@deck.gl/core"),
           import("@deck.gl/layers"),
+          import("@deck.gl/aggregation-layers"),
           import("@deck.gl/geo-layers"),
           import("@deck.gl/mesh-layers"),
           import("@deck.gl/mapbox"),
-        ]).then(([core, layers, geoLayers, meshLayers, mapbox]) => ({
-          core,
-          layers,
-          geoLayers,
-          meshLayers,
-          mapbox,
-        })));
+        ]).then(
+          ([core, layers, aggregationLayers, geoLayers, meshLayers, mapbox]) => ({
+            core,
+            layers,
+            aggregationLayers,
+            geoLayers,
+            meshLayers,
+            mapbox,
+          }),
+        ));
     })(),
   };
 }

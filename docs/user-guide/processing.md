@@ -1,9 +1,9 @@
 # Processing Tools
 
-The **Processing** menu collects GeoLibre's analysis and conversion tools: vector geometry and overlay tools, raster terrain and clipping tools, format conversion, and the Whitebox toolbox. The [SQL Workspace](sql-workspace.md) also lives here and has its own page.
+The **Processing** menu collects GeoLibre's analysis and conversion tools: vector geometry and overlay tools, raster terrain and clipping tools, AI segmentation, format conversion, and the Whitebox toolbox. The [SQL Workspace](sql-workspace.md), [Python Console](python-console.md), [AI Assistant](ai-assistant.md), and [AI Segmentation](segmentation.md) also live here and have their own pages.
 
 !!! note "Page order"
-    This page groups the tools by theme. In the menu itself the items appear in a different order: Whitebox, SQL Workspace, Conversion, Vector, Raster, Planetary Computer, Earth Engine.
+    This page groups the tools by theme. In the menu itself the items appear in a different order: AI Assistant (top), Whitebox, SQL Workspace, Python Console, Conversion, Vector, Raster, AI Segmentation, Planetary Computer, Earth Engine.
 
 ![Vector tools dialog](https://data.geolibre.app/images/geolibre-processing-vector.webp)
 
@@ -30,6 +30,20 @@ The **Processing** menu collects GeoLibre's analysis and conversion tools: vecto
 | **Intersection** | Keep only the areas where both polygon layers overlap (merges attributes from both). |
 | **Difference** | Remove the overlay layer's area from the input layer (keeps input attributes). |
 | **Union** | Merge two polygon layers into a single combined geometry (attributes are not preserved on either engine). |
+
+**Join**
+
+| Tool | Description |
+| --- | --- |
+| **Spatial join** | Attach attributes from a join layer to each input feature based on a spatial relationship (intersects, within, or contains). Choose an *inner* join to keep only matched features or a *left* join to keep all input features. Works with any geometry type. |
+| **Attribute join** | Attach attributes from a join layer (a table) onto each input feature where a key field matches — no geometry involved (e.g. join census stats to boundary polygons by FIPS code). One-to-one: the first matching join row wins. Choose which fields to bring over, and an *inner* join (keep only matched) or *left* join (keep all input). |
+
+**Select**
+
+| Tool | Description |
+| --- | --- |
+| **Select by value** | Extract features whose attribute matches a condition into a new layer. Pick a field, an operator (=, ≠, >, ≥, <, ≤, contains, starts with, is empty, is not empty) and a value. Comparisons are numeric when both sides are numbers, otherwise text. |
+| **Select by location** | Extract features by their spatial relationship to a second layer (intersects, within, contains, or disjoint) into a new layer. Works with any geometry type. |
 
 ### Engines
 
@@ -74,6 +88,12 @@ See the [Vector Analysis tutorial](../tutorials/vector-analysis.md).
 | **Polygonize** | Convert a raster band into vector polygons grouped by pixel value. |
 | **Contour** | Generate contour lines from an elevation model. |
 
+**Vector to Raster**
+
+| Tool | Description |
+| --- | --- |
+| **Interpolation (IDW / Kriging)** | Interpolate a point layer's numeric attribute into a continuous raster surface using inverse distance weighting or ordinary kriging. The output grid spans the points' extent at the chosen pixel size, in the layer's CRS. |
+
 See the [Terrain Analysis tutorial](../tutorials/terrain-analysis.md).
 
 ## Conversion
@@ -84,6 +104,8 @@ See the [Terrain Analysis tutorial](../tutorials/terrain-analysis.md).
 | --- | --- | --- |
 | **Vector to GeoParquet** | Browser (DuckDB-WASM) | Hilbert-sorted, compressed GeoParquet. |
 | **Vector to FlatGeobuf** | Sidecar | Hilbert-sorted, cloud-optimized, spatially indexed vector. |
+| **Vector to Shapefile** | Sidecar | Hilbert-sorted, zipped ESRI Shapefile (field names truncated to 10 characters). |
+| **Vector to GeoPackage** | Sidecar | Hilbert-sorted GeoPackage for sharing with QGIS/ArcGIS. |
 | **CSV to GeoParquet** | Browser (DuckDB-WASM) | Convert a CSV with coordinates to GeoParquet. |
 | **Vector to PMTiles** | Sidecar | Build a vector tile archive. |
 | **Raster to COG** | Sidecar | Write a Cloud-Optimized GeoTIFF. |
@@ -93,6 +115,10 @@ The conversion sidecar is hardened with a path allowlist.
 ## Whitebox
 
 **Processing → Whitebox** opens the Whitebox toolbox for batch geoprocessing, backed by a managed Python sidecar. Point it at an input directory and run tools across the files in it.
+
+## AI Segmentation
+
+**Processing → AI Segmentation** turns imagery into vector features with [segment-geospatial](https://github.com/opengeos/segment-geospatial) (SamGeo) and Meta's SAM 3 model: choose a GeoTIFF, type a text prompt (*"trees"*, *"buildings"*) or run automatic segmentation, and the resulting polygons are added as a new layer. It runs the model in a separate `samgeo-api` server (a GPU is recommended) that the sidecar proxies. See the dedicated [AI Segmentation](segmentation.md) page for setup and usage.
 
 ## Planetary Computer and Earth Engine
 

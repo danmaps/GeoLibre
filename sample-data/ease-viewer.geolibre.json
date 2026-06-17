@@ -1,0 +1,493 @@
+{
+  "version": "0.1.0",
+  "name": "SCE EASE Viewer",
+  "mapView": {
+    "center": [
+      -118.25,
+      34.05
+    ],
+    "zoom": 9,
+    "bearing": 0,
+    "pitch": 0
+  },
+  "basemapStyleUrl": "https://tiles.openfreemap.org/styles/dark",
+  "basemapVisible": true,
+  "basemapOpacity": 1,
+  "layers": [
+    {
+      "id": "tier3-hfra",
+      "name": "HFRA Tier 3",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://services.arcgis.com/BLN4oKB0N1YSgvY8/ArcGIS/rest/services/CPUC_Fire_Threat_Areas/FeatureServer/0/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://services.arcgis.com/BLN4oKB0N1YSgvY8/ArcGIS/rest/services/CPUC_Fire_Threat_Areas/FeatureServer/0/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": true,
+      "opacity": 1,
+      "style": {
+        "fillColor": "#ff0000",
+        "strokeColor": "#ff0000",
+        "fillOpacity": 0.1,
+        "strokeWidth": 1
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "sourceKey": "tier3_layer"
+      }
+    },
+    {
+      "id": "tier2-hfra",
+      "name": "HFRA Tier 2",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://services.arcgis.com/BLN4oKB0N1YSgvY8/ArcGIS/rest/services/CPUC_Fire_Threat_Areas/FeatureServer/1/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://services.arcgis.com/BLN4oKB0N1YSgvY8/ArcGIS/rest/services/CPUC_Fire_Threat_Areas/FeatureServer/1/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": true,
+      "opacity": 1,
+      "style": {
+        "fillColor": "#ffff00",
+        "strokeColor": "#ffff00",
+        "fillOpacity": 0.1,
+        "strokeWidth": 1
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "sourceKey": "tier2_layer"
+      }
+    },
+    {
+      "id": "transmission-circuits",
+      "name": "Transmission Circuits",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://services5.arcgis.com/z6hI6KRjKHvhNO0r/ArcGIS/rest/services/Layers/FeatureServer/4/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://services5.arcgis.com/z6hI6KRjKHvhNO0r/ArcGIS/rest/services/Layers/FeatureServer/4/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": true,
+      "opacity": 1,
+      "style": {
+        "strokeColor": "#eff246",
+        "strokeWidth": 2,
+        "fillOpacity": 0
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "sourceKey": "transmission_circuits_layer"
+      }
+    },
+    {
+      "id": "ica-circuit-segments",
+      "name": "ICA - Circuit Segments",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://services5.arcgis.com/z6hI6KRjKHvhNO0r/ArcGIS/rest/services/Layers/FeatureServer/1/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://services5.arcgis.com/z6hI6KRjKHvhNO0r/ArcGIS/rest/services/Layers/FeatureServer/1/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": false,
+      "opacity": 1,
+      "style": {
+        "strokeColor": "#69ea5d",
+        "strokeWidth": 2,
+        "fillOpacity": 0
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "sourceKey": "ica_circuit_segments"
+      }
+    },
+    {
+      "id": "ica-circuit-segments-non3phase",
+      "name": "ICA - Circuit Segments, Non-3 Phase",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://services5.arcgis.com/z6hI6KRjKHvhNO0r/ArcGIS/rest/services/Layers/FeatureServer/2/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://services5.arcgis.com/z6hI6KRjKHvhNO0r/ArcGIS/rest/services/Layers/FeatureServer/2/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": false,
+      "opacity": 1,
+      "style": {
+        "strokeColor": "#b3f21f",
+        "strokeWidth": 2,
+        "fillOpacity": 0
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "sourceKey": "ica_circuit_segments_non3phase"
+      }
+    },
+    {
+      "id": "ram-circuits",
+      "name": "RAM - Circuits",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://services5.arcgis.com/z6hI6KRjKHvhNO0r/ArcGIS/rest/services/Layers/FeatureServer/3/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://services5.arcgis.com/z6hI6KRjKHvhNO0r/ArcGIS/rest/services/Layers/FeatureServer/3/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": false,
+      "opacity": 1,
+      "style": {
+        "strokeColor": "#cfff32",
+        "strokeWidth": 2,
+        "fillOpacity": 0
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "sourceKey": "ram_circuits"
+      }
+    },
+    {
+      "id": "sce-service-territory",
+      "name": "SCE Service Territory",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://services5.arcgis.com/z6hI6KRjKHvhNO0r/ArcGIS/rest/services/Layers/FeatureServer/5/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://services5.arcgis.com/z6hI6KRjKHvhNO0r/ArcGIS/rest/services/Layers/FeatureServer/5/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": false,
+      "opacity": 1,
+      "style": {
+        "fillOpacity": 0,
+        "strokeColor": "#ffffff",
+        "strokeWidth": 1
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "sourceKey": "sce_service_territory_layer"
+      }
+    },
+    {
+      "id": "substations",
+      "name": "Substations",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://services5.arcgis.com/z6hI6KRjKHvhNO0r/ArcGIS/rest/services/Layers/FeatureServer/0/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://services5.arcgis.com/z6hI6KRjKHvhNO0r/ArcGIS/rest/services/Layers/FeatureServer/0/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": false,
+      "opacity": 1,
+      "style": {
+        "fillColor": "#3b82f6",
+        "strokeColor": "#1e40af",
+        "circleRadius": 6
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "sourceKey": "Substations"
+      }
+    },
+    {
+      "id": "ca-statewide-parcels",
+      "name": "CA Statewide Parcels",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://services1.arcgis.com/jUJYIo9tSA7EHvfZ/arcgis/rest/services/CA_Statewide_Parcels_Public_view/FeatureServer/0/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://services1.arcgis.com/jUJYIo9tSA7EHvfZ/arcgis/rest/services/CA_Statewide_Parcels_Public_view/FeatureServer/0/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": false,
+      "opacity": 1,
+      "style": {
+        "fillColor": "#ffff00",
+        "strokeColor": "#ffff00",
+        "fillOpacity": 0,
+        "strokeWidth": 1,
+        "minZoom": 15
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "sourceKey": "ca_statewide_parcels_public_view"
+      }
+    },
+    {
+      "id": "distribution-circuit",
+      "name": "Distribution Circuit",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/DISTRIBUTION/MapServer/13/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/DISTRIBUTION/MapServer/13/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": false,
+      "opacity": 1,
+      "style": {
+        "strokeColor": "#3b82f6",
+        "strokeWidth": 2,
+        "fillOpacity": 0
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "requiresAuth": true,
+        "sourceKey": "Circuits"
+      }
+    },
+    {
+      "id": "landbase-rightofway-poly",
+      "name": "Landbase - Right-of-Way Poly",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/LANDBASE_COTS/MapServer/12/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/LANDBASE_COTS/MapServer/12/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": false,
+      "opacity": 1,
+      "style": {
+        "fillColor": "#008000",
+        "strokeColor": "#008000",
+        "fillOpacity": 0.1,
+        "strokeWidth": 1
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "requiresAuth": true,
+        "sourceKey": "landbase_rightofway_poly"
+      }
+    },
+    {
+      "id": "landbase-easement-poly",
+      "name": "Landbase - Easement Poly",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/LANDBASE_COTS/MapServer/13/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/LANDBASE_COTS/MapServer/13/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": false,
+      "opacity": 1,
+      "style": {
+        "fillColor": "#FFA500",
+        "strokeColor": "#FFA500",
+        "fillOpacity": 0.1,
+        "strokeWidth": 1
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "requiresAuth": true,
+        "sourceKey": "landbase_easement_poly"
+      }
+    },
+    {
+      "id": "landbase-parcel-poly",
+      "name": "Landbase - Parcel Poly",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/LANDBASE_COTS/MapServer/14/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/LANDBASE_COTS/MapServer/14/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": false,
+      "opacity": 1,
+      "style": {
+        "fillColor": "#ffa500",
+        "strokeColor": "#ffa500",
+        "fillOpacity": 0,
+        "strokeWidth": 1,
+        "minZoom": 15
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "requiresAuth": true,
+        "sourceKey": "landbase_parcel_poly"
+      }
+    },
+    {
+      "id": "landbase-parcel-centroids",
+      "name": "Landbase - Parcel Centroids",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/LANDBASE_COTS/MapServer/11/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/LANDBASE_COTS/MapServer/11/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": false,
+      "opacity": 1,
+      "style": {
+        "minZoom": 17
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "requiresAuth": true,
+        "sourceKey": "landbase_parcel_centroids"
+      }
+    },
+    {
+      "id": "landbase-wind-loading",
+      "name": "Landbase - Wind Loading",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/LANDBASE_3rd_Party/MapServer/26/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/LANDBASE_3rd_Party/MapServer/26/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": false,
+      "opacity": 1,
+      "style": {
+        "fillColor": "#00c7ff",
+        "strokeColor": "#00c7ff",
+        "fillOpacity": 0,
+        "strokeWidth": 1,
+        "minZoom": 12
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "requiresAuth": true,
+        "sourceKey": "landbase_wind_loading"
+      }
+    },
+    {
+      "id": "soil-classification",
+      "name": "Soil Classification",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/LANDBASE_3rd_Party/MapServer/28/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/LANDBASE_3rd_Party/MapServer/28/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": false,
+      "opacity": 1,
+      "style": {
+        "strokeColor": "#e28b38",
+        "minZoom": 13
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "requiresAuth": true,
+        "sourceKey": "soil_classification"
+      }
+    },
+    {
+      "id": "eagle-zone",
+      "name": "Eagle Zone",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/LANDBASE_SCE_MANAGED/MapServer/17/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/LANDBASE_SCE_MANAGED/MapServer/17/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": false,
+      "opacity": 1,
+      "style": {
+        "fillColor": "#A4D6B1",
+        "strokeColor": "#A4D6B1",
+        "fillOpacity": 0.3
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "requiresAuth": true,
+        "sourceKey": "eagle_zone"
+      }
+    },
+    {
+      "id": "sce-fim-grid-oh",
+      "name": "SCE Grid - FIM GRID OH",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/LANDBASE_SCE_MANAGED/MapServer/26/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/LANDBASE_SCE_MANAGED/MapServer/26/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": false,
+      "opacity": 1,
+      "style": {
+        "strokeColor": "#e28b38",
+        "fillOpacity": 0,
+        "minZoom": 13
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "requiresAuth": true,
+        "sourceKey": "sce_fin_grid_oh"
+      }
+    },
+    {
+      "id": "sce-fim-grid-ug",
+      "name": "SCE Grid - FIM GRID UG",
+      "type": "geojson",
+      "source": {
+        "type": "geojson",
+        "data": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/LANDBASE_SCE_MANAGED/MapServer/25/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true"
+      },
+      "sourcePath": "https://scegeoview.sce.com/arcgis2/rest/services/SCEGEOVIEW/LANDBASE_SCE_MANAGED/MapServer/25/query?f=geojson&where=1%3D1&outFields=*&returnGeometry=true",
+      "visible": false,
+      "opacity": 1,
+      "style": {
+        "strokeColor": "#80c136",
+        "fillOpacity": 0,
+        "minZoom": 13
+      },
+      "metadata": {
+        "arcgisLayerType": "feature",
+        "arcgisSourceType": "url",
+        "externalNativeLayer": true,
+        "requiresAuth": true,
+        "sourceKey": "sce_fin_grid_ug"
+      }
+    }
+  ],
+  "styles": {},
+  "preferences": {
+    "map": {
+      "restrictBounds": false,
+      "bounds": [
+        -180,
+        -85,
+        180,
+        85
+      ],
+      "minZoom": 0,
+      "maxZoom": 24,
+      "maxPitch": 85,
+      "renderWorldCopies": true
+    },
+    "environmentVariables": []
+  },
+  "metadata": {
+    "author": "GeoLibre",
+    "description": "SCE EASE Viewer layers ported to GeoLibre format. Layers marked requiresAuth need a valid SCE token to load."
+  }
+}

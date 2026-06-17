@@ -4,12 +4,43 @@ import ehWorker from "@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url";
 import duckdbWasmMvp from "@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm?url";
 import mvpWorker from "@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?url";
 import type { Feature, FeatureCollection, Geometry } from "geojson";
+import {
+  detectGeometryColumn,
+  geometryExpr,
+  geometryGeoJsonSql,
+  isGeometryColumnType,
+  quoteIdentifier,
+  quoteSqlString,
+} from "./duckdb-geometry";
+import {
+  confirmLargeDataset,
+  type DuckDbVectorLoadOptions,
+} from "./duckdb-vector-guard";
+import { ensureGpkgFeatureCount } from "./gpkg-ogr-contents";
 import { getSpatialExtensionPath } from "./spatial-extension-config";
+
+// Re-exported for existing importers (sql-workspace, duckdb-processing, etc.)
+// that reach for these helpers via this module.
+export {
+  isGeometryColumnType,
+  quoteIdentifier,
+  quoteSqlString,
+} from "./duckdb-geometry";
+
+// Re-exported so callers can keep importing the guard surface from the loader.
+export {
+  confirmLargeDataset,
+  DUCKDB_VECTOR_FEATURE_WARN_COUNT,
+  VectorLoadCancelledError,
+  type DuckDbVectorLoadOptions,
+  type LargeVectorDataset,
+} from "./duckdb-vector-guard";
 
 const GEOMETRY_JSON_COLUMN = "__geolibre_geometry_geojson";
 const EXPORT_GEOJSON_EXTENSION = "geojson";
 const EXPORT_GEOPARQUET_EXTENSION = "parquet";
-const TARGET_CRS = "EPSG:4326";
+
+const FEATURE_COUNT_COLUMN = "__geolibre_feature_count";
 
 const MANUAL_BUNDLES: duckdb.DuckDBBundles = {
   mvp: {
@@ -100,6 +131,33 @@ export async function ensureSpatialExtension(
   }
 }
 
+let h3ExtensionPromise: Promise<void> | null = null;
+
+/**
+ * Install and load the DuckDB `h3` community extension once per database
+ * instance. Mirrors {@link ensureSpatialExtension}: memoized as a promise so
+ * concurrent callers share one INSTALL/LOAD, and cleared on failure so a later
+ * call can retry. `h3` is published for the bundled DuckDB version (v1.5.1) on
+ * all WASM platforms.
+ */
+export async function ensureH3Extension(
+  connection: duckdb.AsyncDuckDBConnection,
+): Promise<void> {
+  h3ExtensionPromise ??= (async () => {
+    // Unlike `ensureSpatialExtension`, no `beforeLoad` warm-up is needed here:
+    // the duckdb-wasm v1.33.1-dev45 remote-read bug only affects `spatial`. If a
+    // similar issue ever surfaces for `h3`, add a `beforeLoad` hook to match.
+    await connection.query("INSTALL h3 FROM community");
+    await connection.query("LOAD h3");
+  })();
+  try {
+    await h3ExtensionPromise;
+  } catch (error) {
+    h3ExtensionPromise = null;
+    throw error;
+  }
+}
+
 async function createDatabase(): Promise<duckdb.AsyncDuckDB> {
   const bundle = await duckdb.selectBundle(MANUAL_BUNDLES);
   const worker = new Worker(bundle.mainWorker!, { type: "module" });
@@ -114,14 +172,6 @@ async function createDatabase(): Promise<duckdb.AsyncDuckDB> {
   return db;
 }
 
-export function quoteSqlString(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
-}
-
-export function quoteIdentifier(value: string): string {
-  return `"${value.replaceAll('"', '""')}"`;
-}
-
 function exportBaseName(): string {
   const suffix = Math.random().toString(36).slice(2);
   return `__geolibre_export_${Date.now()}_${suffix}`;
@@ -133,17 +183,27 @@ export function rowsFromResult(result: { toArray: () => DuckDbRow[] }) {
   );
 }
 
-// DuckDB Spatial reports CRS-annotated geometry types such as
-// GEOMETRY('EPSG:4326'), so match on the prefix rather than equality.
-export function isGeometryColumnType(columnType: unknown): boolean {
-  return (
-    typeof columnType === "string" &&
-    columnType.toUpperCase().startsWith("GEOMETRY")
-  );
-}
-
 function isParquetExtension(extension: string): boolean {
   return extension === "parquet" || extension === "geoparquet";
+}
+
+/**
+ * Register a vector file (and any siblings) as DuckDB file buffers, repairing
+ * GeoPackages that lack `gpkg_ogr_contents` first so `ST_Read` does not crash on
+ * the single-threaded WASM build. See `gpkg-ogr-contents.ts` and issue #258.
+ */
+async function registerVectorFileBuffers(
+  db: duckdb.AsyncDuckDB,
+  file: DuckDbVectorFile,
+): Promise<void> {
+  const data =
+    file.extension === "gpkg"
+      ? await ensureGpkgFeatureCount(file.data)
+      : file.data;
+  await db.registerFileBuffer(file.name, data);
+  for (const sibling of file.siblingFiles ?? []) {
+    await db.registerFileBuffer(sibling.name, sibling.data);
+  }
 }
 
 function sourceSql(fileName: string, extension: string): string {
@@ -192,22 +252,6 @@ async function readSourceCrs(
     );
     return null;
   }
-}
-
-function geometryGeoJsonSql(
-  geometryColumn: string,
-  sourceCrs: string | null,
-): string {
-  const geometrySql = quoteIdentifier(geometryColumn);
-  if (!sourceCrs) {
-    return `ST_AsGeoJSON(${geometrySql})`;
-  }
-  // Transform even for EPSG:4326 sources: always_xy=true normalises axis order
-  // to lon/lat, which a no-op EPSG:4326 -> EPSG:4326 transform guarantees for
-  // formats that may store data as lat/lon.
-  return `ST_AsGeoJSON(ST_Transform(${geometrySql}, ${quoteSqlString(
-    sourceCrs,
-  )}, ${quoteSqlString(TARGET_CRS)}, true))`;
 }
 
 function toFeatureCollection(
@@ -259,33 +303,59 @@ function normalizePropertyValue(value: unknown): unknown {
   return value;
 }
 
+/**
+ * Count the rows a source SQL statement would return. DuckDB answers this from
+ * Parquet metadata without a scan and, for `ST_Read` formats, far more cheaply
+ * than the full `SELECT *, ST_AsGeoJSON(...)` materialization, so it is a sound
+ * up-front guard against runaway feature counts.
+ */
+async function countFeatures(
+  connection: duckdb.AsyncDuckDBConnection,
+  sql: string,
+): Promise<number> {
+  const row = rowsFromResult(
+    await connection.query(
+      `SELECT count(*) AS ${quoteIdentifier(FEATURE_COUNT_COLUMN)} FROM (${sql}) AS data`,
+    ),
+  )[0];
+  const raw = row?.[FEATURE_COUNT_COLUMN];
+  return typeof raw === "bigint" ? Number(raw) : Number(raw ?? 0);
+}
+
 export async function loadDuckDbVectorFile(
   file: DuckDbVectorFile,
+  options: DuckDbVectorLoadOptions = {},
 ): Promise<FeatureCollection> {
   const db = await getDatabase();
   const connection = await db.connect();
 
   try {
-    await db.registerFileBuffer(file.name, file.data);
-    for (const sibling of file.siblingFiles ?? []) {
-      await db.registerFileBuffer(sibling.name, sibling.data);
-    }
+    await registerVectorFileBuffers(db, file);
     await ensureSpatialExtension(connection);
 
     const sql = sourceSql(file.name, file.extension);
     const description = rowsFromResult(
       await connection.query(`DESCRIBE ${sql}`),
     );
-    const geometryColumn = description.find((row) =>
-      isGeometryColumnType(row.column_type),
-    )?.column_name;
+    const detected = detectGeometryColumn(description);
 
-    if (typeof geometryColumn !== "string") {
-      throw new Error("DuckDB did not find a GEOMETRY column in this file.");
+    if (!detected) {
+      throw new Error("DuckDB did not find a geometry column in this file.");
+    }
+
+    // Guard against very large files before the expensive GeoJSON
+    // materialization. Only counted when a callback is attached, so the
+    // common (non-interactive) path stays single-pass.
+    if (options.onLargeDataset) {
+      const featureCount = await countFeatures(connection, sql);
+      await confirmLargeDataset({ name: file.name, featureCount }, options.onLargeDataset);
     }
 
     const sourceCrs = await readSourceCrs(connection, file);
-    const geometryJsonSql = geometryGeoJsonSql(geometryColumn, sourceCrs);
+    const geometryJsonSql = geometryGeoJsonSql(
+      geometryExpr(detected),
+      sourceCrs,
+    );
     const result = await connection.query(
       `SELECT *, ${geometryJsonSql} AS ${quoteIdentifier(
         GEOMETRY_JSON_COLUMN,
@@ -296,6 +366,87 @@ export async function loadDuckDbVectorFile(
     return toFeatureCollection(rowsFromResult(result)) as FeatureCollection;
   } finally {
     await connection.close();
+  }
+}
+
+// Monotonic suffix so concurrent reprojections register distinct DuckDB files.
+let reprojectionSeq = 0;
+
+/**
+ * Resolve the EPSG source CRS declared by a legacy GeoJSON ``crs`` member.
+ *
+ * Handles the common forms (``urn:ogc:def:crs:EPSG::3857``, ``EPSG:3857``) and
+ * treats WGS84 variants (``EPSG:4326``, OGC ``CRS84``) as "no reprojection
+ * needed" by returning null.
+ *
+ * @param fc The FeatureCollection that may carry a ``crs`` member.
+ * @returns An ``EPSG:<code>`` string to reproject from, or null when the member
+ *   is absent, unparseable, or already WGS84.
+ */
+function sourceCrsFromGeoJson(fc: FeatureCollection): string | null {
+  const name = (fc as { crs?: { properties?: { name?: unknown } } }).crs
+    ?.properties?.name;
+  if (typeof name !== "string") return null;
+  const upper = name.toUpperCase();
+  // CRS84 and EPSG:4326 are both WGS84 lon/lat; no reprojection is required.
+  if (upper.includes("CRS84") || /EPSG:+4326\b/.test(upper)) return null;
+  const match = upper.match(/EPSG:+(\d+)/);
+  return match ? `EPSG:${match[1]}` : null;
+}
+
+/**
+ * Reproject a FeatureCollection to WGS84 (EPSG:4326) when it declares a
+ * non-WGS84 CRS via a legacy GeoJSON ``crs`` member.
+ *
+ * The AI segmentation backend (samgeo-api) returns polygons in the source
+ * raster's CRS (e.g. EPSG:3857 in metres) tagged with a ``crs`` member, but
+ * MapLibre and the store expect WGS84 lon/lat, so the raw coordinates trip
+ * MapLibre's "Invalid LngLat latitude" guard. Reprojection reuses the bundled
+ * DuckDB-WASM Spatial engine (PROJ) so any EPSG code is handled. A collection
+ * with no CRS member (or one already in WGS84) is returned unchanged, with the
+ * deprecated ``crs`` member stripped either way.
+ *
+ * @param fc The FeatureCollection to reproject.
+ * @returns A WGS84 FeatureCollection without a ``crs`` member.
+ */
+export async function reprojectFeatureCollectionToWgs84(
+  fc: FeatureCollection,
+): Promise<FeatureCollection> {
+  const sourceCrs = sourceCrsFromGeoJson(fc);
+  const { crs: _deprecatedCrs, ...stripped } = fc as FeatureCollection & {
+    crs?: unknown;
+  };
+  if (!sourceCrs) return stripped as FeatureCollection;
+
+  const db = await getDatabase();
+  const connection = await db.connect();
+  const sourceFile = `geolibre-reproject-${(reprojectionSeq += 1)}.geojson`;
+  try {
+    await db.registerFileText(sourceFile, JSON.stringify(fc));
+    await ensureSpatialExtension(connection);
+
+    const sql = `SELECT * FROM ST_Read(${quoteSqlString(sourceFile)})`;
+    const description = rowsFromResult(
+      await connection.query(`DESCRIBE ${sql}`),
+    );
+    const detected = detectGeometryColumn(description);
+    if (!detected) {
+      // No geometry to reproject; hand back the stripped collection untouched.
+      return stripped as FeatureCollection;
+    }
+
+    // Pass the CRS parsed from the `crs` member explicitly rather than relying
+    // on ST_Read_Meta, which does not surface a legacy GeoJSON CRS member.
+    const geometryJsonSql = geometryGeoJsonSql(geometryExpr(detected), sourceCrs);
+    const result = await connection.query(
+      `SELECT *, ${geometryJsonSql} AS ${quoteIdentifier(
+        GEOMETRY_JSON_COLUMN,
+      )} FROM (${sql}) AS data`,
+    );
+    return toFeatureCollection(rowsFromResult(result)) as FeatureCollection;
+  } finally {
+    await connection.close();
+    await dropFilesIfPresent(db, [sourceFile]);
   }
 }
 
@@ -349,10 +500,6 @@ const GEOPARQUET_COMPRESSIONS = new Set([
 const DEFAULT_GEOPARQUET_COMPRESSION = "zstd";
 const DEFAULT_GEOPARQUET_ROW_GROUP_SIZE = 30000;
 
-// Well-known WKB geometry column names used when a plain Parquet input lacks
-// a GEOMETRY-typed column. Mirrors the sidecar's vector conversion fallback.
-const WKB_GEOMETRY_COLUMN_NAMES = new Set(["geometry", "geom", "wkb_geometry"]);
-
 /**
  * Convert an in-memory vector file to a Hilbert-sorted, compressed GeoParquet
  * entirely inside DuckDB-WASM. Rows are ordered by ST_Hilbert over the
@@ -384,10 +531,7 @@ export async function convertDuckDbVectorToGeoParquet(
   ];
 
   try {
-    await db.registerFileBuffer(file.name, file.data);
-    for (const sibling of file.siblingFiles ?? []) {
-      await db.registerFileBuffer(sibling.name, sibling.data);
-    }
+    await registerVectorFileBuffers(db, file);
     await ensureSpatialExtension(connection);
 
     let geometryColumn: string;
@@ -406,28 +550,17 @@ export async function convertDuckDbVectorToGeoParquet(
       const description = rowsFromResult(
         await connection.query(`DESCRIBE ${sql}`),
       );
-      let detected = description.find((row) =>
-        isGeometryColumnType(row.column_type),
-      )?.column_name;
-      let geometryIsNative = true;
-      if (typeof detected !== "string") {
-        // Plain Parquet files may carry geometry as a WKB blob; rebuild it as a
-        // GEOMETRY column so ST_Hilbert and the GeoParquet writer can use it.
-        detected = description.find(
-          (row) =>
-            typeof row.column_name === "string" &&
-            WKB_GEOMETRY_COLUMN_NAMES.has(row.column_name.toLowerCase()),
-        )?.column_name as string | undefined;
-        geometryIsNative = false;
-      }
-      if (typeof detected !== "string") {
+      const detected = detectGeometryColumn(description);
+      if (!detected) {
         throw new Error("DuckDB did not find a geometry column in this file.");
       }
-      geometryColumn = detected;
+      geometryColumn = detected.column;
       const geometrySql = quoteIdentifier(geometryColumn);
-      source = geometryIsNative
-        ? sql
-        : `SELECT * REPLACE (ST_GeomFromWKB(${geometrySql}) AS ${geometrySql}) FROM (${sql}) AS data`;
+      // Plain Parquet files may carry geometry as a WKB blob; rebuild it as a
+      // GEOMETRY column so ST_Hilbert and the GeoParquet writer can use it.
+      source = detected.isWkb
+        ? `SELECT * REPLACE (ST_GeomFromWKB(${geometrySql}) AS ${geometrySql}) FROM (${sql}) AS data`
+        : sql;
     }
 
     const geometrySql = quoteIdentifier(geometryColumn);

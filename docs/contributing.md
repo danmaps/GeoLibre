@@ -70,7 +70,6 @@ packages/plugins        # Plugin API and built-in plugins
 packages/processing     # Client-side algorithm registry
 workers/viewer          # Cloudflare viewer worker (geolibre-viewer-worker)
 backend/geolibre_server # Optional FastAPI conversion sidecar (Python)
-sample-data/            # Sample GeoJSON and an example project
 docs/                   # This documentation site (MkDocs)
 ```
 
@@ -127,6 +126,16 @@ npm run ci
 You only need the toolchains for the areas you touched. A docs-only or
 frontend-only change does not require Rust or Python, though the full `npm run
 ci` gate does.
+
+### End-to-end smoke tests
+
+`npm run test:e2e` runs the Playwright smoke suite in `e2e/` against the built
+web app (it builds, serves it with `vite preview`, and drives a headless
+Chromium). It is a render-path guardrail — it loads a GeoJSON layer, opens the
+attribute table, toggles visibility, and runs an accessibility check — not
+exhaustive coverage. Install the browser once with `npx playwright install
+chromium`. The suite runs as a separate `E2E smoke (Playwright)` job in CI and
+uploads its report as an artifact on failure.
 
 ### Coding conventions
 

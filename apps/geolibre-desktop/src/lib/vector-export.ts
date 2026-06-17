@@ -62,6 +62,10 @@ function exportFormatLabel(format: BinaryVectorExportFormat): string {
   switch (format) {
     case "geoparquet":
       return "GeoParquet";
+    case "geopackage":
+      return "GeoPackage";
+    case "shapefile":
+      return "Shapefile (zipped)";
   }
 }
 
@@ -69,6 +73,10 @@ function exportFileExtension(format: BinaryVectorExportFormat): string {
   switch (format) {
     case "geoparquet":
       return "parquet";
+    case "geopackage":
+      return "gpkg";
+    case "shapefile":
+      return "zip";
   }
 }
 
@@ -76,7 +84,106 @@ function exportMimeType(format: BinaryVectorExportFormat): string {
   switch (format) {
     case "geoparquet":
       return "application/vnd.apache.parquet";
+    case "geopackage":
+      return "application/geopackage+sqlite3";
+    case "shapefile":
+      return "application/zip";
   }
+}
+
+// Shapefile holds one geometry family per file. Mirror the writer's grouping so
+// the warning matches what actually happens on export.
+type ShapefileFamily = "point" | "line" | "polygon";
+
+function shapefileFamily(type: string): ShapefileFamily | null {
+  switch (type) {
+    case "Point":
+    case "MultiPoint":
+      return "point";
+    case "LineString":
+    case "MultiLineString":
+      return "line";
+    case "Polygon":
+    case "MultiPolygon":
+      return "polygon";
+    default:
+      return null;
+  }
+}
+
+/**
+ * Field-name limitations the Shapefile format will silently apply on export.
+ * Returns a human-readable warning for any attribute name longer than 10
+ * characters (which DBF truncates), for truncations that collide into the same
+ * name, and when the layer mixes geometry types (extra families are dropped to
+ * Null shapes). Empty when the layer is fully Shapefile-safe.
+ */
+export function shapefileFieldWarnings(geojson: FeatureCollection): string[] {
+  const names = new Set<string>();
+  for (const feature of geojson.features) {
+    for (const key of Object.keys(feature.properties ?? {})) {
+      names.add(key);
+    }
+  }
+
+  const fieldNames = Array.from(names);
+  const longNames = fieldNames.filter((name) => name.length > 10);
+  const warnings: string[] = [];
+  if (longNames.length > 0) {
+    warnings.push(
+      `Shapefile truncates field names to 10 characters: ${longNames.join(", ")}`,
+    );
+  }
+
+  // Normalise non-alphanumerics to "_" before truncating, exactly as the DBF
+  // writer does, so collisions caused by character replacement are detected.
+  const byTruncated = new Map<string, string[]>();
+  for (const name of fieldNames) {
+    const key = name.replace(/[^0-9A-Za-z_]/g, "_").slice(0, 10).toLowerCase();
+    byTruncated.set(key, [...(byTruncated.get(key) ?? []), name]);
+  }
+  const collisions = Array.from(byTruncated.values()).filter(
+    (group) => group.length > 1,
+  );
+  if (collisions.length > 0) {
+    warnings.push(
+      `Truncating to 10 characters produces duplicate field names: ${collisions
+        .map((group) => group.join(", "))
+        .join("; ")}`,
+    );
+  }
+
+  // The writer locks the file to the first geometry's family; mixed or null
+  // geometries become attribute-only Null shapes, which is silent data loss.
+  let fileFamily: ShapefileFamily | null = null;
+  for (const feature of geojson.features) {
+    const family = feature.geometry
+      ? shapefileFamily(feature.geometry.type)
+      : null;
+    if (family) {
+      fileFamily = family;
+      break;
+    }
+  }
+  // Count only features that carry a geometry of a different family; null
+  // geometries have nothing to lose and are not flagged.
+  let demoted = 0;
+  if (fileFamily !== null) {
+    for (const feature of geojson.features) {
+      const family = feature.geometry
+        ? shapefileFamily(feature.geometry.type)
+        : null;
+      if (family && family !== fileFamily) demoted += 1;
+    }
+  }
+  if (fileFamily !== null && demoted > 0) {
+    warnings.push(
+      `${demoted} feature(s) whose geometry differs from the ${fileFamily} ` +
+        "type will be written without geometry (Shapefile allows one geometry " +
+        "type per file).",
+    );
+  }
+  return warnings;
 }
 
 async function exportTextLayer(

@@ -126,7 +126,7 @@
 - [x] Cross-platform installers
 - [x] Documentation and tutorials
 
-## v1.1: Vector styling, attribute table management, and atmosphere effects (current)
+## v1.1: Vector styling, attribute table management, and atmosphere effects
 
 - [x] In-browser GeoPandas engine for the Vector tools via Pyodide (no server, same results as the optional sidecar)
 - [x] Host deck.gl exposed to external plugins via `app.getDeckGL()`, so plugins render on the shared instance instead of bundling their own copy
@@ -139,6 +139,83 @@
 - [x] conda-forge install instructions and a video tutorial in the documentation
 - [x] MIT license
 - [x] CSP allowance for `cdn.jsdelivr.net` so DuckDB-WASM loads its bundles in the browser build
+
+## v1.2: New data sources, attribute analytics, routing, and platform polish
+
+- [x] OpenStreetMap PBF file loading parsed in-browser with osmix
+- [x] Cloud-Optimized NetCDF/HDF layers loaded via kerchunk references
+- [x] Authenticated 3D Tiles tilesets via custom request headers
+- [x] Georeferenced video overlay layers
+- [x] Deck.gl Layer builder for composing deck.gl overlays from uploaded files and remote URLs
+- [x] In-browser PostGIS SQL engine via PGlite, alongside the DuckDB Spatial SQL Workspace
+- [x] Attribute table add-field and field-calculator tools
+- [x] Attribute table Charts panel (histogram, scatter, bar, line, box)
+- [x] Spatial join added to the Vector tools
+- [x] Select by value and Select by location tools
+- [x] H3 tools to create hexagonal grids and bin points into H3 cells
+- [x] Point heatmap renderer and clustering, including for Add Vector Layer point layers
+- [x] Directions plugin for interactive routing via `maplibre-gl-directions`, with a one-time privacy notice before enabling it
+- [x] Undo/redo for layer and style operations
+- [x] Command palette (`Ctrl`/`Cmd` + `K`) and global keyboard shortcuts with a `?` cheat sheet
+- [x] Print layout composer with PNG and PDF export
+- [x] Installable, offline-capable Progressive Web App (PWA) build
+- [x] Internationalization framework (react-i18next) with extracted string catalogs and a `?locale`/`?lang` embed language parameter
+- [x] Accessibility pass with axe checks across key screens
+- [x] App, section, and plugin React error boundaries
+- [x] Playwright end-to-end smoke tests and a CI job
+- [x] Expanded Python `Map` API covering more Add Data layer types
+- [x] CDN-loaded PGlite/PostGIS to shrink the Jupyter wheel and the desktop binary
+
+## v1.3: Analysis depth, real-time collaboration, story maps, scripting, and an AI assistant (current)
+
+### Processing and analysis
+
+- [x] Spatial Statistics toolbox under Processing
+- [x] Vector tools: Smooth, Regular grid, and Voronoi/Delaunay
+- [x] IDW / kriging interpolation (point layer → continuous raster surface)
+- [x] Attribute (table) join vector tool, joining a table's fields by a matching key
+- [x] Raster analysis tools: zonal statistics, raster calculator, reclassify, mosaic, and focal statistics
+- [x] Client-side raster processing fallback that runs in the browser when the Python sidecar is unavailable
+- [x] Single-band pseudocolor with classification and RGB band combination for raster styling
+- [x] Batch run and model/pipeline chaining for processing tools
+- [x] Network analysis: isochrones, service areas, and origin–destination cost matrices
+
+### Data, layers, and export
+
+- [x] Collapsible layer groups/folders in the layer panel
+- [x] glTF/GLB 3D model layers placed at coordinates
+- [x] Client-side vector tiling for large local vector layers
+- [x] Warning before loading very large vector files
+- [x] Transparent rewrite of public S3, GCS, and Azure cloud-storage URLs in SQL queries
+- [x] Shapefile and GeoPackage export
+- [x] Apache Sedona as an additional SQL Workspace engine
+- [x] Batch geocoding and reverse geocoding tools, with a multi-provider geocoding abstraction
+
+### Collaboration, story maps, and sharing
+
+- [x] Real-time multi-user collaboration (MVP) backed by a Cloudflare Worker
+- [x] Scroll-driven story map builder, presenter, and standalone HTML export
+- [x] User-editable legend for the print layout
+- [x] Field statistics summary panel in the attribute table
+
+### AI and scripting
+
+- [x] AI Segmentation toolbox via [segment-geospatial](https://github.com/opengeos/segment-geospatial) (SamGeo) and Meta's SAM 3, proxied through the sidecar to a separate `samgeo-api` model server
+- [x] Natural-language GIS assistant (Strands agent) that turns plain-English requests into auditable, undoable GeoLibre operations
+- [x] Python automation API and an in-app Python Console
+- [x] Python package: local raster, marker/cluster, and choropleth APIs; `split_map`, `add_legend`, and `add_colorbar` helpers; typed read-back of selected/drawn features; and `to_html` export
+
+### Mobile, offline, and Android
+
+- [x] Native Android app from the same codebase via Tauri v2 mobile, with a CI workflow that builds signed, per-ABI release APKs (~40 MB) — see [Android](android.md)
+- [x] `isMobile()` feature-gating that hides desktop-process tools (Whitebox, Raster, Conversion, AI Segmentation, PostgreSQL/Martin) on Android so nothing is shown that cannot run
+- [x] Responsive, touch-friendly mobile layout: Layers/Style panels overlay the map as slide-over sheets on phones, pointer-event (touch) panel resizing, and safe-area insets so the toolbar clears the system status bar
+- [x] Download Offline Area tool that pre-caches the current map view's basemap tiles into the service-worker cache
+- [x] Service-worker caching of the CDN-loaded Pyodide and PGlite/PostGIS engines so browser SQL and Python keep working offline after first use
+
+### Packaging
+
+- [x] Homebrew Cask packaging for macOS
 
 ## Plugin marketplace and registry (design)
 

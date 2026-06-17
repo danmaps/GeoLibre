@@ -2,11 +2,17 @@ import { isAllowedPluginManifestUrl } from "@geolibre/core";
 import { useEffect } from "react";
 import { create } from "zustand";
 import { normalizeStringList } from "../lib/string-lists";
-
-const DESKTOP_SETTINGS_STORAGE_KEY = "geolibre.desktopSettings";
+import { DESKTOP_SETTINGS_STORAGE_KEY } from "../lib/storage-keys";
 
 export interface DesktopSettings {
   additionalPluginDirectories: string[];
+  /**
+   * Persisted UI language code (e.g. `"en"`, `"zh"`). Empty string means "follow
+   * automatic detection" (browser/default). The i18n layer reads this directly
+   * from localStorage on startup; a `?locale`/`?lang` query param overrides it
+   * for embeds. See `src/i18n/index.ts`.
+   */
+  language: string;
   layout: DesktopLayoutSettings;
   pluginManifestUrls: string[];
   /**
@@ -22,7 +28,6 @@ export interface DesktopSettings {
 }
 
 export interface DesktopLayoutSettings {
-  attributePanelVisible: boolean;
   layerPanelVisible: boolean;
   showProjectInfo: boolean;
   stylePanelVisible: boolean;
@@ -35,7 +40,6 @@ interface DesktopSettingsState {
 }
 
 export const DEFAULT_DESKTOP_LAYOUT_SETTINGS: DesktopLayoutSettings = {
-  attributePanelVisible: true,
   layerPanelVisible: true,
   showProjectInfo: true,
   stylePanelVisible: true,
@@ -44,6 +48,7 @@ export const DEFAULT_DESKTOP_LAYOUT_SETTINGS: DesktopLayoutSettings = {
 
 const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   additionalPluginDirectories: [],
+  language: "",
   layout: DEFAULT_DESKTOP_LAYOUT_SETTINGS,
   pluginManifestUrls: [],
   shareToken: "",
@@ -59,6 +64,8 @@ function normalizeDesktopSettings(settings: unknown): DesktopSettings {
     additionalPluginDirectories: normalizeStringList(
       candidate.additionalPluginDirectories,
     ),
+    language:
+      typeof candidate.language === "string" ? candidate.language.trim() : "",
     layout: normalizeDesktopLayoutSettings(candidate.layout),
     // Apply the same scheme rule as project-file loading so stale or edited
     // localStorage values cannot smuggle in disallowed URL schemes.
@@ -81,10 +88,6 @@ function normalizeDesktopLayoutSettings(
   // cannot smuggle non-boolean values into the layout settings.
   const candidate = layout as Partial<DesktopLayoutSettings>;
   return {
-    attributePanelVisible:
-      typeof candidate.attributePanelVisible === "boolean"
-        ? candidate.attributePanelVisible
-        : DEFAULT_DESKTOP_LAYOUT_SETTINGS.attributePanelVisible,
     layerPanelVisible:
       typeof candidate.layerPanelVisible === "boolean"
         ? candidate.layerPanelVisible

@@ -20,6 +20,7 @@ import {
   Play,
 } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   exportBinaryVectorLayer,
   type BinaryVectorExportResult,
@@ -31,9 +32,33 @@ import {
   SAMPLE_DATASET_URL,
   type SqlQueryResult,
 } from "../../lib/sql-workspace";
+import { runPostgisQuery } from "../../lib/pglite-workspace";
+import { runSedonaQuery } from "../../lib/sedona-workspace";
 import { saveBinaryFileWithFallback } from "../../lib/tauri-io";
 
 const CSV_MIME_TYPE = "text/csv";
+
+/** SQL engine backing the workspace. */
+type SqlEngine = "duckdb" | "postgis" | "sedona";
+
+const ENGINE_STORAGE_KEY = "geolibre.sqlWorkspace.engine";
+
+/** Load the last-used engine from localStorage, defaulting to DuckDB. */
+function loadEngine(): SqlEngine {
+  if (typeof window === "undefined") return "duckdb";
+  const stored = window.localStorage.getItem(ENGINE_STORAGE_KEY);
+  return stored === "postgis" || stored === "sedona" ? stored : "duckdb";
+}
+
+/** Persist the chosen engine; ignore storage failures (quota/privacy mode). */
+function saveEngine(engine: SqlEngine): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(ENGINE_STORAGE_KEY, engine);
+  } catch {
+    // Best-effort persistence only.
+  }
+}
 
 // Cap how many result rows are rendered so a large result set cannot freeze the
 // UI; the full result is still used for export and add-as-layer.
@@ -71,6 +96,73 @@ const SAMPLE_QUERIES: ReadonlyArray<{ label: string; sql: string }> = [
   },
 ];
 
+// PostGIS examples. PGlite cannot read remote files, so these target registered
+// layer tables (replace `your_layer` with a name from "Queryable layers") plus a
+// couple of table-free spatial constructors. Every table query uses the `geom`
+// column the workspace creates on each registered layer.
+const POSTGIS_SAMPLE_QUERIES: ReadonlyArray<{ label: string; sql: string }> = [
+  {
+    label: "PostGIS version",
+    sql: "SELECT PostGIS_Full_Version() AS version;",
+  },
+  {
+    label: "Make a point (geometry)",
+    sql: "SELECT ST_SetSRID(ST_MakePoint(-115.1398, 36.1699), 4326) AS geom;",
+  },
+  {
+    label: "First rows of a layer",
+    sql: `SELECT *\nFROM your_layer\nLIMIT 10;`,
+  },
+  {
+    label: "Feature count",
+    sql: `SELECT COUNT(*) AS features\nFROM your_layer;`,
+  },
+  {
+    label: "Centroids of a layer (spatial)",
+    sql: `SELECT ST_Centroid(geom) AS geom\nFROM your_layer;`,
+  },
+  {
+    label: "Buffer features by 0.01 deg (spatial)",
+    sql: `SELECT ST_Buffer(geom, 0.01) AS geom\nFROM your_layer;`,
+  },
+  {
+    label: "Bounding box of a layer (spatial)",
+    sql: `SELECT ST_Envelope(ST_Collect(geom)) AS geom\nFROM your_layer;`,
+  },
+];
+
+// Apache Sedona examples. Both backends (the in-browser CereusDB WASM engine and
+// the SedonaDB sidecar) register loaded layers as tables, so these target a
+// layer table (replace `your_layer` with a name from "Queryable layers") plus a
+// couple of table-free spatial constructors. Each table query uses the `geom`
+// alias for the geometry column the workspace creates on each registered layer.
+const SEDONA_SAMPLE_QUERIES: ReadonlyArray<{ label: string; sql: string }> = [
+  {
+    label: "Make a point (geometry)",
+    sql: "SELECT ST_Point(-115.1398, 36.1699) AS geom;",
+  },
+  {
+    label: "Buffer a point (spatial)",
+    sql: "SELECT ST_Buffer(ST_Point(-115.1398, 36.1699), 0.5) AS geom;",
+  },
+  {
+    label: "First rows of a layer",
+    sql: `SELECT *\nFROM your_layer\nLIMIT 10;`,
+  },
+  {
+    label: "Feature count",
+    sql: `SELECT COUNT(*) AS features\nFROM your_layer;`,
+  },
+  {
+    label: "Centroids of a layer (spatial)",
+    sql: `SELECT ST_Centroid(geometry) AS geom\nFROM your_layer;`,
+  },
+  {
+    label: "Area of each feature (spatial)",
+    sql: `SELECT ST_Area(geometry) AS area, geometry AS geom\nFROM your_layer\nORDER BY area DESC\nLIMIT 10;`,
+  },
+];
+
 /** Build a starter query that selects the first rows of a layer table. */
 function sampleQueryForTable(tableName: string): string {
   // Quote the identifier so the generated query stays valid even if the table
@@ -90,8 +182,8 @@ function loadQueryHistory(): string[] {
     );
     return Array.isArray(parsed)
       ? parsed
-          .filter((entry): entry is string => typeof entry === "string")
-          .slice(0, MAX_HISTORY_ENTRIES)
+        .filter((entry): entry is string => typeof entry === "string")
+        .slice(0, MAX_HISTORY_ENTRIES)
       : [];
   } catch {
     return [];
@@ -141,6 +233,9 @@ export function SqlWorkspaceDialog() {
   const layers = useAppStore((s) => s.layers);
   const addGeoJsonLayer = useAppStore((s) => s.addGeoJsonLayer);
 
+  const { t } = useTranslation();
+
+  const [engine, setEngine] = useState<SqlEngine>(loadEngine);
   const [sql, setSql] = useState(SAMPLE_QUERY);
   const [running, setRunning] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -151,6 +246,14 @@ export function SqlWorkspaceDialog() {
   const [layerName, setLayerName] = useState("");
 
   const tables = useMemo(() => previewLayerTables(layers), [layers]);
+  const sampleQueries =
+    engine === "postgis"
+      ? POSTGIS_SAMPLE_QUERIES
+      : engine === "sedona"
+        ? SEDONA_SAMPLE_QUERIES
+        : SAMPLE_QUERIES;
+  // DuckDB can read files/URLs directly; PostGIS and Sedona query loaded layers.
+  const queriesLayersOnly = engine === "postgis" || engine === "sedona";
 
   // `running` state lags a render behind, so a rapid second Ctrl+Enter could
   // read the stale `false` and fire a concurrent query. A ref is updated
@@ -172,7 +275,12 @@ export function SqlWorkspaceDialog() {
     setError(null);
     setNotice(null);
     try {
-      const queryResult = await runSqlQuery(trimmed, layers);
+      const queryResult =
+        engine === "postgis"
+          ? await runPostgisQuery(trimmed, layers)
+          : engine === "sedona"
+            ? await runSedonaQuery(trimmed, layers)
+            : await runSqlQuery(trimmed, layers);
       setResult(queryResult);
     } catch (err) {
       setResult(null);
@@ -274,10 +382,13 @@ export function SqlWorkspaceDialog() {
     <Dialog open={open} onOpenChange={setSqlWorkspaceOpen}>
       <DialogContent className="max-w-4xl">
         <DialogHeader>
-          <DialogTitle>SQL Workspace</DialogTitle>
+          <DialogTitle>{t("toolbar.command.sqlWorkspace")}</DialogTitle>
           <DialogDescription>
-            Run DuckDB SQL against loaded layers, files, and URLs. The spatial
-            extension is loaded, so {"ST_*"} functions are available.
+            {engine === "postgis"
+              ? t("toolbar.sqlWorkspace.description.postgis")
+              : engine === "sedona"
+                ? t("toolbar.sqlWorkspace.description.sedona")
+                : t("toolbar.sqlWorkspace.description.duckdb")}
           </DialogDescription>
         </DialogHeader>
 
@@ -295,6 +406,11 @@ export function SqlWorkspaceDialog() {
                   </span>
                 ))}
               </p>
+            ) : queriesLayersOnly ? (
+              <p className="text-xs text-muted-foreground">
+                No vector layers are loaded as tables yet. Load a vector layer to
+                query it with {engine === "sedona" ? "Apache Sedona" : "PostGIS"}.
+              </p>
             ) : (
               <p className="text-xs text-muted-foreground">
                 No vector layers are loaded as tables yet. You can still read
@@ -303,6 +419,26 @@ export function SqlWorkspaceDialog() {
               </p>
             )}
             <div className="ml-auto flex items-center gap-2">
+              <Select
+                aria-label="SQL engine"
+                className="h-8 w-auto text-xs"
+                value={engine}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  const next: SqlEngine =
+                    value === "postgis"
+                      ? "postgis"
+                      : value === "sedona"
+                        ? "sedona"
+                        : "duckdb";
+                  setEngine(next);
+                  saveEngine(next);
+                }}
+              >
+                <option value="duckdb">Engine: DuckDB</option>
+                <option value="postgis">Engine: PostGIS</option>
+                <option value="sedona">Engine: Apache Sedona</option>
+              </Select>
               {history.length > 0 ? (
                 <Select
                   aria-label="Reuse a query from history"
@@ -329,14 +465,14 @@ export function SqlWorkspaceDialog() {
                 value=""
                 onChange={(event) => {
                   const index = Number(event.target.value);
-                  const sample = SAMPLE_QUERIES[index];
+                  const sample = sampleQueries[index];
                   if (sample) setSql(sample.sql);
                 }}
               >
                 <option value="" disabled>
                   Sample queries…
                 </option>
-                {SAMPLE_QUERIES.map((sample, index) => (
+                {sampleQueries.map((sample, index) => (
                   <option key={sample.label} value={index}>
                     {sample.label}
                   </option>

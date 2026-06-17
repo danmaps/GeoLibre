@@ -84,6 +84,25 @@ bundled Docker image), set `GEOLIBRE_CONVERSION_ROOTS` so conversions cannot
 read or overwrite arbitrary filesystem paths. It is unset by default for the
 desktop app, where paths are the user's own filesystem.
 
+## Spatial SQL runtime (Apache Sedona)
+
+The **Apache Sedona** engine of the SQL Workspace runs Sedona spatial SQL on
+[SedonaDB](https://sedona.apache.org/sedonadb/) (the single-node Rust engine)
+through the `/sql` endpoints. It is an optional extra:
+
+```bash
+pip install -e ".[sedona]"   # apache-sedona[db] + geopandas + shapely
+geolibre-server
+```
+
+The sidecar reports availability through `/sql/status`. When the extra is **not**
+installed (or the sidecar is not running), the SQL Workspace falls back to the
+in-browser [CereusDB](https://github.com/tobilg/cereusdb) engine — a WebAssembly
+build of SedonaDB — so the Apache Sedona engine works with **no sidecar** too.
+`/sql/run` registers each posted layer as a named view, runs one statement, and
+returns rows (geometry as WKT) plus a GeoJSON FeatureCollection when the result
+has a geometry column.
+
 ## Endpoints
 
 | Method | Path | Description |
@@ -98,16 +117,54 @@ desktop app, where paths are the user's own filesystem.
 | POST | `/conversion/vector-to-pmtiles` | Vector → PMTiles (freestiler) |
 | POST | `/conversion/raster-to-cog` | Raster → Cloud Optimized GeoTIFF |
 | GET | `/conversion/jobs/{id}` | Conversion job status |
+| GET | `/sql/status` | Spatial SQL (SedonaDB) availability |
+| POST | `/sql/run` | Run Sedona spatial SQL over registered layers |
+| GET | `/ml/status` | Segmentation backend availability + models |
+| POST | `/ml/segment/text` | Text-prompt segmentation (SAM 3) |
+| POST | `/ml/segment/automatic` | Automatic mask generation |
+| POST | `/ml/segment/predict` | Box/point prompt segmentation |
+
+## AI segmentation runtime (SamGeo / SAM 3)
+
+The `/ml` endpoints back GeoLibre's AI segmentation toolbox. They are a thin
+reverse-proxy in front of a **separate `samgeo-api` server** (the REST server
+shipped with [segment-geospatial](https://github.com/opengeos/segment-geospatial)),
+which runs SAM 3 and returns GeoJSON. The heavy model stack (PyTorch + SAM 3) is
+**not** imported into this sidecar; install and run it on its own (ideally on a
+GPU host):
+
+```bash
+# the model server (in an env with a working PyTorch build)
+pip install "segment-geospatial[api,samgeo3]"
+# the sidecar's ml extra (just an HTTP client)
+pip install -e ".[ml]"
+```
+
+`samgeo-api` is launched on demand when it is on the `PATH`, otherwise the proxy
+returns `available: false` with an actionable message. The desktop app runs the
+sidecar in a managed (uv) environment that includes the `ml` extra but not
+`segment-geospatial`, so `samgeo-api` is not on its `PATH`; launch the desktop
+app with `GEOLIBRE_ML_SAMGEO_URL` set to an external `samgeo-api` (the spawned
+sidecar inherits the app's environment). Configuration:
+
+| Variable | Purpose |
+|----------|---------|
+| `GEOLIBRE_ML_SAMGEO_URL` | Proxy to an already-running `samgeo-api` (no child process is launched). |
+| `GEOLIBRE_ML_SAMGEO_CMD` | Command to launch `samgeo-api` on demand (default `samgeo-api`). |
+| `GEOLIBRE_ML_DEFAULT_MODEL` | Model the UI defaults to (default `sam3`). |
+
+Each `/ml/segment/*` request takes a multipart `file` plus `model_version`
+(default `sam3`) and `output_format` (default `geojson`).
 
 ## Future stack
 
-The sidecar will integrate (see `docs/roadmap.md` v0.5):
+The sidecar will further integrate (see `docs/roadmap.md`):
 
-- **GDAL / Rasterio** — COG, warping, raster analysis
-- **GeoPandas** — vector ops, reproject, export
-- **DuckDB Spatial** — SQL on cloud-native formats
-- **WhiteboxTools** — terrain & hydrology
 - **Leafmap** — notebook-style geospatial utilities
-- **GeoAI / SamGeo** — ML segmentation workflows
+
+GDAL/Rasterio (raster tools), GeoPandas (vector engine), DuckDB Spatial
+(conversion), WhiteboxTools, Apache Sedona (spatial SQL), and GeoAI/SamGeo
+segmentation now ship as optional extras (`raster`, `vector`, `conversion`,
+`whitebox`, `sedona`, `ml`).
 
 Tauri will bundle the sidecar as an `externalBin` in a later release.

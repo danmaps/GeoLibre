@@ -71,6 +71,11 @@ import type {
   GeoLibrePlugin,
 } from "../types";
 import { ensureMercatorProjection } from "./map-projection-utils";
+import {
+  KerchunkReferenceStore,
+  loadKerchunkReference,
+  type KerchunkRefs,
+} from "./kerchunk-reference-store";
 
 type ControlGridConstructor =
   (typeof import("maplibre-gl-components"))["ControlGrid"];
@@ -1637,6 +1642,92 @@ export function openStacSearchLayerPanel(app: GeoLibreAppAPI): void {
 
 export function openZarrLayerPanel(app: GeoLibreAppAPI): void {
   void openStandaloneZarrControl(app);
+}
+
+/** Options for {@link addCloudNetcdfLayer}. */
+export interface CloudNetcdfLayerOptions {
+  /** URL of the kerchunk reference manifest (JSON) for the NetCDF/HDF file. */
+  url: string;
+  /**
+   * Pre-loaded, normalized reference map. When provided, the manifest is not
+   * fetched again (avoids a second download of a potentially large manifest).
+   */
+  refs?: KerchunkRefs;
+  /** Variable (array) to render. */
+  variable: string;
+  /** Dimension selector for non-spatial dims, e.g. `{ time: 0 }`. */
+  selector?: Record<string, number | string>;
+  /** Color limits `[min, max]`. */
+  clim?: [number, number];
+  /** Colormap (array of hex colors). */
+  colormap?: string[];
+  /** Layer opacity (0-1). */
+  opacity?: number;
+  /** Optional request headers (e.g. for authenticated stores). */
+  headers?: Record<string, string>;
+}
+
+/**
+ * Add a Cloud-Optimized NetCDF/HDF5 layer by rendering it through the shared
+ * Zarr control with a kerchunk reference store. The reference manifest is
+ * fetched and normalized, a {@link KerchunkReferenceStore} resolves each chunk
+ * to an HTTP byte range inside the original file, and the store is handed to
+ * `ZarrLayerControl.addLayer(url, variable, { store })`. The resulting layer is
+ * tracked in the store like any other Zarr layer.
+ *
+ * @param app The GeoLibre app API.
+ * @param options Reference URL, variable, and optional styling/selector.
+ * @throws If the Zarr control cannot be mounted or the reference fails to load.
+ */
+export async function addCloudNetcdfLayer(
+  app: GeoLibreAppAPI,
+  options: CloudNetcdfLayerOptions,
+): Promise<void> {
+  const { ZarrLayerControl: ZarrLayerControlClass } =
+    await getComponentsConstructors();
+
+  zarrControl ??= createZarrControl(ZarrLayerControlClass);
+  if (!zarrControlMounted) {
+    const added = app.addMapControl(zarrControl, zarrControlPosition);
+    if (!added) {
+      zarrControl = null;
+      throw new Error("Could not add the Zarr control to the map.");
+    }
+    zarrControlMounted = true;
+  }
+
+  // The untiled Zarr renderer draws in Web Mercator; switch off globe first
+  // (matching the COG raster flow) so the layer paints.
+  ensureMercatorProjection(app.getMap?.());
+
+  const refs =
+    options.refs ??
+    (await loadKerchunkReference(options.url, { headers: options.headers }));
+  const store = new KerchunkReferenceStore(refs, { headers: options.headers });
+
+  // The control is a module-level singleton and may have been torn down (set to
+  // null on plugin deactivation) during the await above.
+  if (!zarrControl) {
+    throw new Error("The Zarr control was removed while loading the reference.");
+  }
+
+  // Success is tracked by the control's "layeradd" event (see createZarrControl),
+  // which adds the layer to the store. We intentionally do not read
+  // getState().error here: the control is shared, so the error may be stale from
+  // a prior operation, and addLayer resolves before async chunk loading finishes.
+  await zarrControl.addLayer(options.url, options.variable, {
+    store,
+    zarrVersion: 2,
+    selector: options.selector,
+    clim: options.clim,
+    colormap: options.colormap,
+    opacity: options.opacity,
+  });
+
+  // Unlike openZarrLayerPanel, the dialog-based flow intentionally leaves the
+  // Zarr control collapsed/hidden: the layer is managed from the layer and
+  // style panels. Users can still open the Zarr panel from the menu to tweak
+  // colormap/clim.
 }
 
 export function openLidarLayerPanel(app: GeoLibreAppAPI): void {

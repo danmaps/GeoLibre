@@ -16,6 +16,7 @@ import {
   onPyodideProgress,
   runVectorToolInPyodide,
 } from "../../lib/pyodide/pyodide-vector-loader";
+import { createDuckDbCapability } from "../../lib/duckdb-processing";
 import {
   Button,
   Dialog,
@@ -23,12 +24,12 @@ import {
   DialogDescription,
   DialogHeader,
   DialogTitle,
-  Input,
   Label,
   ScrollArea,
   Select,
   cn,
 } from "@geolibre/ui";
+import { ParameterField } from "./ParameterField";
 import { Loader2, Play, Server } from "lucide-react";
 import type { FeatureCollection } from "geojson";
 import {
@@ -85,6 +86,9 @@ export function VectorToolsDialog({
     [selectedId],
   );
 
+  // One DuckDB capability per dialog instance; the H3 tools use it via ctx.
+  const duckdb = useMemo(() => createDuckDbCapability(), []);
+
   // When the menu opens the dialog with a specific tool, preselect it.
   useEffect(() => {
     if (openTool) setSelectedId(openTool);
@@ -98,8 +102,43 @@ export function VectorToolsDialog({
     }
     setParams(defaults);
     setLog([]);
-    if (!tool.supportsSidecar) setEngine("client");
+    // Pick the engine that can actually run this tool: sidecar-only tools (e.g.
+    // Reproject, whose client run just defers) default to "sidecar" so Run
+    // produces a result without touching the selector; client-only tools force
+    // "client". requiresSidecar is checked first so it wins even if a tool ever
+    // sets it without supportsSidecar (the JSDoc says it implies supportsSidecar).
+    if (tool.requiresSidecar) setEngine("sidecar");
+    else if (!tool.supportsSidecar) setEngine("client");
   }, [tool]);
+
+  // Prefill the H3 grid's manual bounding-box fields from the current map
+  // viewport when the user first switches to that source, so they can tweak the
+  // box rather than type it from scratch. Only fills empty fields, so it never
+  // clobbers manual edits. Keyed on the source value, not every keystroke.
+  useEffect(() => {
+    if (selectedId !== "h3-grid" || params.source !== "bbox") return;
+    if (
+      params.west !== undefined ||
+      params.south !== undefined ||
+      params.east !== undefined ||
+      params.north !== undefined
+    )
+      return;
+    const map = mapControllerRef.current?.getMap();
+    if (!map) return;
+    const b = map.getBounds();
+    const round = (n: number) => Number(n.toFixed(6));
+    setParams((prev) => ({
+      ...prev,
+      west: round(b.getWest()),
+      south: round(b.getSouth()),
+      east: round(b.getEast()),
+      north: round(b.getNorth()),
+    }));
+    // params.west/south/east/north are read as a one-time guard; re-running only
+    // when the source changes is intentional.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId, params.source, mapControllerRef]);
 
   // Probe the sidecar's vector capability when the dialog opens.
   useEffect(() => {
@@ -127,12 +166,6 @@ export function VectorToolsDialog({
     [],
   );
 
-  const setParam = useCallback(
-    (id: string, value: unknown) =>
-      setParams((prev) => ({ ...prev, [id]: value })),
-    [],
-  );
-
   const layerOptions = useCallback(
     (filter?: GeometryFamily[]) =>
       layers.filter((layer) => {
@@ -147,6 +180,70 @@ export function VectorToolsDialog({
         );
       }),
     [layers],
+  );
+
+  // Attribute-field names per layer, memoized on the layer set (and the dialog
+  // being open) so it doesn't recompute on every keystroke. GeoJSON is
+  // schemaless, so sample the first FIELD_SCAN_SAMPLE features rather than
+  // scanning a whole large layer on the React commit path.
+  const fieldsByLayer = useMemo(() => {
+    const FIELD_SCAN_SAMPLE = 1000;
+    const map = new Map<string, string[]>();
+    if (!open) return map;
+    for (const layer of layers) {
+      if (layer.type !== "geojson" || !layer.geojson) continue;
+      const keys = new Set<string>();
+      for (const feature of layer.geojson.features.slice(0, FIELD_SCAN_SAMPLE)) {
+        for (const key of Object.keys(feature.properties ?? {})) keys.add(key);
+      }
+      map.set(layer.id, [...keys]);
+    }
+    return map;
+  }, [layers, open]);
+
+  // Attribute-field options for a `type: "field"` parameter, read from the layer
+  // chosen in its `fieldSource` parameter (default "layer"). O(1) lookup.
+  const fieldOptions = useCallback(
+    (param: AlgorithmParameter): string[] => {
+      const sourceId = params[param.fieldSource ?? "layer"] as
+        | string
+        | undefined;
+      return (sourceId && fieldsByLayer.get(sourceId)) || [];
+    },
+    [fieldsByLayer, params],
+  );
+
+  // Update a parameter. When a layer parameter changes, also clear any
+  // `type: "field"` parameter that draws its options from it, so the field
+  // dropdown never keeps a value from the previous layer. Doing this at the
+  // mutation site (rather than in an effect) avoids re-running on every keystroke
+  // and means closing the dialog never wipes a valid selection.
+  const handleParamChange = useCallback(
+    (id: string, value: unknown) => {
+      setParams((prev) => {
+        const next = { ...prev, [id]: value };
+        for (const param of tool.parameters) {
+          if (param.type === "field" && (param.fieldSource ?? "layer") === id) {
+            next[param.id] = undefined;
+          }
+        }
+        return next;
+      });
+    },
+    [tool],
+  );
+
+  // Whether a parameter should be shown, given another parameter's value
+  // (e.g. hide the Value field for is-empty/is-not-empty operators).
+  const isParamVisible = useCallback(
+    (param: AlgorithmParameter): boolean => {
+      const vw = param.visibleWhen;
+      if (!vw) return true;
+      const current = params[vw.param] as string | undefined;
+      if ("in" in vw) return current != null && vw.in.includes(current);
+      return current == null || !vw.notIn.includes(current);
+    },
+    [params],
   );
 
   const addResultLayer = useCallback(
@@ -214,7 +311,7 @@ export function VectorToolsDialog({
     setLog([]);
     // Validate required parameters before doing any work.
     for (const param of tool.parameters) {
-      if (!param.required) continue;
+      if (!param.required || !isParamVisible(param)) continue;
       const value = params[param.id];
       if (
         value === undefined ||
@@ -252,6 +349,13 @@ export function VectorToolsDialog({
           log: appendLog,
           fitBounds: (bounds) => mapControllerRef.current?.fitBounds(bounds),
           addResultLayer,
+          duckdb,
+          viewportBounds: () => {
+            const map = mapControllerRef.current?.getMap();
+            if (!map) return null;
+            const b = map.getBounds();
+            return [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
+          },
         };
         await tool.run(ctx);
       }
@@ -269,6 +373,8 @@ export function VectorToolsDialog({
     addResultLayer,
     runRemoteEngine,
     mapControllerRef,
+    isParamVisible,
+    duckdb,
   ]);
 
   const groups = useMemo(groupedTools, []);
@@ -321,18 +427,21 @@ export function VectorToolsDialog({
             <p className="text-sm text-muted-foreground">{tool.description}</p>
 
             <div className="flex flex-col gap-3">
-              {tool.parameters.map((param) => (
+              {tool.parameters.filter(isParamVisible).map((param) => (
                 <ParameterField
                   key={param.id}
                   param={param}
                   value={params[param.id]}
                   layerOptions={layerOptions(param.geometryFilter)}
-                  onChange={(value) => setParam(param.id, value)}
+                  fieldOptions={
+                    param.type === "field" ? fieldOptions(param) : undefined
+                  }
+                  onChange={(value) => handleParamChange(param.id, value)}
                 />
               ))}
             </div>
 
-            {tool.supportsSidecar ? (
+            {tool.supportsSidecar || tool.requiresSidecar ? (
               <div className="flex flex-col gap-1">
                 <Label className="flex items-center gap-1.5 text-xs">
                   <Server className="h-3.5 w-3.5" /> Engine
@@ -341,7 +450,11 @@ export function VectorToolsDialog({
                   value={engine}
                   onChange={(e) => setEngine(e.target.value as Engine)}
                 >
-                  <option value="client">Client (Turf.js)</option>
+                  {/* requiresSidecar tools (e.g. Reproject) have no working client
+                      path, so don't let the user pick a dead-end engine. */}
+                  <option value="client" disabled={tool.requiresSidecar}>
+                    Client (Turf.js)
+                  </option>
                   <option value="sidecar">Sidecar (GeoPandas)</option>
                   <option value="pyodide">Python (Pyodide)</option>
                 </Select>
@@ -353,7 +466,10 @@ export function VectorToolsDialog({
                 {engine === "sidecar" && sidecarAvailable === false ? (
                   <p className="text-xs text-destructive">
                     The GeoPandas sidecar is not available. Start the sidecar
-                    with the vector extra, or switch to the client engine.
+                    with the vector extra, or switch to
+                    {tool.requiresSidecar
+                      ? " Python (Pyodide)."
+                      : " the client engine."}
                   </p>
                 ) : null}
                 {engine === "pyodide" ? (
@@ -401,120 +517,5 @@ export function VectorToolsDialog({
         </div>
       </DialogContent>
     </Dialog>
-  );
-}
-
-interface ParameterFieldProps {
-  param: AlgorithmParameter;
-  value: unknown;
-  layerOptions: { id: string; name: string }[];
-  onChange: (value: unknown) => void;
-}
-
-function ParameterField({
-  param,
-  value,
-  layerOptions,
-  onChange,
-}: ParameterFieldProps): ReactElement {
-  const label = (
-    <Label htmlFor={param.id} className="text-xs">
-      {param.label}
-      {param.required ? <span className="text-destructive"> *</span> : null}
-    </Label>
-  );
-
-  if (param.type === "layer") {
-    return (
-      <div className="flex flex-col gap-1">
-        {label}
-        <Select
-          id={param.id}
-          value={(value as string) ?? ""}
-          onChange={(e) => onChange(e.target.value)}
-        >
-          <option value="">Select a layer...</option>
-          {layerOptions.map((layer) => (
-            <option key={layer.id} value={layer.id}>
-              {layer.name}
-            </option>
-          ))}
-        </Select>
-        {param.description ? (
-          <p className="text-xs text-muted-foreground">{param.description}</p>
-        ) : null}
-      </div>
-    );
-  }
-
-  if (param.type === "select") {
-    return (
-      <div className="flex flex-col gap-1">
-        {label}
-        <Select
-          id={param.id}
-          value={(value as string) ?? ""}
-          onChange={(e) => onChange(e.target.value)}
-        >
-          {param.options?.map((option) => (
-            <option key={option.value} value={option.value}>
-              {option.label}
-            </option>
-          ))}
-        </Select>
-      </div>
-    );
-  }
-
-  if (param.type === "boolean") {
-    return (
-      <label className="flex items-center gap-2 text-sm" htmlFor={param.id}>
-        <input
-          id={param.id}
-          type="checkbox"
-          checked={Boolean(value)}
-          onChange={(e) => onChange(e.target.checked)}
-          className="h-4 w-4 rounded border-input"
-        />
-        {param.label}
-      </label>
-    );
-  }
-
-  if (param.type === "number") {
-    return (
-      <div className="flex flex-col gap-1">
-        {label}
-        <Input
-          id={param.id}
-          type="number"
-          value={value === undefined || value === null ? "" : String(value)}
-          min={param.min}
-          max={param.max}
-          step={param.step}
-          onChange={(e) =>
-            onChange(
-              e.target.value === "" ? undefined : Number(e.target.value),
-            )
-          }
-        />
-      </div>
-    );
-  }
-
-  // string
-  return (
-    <div className="flex flex-col gap-1">
-      {label}
-      <Input
-        id={param.id}
-        type="text"
-        value={(value as string) ?? ""}
-        onChange={(e) => onChange(e.target.value)}
-      />
-      {param.description ? (
-        <p className="text-xs text-muted-foreground">{param.description}</p>
-      ) : null}
-    </div>
   );
 }

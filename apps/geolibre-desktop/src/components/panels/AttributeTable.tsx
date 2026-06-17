@@ -23,28 +23,35 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
   Input,
+  Label,
   ScrollArea,
+  Select,
+  Textarea,
   TableBody,
   TableCell,
   TableHead,
   TableHeader,
   TableRow,
 } from "@geolibre/ui";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import type { Feature, FeatureCollection } from "geojson";
 import {
   ArrowDown,
   ArrowLeft,
   ArrowRight,
   ArrowUp,
+  Calculator,
+  ChartColumn,
   Columns3,
   Download,
   EyeOff,
   MoreHorizontal,
   Pencil,
   PanelBottomClose,
-  PanelBottomOpen,
+  Plus,
   RotateCcw,
   Save,
+  Sigma,
   TableProperties,
   Trash2,
   X,
@@ -53,12 +60,15 @@ import {
   type MouseEvent as ReactMouseEvent,
   type RefObject,
   useEffect,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
 } from "react";
 import { isTauri } from "../../lib/tauri-io";
 import {
+  addColumn,
+  calculateField,
   deleteColumn,
   getColumnSettings,
   hiddenColumns,
@@ -68,12 +78,23 @@ import {
   renameColumn,
   visibleColumns,
   type ColumnMoveDirection,
+  type NewColumnType,
 } from "../../lib/attribute-columns";
+import {
+  coerceComputedValue,
+  compileExpression,
+  EXPRESSION_HELPERS,
+  fieldReference,
+  type CalcOutputType,
+} from "../../lib/attribute-expression";
+import { AttributeChartDialog } from "./AttributeChartDialog";
+import { AttributeStatsDialog } from "./AttributeStatsDialog";
 import {
   exportVectorLayer,
   formatAttributeValue,
   geojsonVectorSourceId,
   sanitizeExportFileName,
+  shapefileFieldWarnings,
   type VectorExportFormat,
 } from "../../lib/vector-export";
 
@@ -92,6 +113,10 @@ const MIN_FEATURE_ID_COLUMN_WIDTH = 48;
 const MAX_FEATURE_ID_COLUMN_WIDTH = 180;
 const MIN_ATTRIBUTE_COLUMN_WIDTH = 72;
 const MAX_ATTRIBUTE_COLUMN_WIDTH = 520;
+// Estimated row height used to size the virtualizer before real rows are
+// measured. View-mode rows are ~37px; edit-mode rows (with an Input) are taller
+// and are corrected by measureElement once rendered.
+const ESTIMATED_ROW_HEIGHT = 37;
 const DEFAULT_TABLE_HEIGHT = 192;
 const MIN_TABLE_HEIGHT = 96;
 const MAX_TABLE_HEIGHT = 520;
@@ -227,6 +252,8 @@ interface AttributeTableProps {
 export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
   const tableSectionRef = useRef<HTMLElement>(null);
   const tableResizeGuideRef = useRef<HTMLDivElement>(null);
+  // The Radix ScrollArea viewport, used as the virtualizer's scroll container.
+  const scrollViewportRef = useRef<HTMLDivElement>(null);
   const selectedLayerId = useAppStore((s) => s.selectedLayerId);
   const layers = useAppStore((s) => s.layers);
   const attributeFilter = useAppStore((s) => s.attributeFilter);
@@ -254,6 +281,7 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [drafts, setDrafts] = useState<AttributeDrafts>({});
   const [exportError, setExportError] = useState<string | null>(null);
+  const [exportWarning, setExportWarning] = useState<string | null>(null);
   const deferTableResize = isTauri();
 
   const [loadingVectorGeojson, setLoadingVectorGeojson] = useState(false);
@@ -266,6 +294,25 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
   const [columnPendingDelete, setColumnPendingDelete] = useState<string | null>(
     null,
   );
+  // New-field creation dialog state.
+  const [addingColumn, setAddingColumn] = useState(false);
+  const [newColumnName, setNewColumnName] = useState("");
+  const [newColumnType, setNewColumnType] = useState<NewColumnType>("text");
+  const [newColumnDefault, setNewColumnDefault] = useState("");
+  // Charts dialog state.
+  const [chartOpen, setChartOpen] = useState(false);
+  // Field-statistics dialog state.
+  const [statsOpen, setStatsOpen] = useState(false);
+  // Field-calculator dialog state.
+  const [calcOpen, setCalcOpen] = useState(false);
+  const [calcMode, setCalcMode] = useState<"update" | "create">("update");
+  const [calcTargetField, setCalcTargetField] = useState("");
+  const [calcNewName, setCalcNewName] = useState("");
+  const [calcOutputType, setCalcOutputType] = useState<CalcOutputType>("auto");
+  const [calcExpression, setCalcExpression] = useState("");
+  const [calcSelectedOnly, setCalcSelectedOnly] = useState(false);
+  const [calcError, setCalcError] = useState<string | null>(null);
+  const calcExpressionRef = useRef<HTMLTextAreaElement>(null);
 
   const layer = layers.find((l) => l.id === selectedLayerId);
   const hasLayer = Boolean(layer);
@@ -365,7 +412,22 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
     setEditingColumn(null);
     setEditingColumnName("");
     setColumnPendingDelete(null);
+    setAddingColumn(false);
+    setNewColumnName("");
+    setNewColumnType("text");
+    setNewColumnDefault("");
+    setCalcOpen(false);
+    setCalcExpression("");
+    setCalcError(null);
+    setCalcSelectedOnly(false);
   }, [selectedLayerId, hasLayer, isGeometryEditing]);
+
+  // If the selected feature is cleared while the calculator is open, drop the
+  // "selected only" flag too: leaving it checked-but-disabled would mislead the
+  // user, and the submit guard would silently widen the scope to all features.
+  useEffect(() => {
+    if (!selectedFeatureId) setCalcSelectedOnly(false);
+  }, [selectedFeatureId]);
 
   const filterLower = attributeFilter.toLowerCase();
   const filtered = attributeRows.filter(({ properties, featureId }) => {
@@ -385,6 +447,63 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
     const result = compareAttributeValues(aValue, bValue);
     return sort.direction === "asc" ? result : -result;
   });
+
+  // Row virtualization: only the rows in (and just around) the viewport are
+  // mounted, so opening the table on a layer with tens of thousands of features
+  // no longer builds that many DOM nodes at once. Sorting/filtering above still
+  // operate over the full data model; the virtualizer only governs rendering.
+  const rowVirtualizer = useVirtualizer({
+    count: sorted.length,
+    getScrollElement: () => scrollViewportRef.current,
+    estimateSize: () => ESTIMATED_ROW_HEIGHT,
+    // Key by feature id so measured heights stay attached to the right row when
+    // the sort/filter reorders the list. getItemKey is only called with indices
+    // in [0, count), so sorted[index] is always defined.
+    getItemKey: (index) => sorted[index].featureId,
+    // A small cushion of off-screen rows: enough to cover the sticky header's
+    // ~1-row offset (the virtualizer measures from the scroll container top) and
+    // to avoid blank gaps during fast scrolling, without keeping many extra rows
+    // mounted.
+    overscan: 8,
+  });
+  const virtualRows = rowVirtualizer.getVirtualItems();
+  const virtualTotalSize = rowVirtualizer.getTotalSize();
+  // Spacer rows above/below the rendered window reserve the scroll height of the
+  // off-screen rows while keeping the native <table> column layout intact.
+  const paddingTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
+  const paddingBottom =
+    virtualRows.length > 0
+      ? virtualTotalSize - virtualRows[virtualRows.length - 1].end
+      : 0;
+
+  // Bring the selected feature's row into view. With virtualization the row may
+  // be unmounted (e.g. when a feature is picked on the map), so a plain CSS
+  // highlight would be invisible; scroll the virtualizer to it instead. "auto"
+  // alignment leaves an already-visible row untouched, so this stays unobtrusive
+  // even when it re-runs on every filter keystroke. Re-runs when the table opens
+  // (the viewport is null while closed, so scrollToIndex is a no-op then), when
+  // the sort changes, when the row count changes (so the scroll fires once rows
+  // materialize asynchronously for Add Vector Layer layers), and when the filter
+  // text changes (two different filters can yield the same row count yet a
+  // different position for the selected row).
+  useEffect(() => {
+    if (!attributeTableOpen || !selectedFeatureId) return;
+    const index = sorted.findIndex(
+      (row) => row.featureId === selectedFeatureId,
+    );
+    if (index >= 0) rowVirtualizer.scrollToIndex(index, { align: "auto" });
+    // `sorted`/`rowVirtualizer` are rebuilt every render and so are intentionally
+    // excluded; the dependencies below are the inputs that actually change which
+    // row (if any) the selected feature occupies and warrant a re-scroll.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    selectedFeatureId,
+    selectedLayerId,
+    attributeTableOpen,
+    sort,
+    sorted.length,
+    attributeFilter,
+  ]);
 
   const propKeys = new Set<string>();
   for (const row of attributeRows) {
@@ -615,11 +734,19 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
 
     try {
       setExportError(null);
+      setExportWarning(null);
       const exportGeojson = geojsonWithDrafts();
       if (!exportGeojson) return;
 
       const baseName = sanitizeExportFileName(layer.name);
-      await exportVectorLayer(exportGeojson, format, baseName);
+      const savedPath = await exportVectorLayer(exportGeojson, format, baseName);
+      // Surface Shapefile field-name limitations (10-char truncation and any
+      // resulting collisions) only when a file was actually written; a null
+      // path means the user cancelled the save dialog.
+      if (savedPath !== null && format === "shapefile") {
+        const warnings = shapefileFieldWarnings(exportGeojson);
+        setExportWarning(warnings.length > 0 ? warnings.join(" ") : null);
+      }
     } catch (error) {
       console.error("Failed to export attribute table", error);
       setExportError(
@@ -709,6 +836,190 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
       return rest;
     });
     setColumnPendingDelete(null);
+  };
+
+  const newColumnNameTrimmed = newColumnName.trim();
+  const newColumnCollides =
+    newColumnNameTrimmed !== "" &&
+    discoveredColumns.includes(newColumnNameTrimmed);
+  // A field is only discoverable through feature property keys, so a new column
+  // cannot be added to a layer with no features (see addColumn).
+  const canAddColumn = features.length > 0;
+  const canSubmitNewColumn =
+    newColumnNameTrimmed !== "" && !newColumnCollides && canAddColumn;
+
+  const openAddColumn = () => {
+    setNewColumnName("");
+    setNewColumnType("text");
+    setNewColumnDefault("");
+    setAddingColumn(true);
+  };
+
+  const changeNewColumnType = (type: NewColumnType) => {
+    setNewColumnType(type);
+    // Reset the default to blank ("no default" → null) for every type so a value
+    // typed for one type does not carry over to an incompatible one, and so the
+    // user must explicitly choose a value rather than silently persisting one.
+    setNewColumnDefault("");
+  };
+
+  const confirmAddColumn = () => {
+    if (!layer || !canSubmitNewColumn) return;
+    const patch = addColumn(
+      layer,
+      discoveredColumns,
+      newColumnName,
+      newColumnType,
+      newColumnDefault,
+    );
+    if (patch) updateLayer(layer.id, patch);
+    setAddingColumn(false);
+  };
+
+  const openCalculator = () => {
+    const hasColumns = discoveredColumns.length > 0;
+    setCalcMode(hasColumns ? "update" : "create");
+    setCalcTargetField(hasColumns ? discoveredColumns[0] : "");
+    setCalcNewName("");
+    setCalcOutputType("auto");
+    setCalcExpression("");
+    setCalcSelectedOnly(false);
+    setCalcError(null);
+    setCalcOpen(true);
+  };
+
+  // Insert a field reference (or function call) into the expression at the
+  // caret, then restore focus so chips can be clicked without losing position.
+  // `caretOffset` overrides where the caret lands relative to the inserted text
+  // (default: at its end) — function chips use it to land inside the parens.
+  const insertExpressionSnippet = (snippet: string, caretOffset?: number) => {
+    const el = calcExpressionRef.current;
+    if (!el) {
+      setCalcExpression((current) => current + snippet);
+      return;
+    }
+    const start = el.selectionStart ?? el.value.length;
+    const end = el.selectionEnd ?? el.value.length;
+    const next = el.value.slice(0, start) + snippet + el.value.slice(end);
+    // Write the DOM value and caret synchronously, then sync React state. Doing
+    // this in a deferred rAF let a rapid second chip click read a stale caret
+    // (still 0) and splice at the wrong offset.
+    el.value = next;
+    const caret = start + (caretOffset ?? snippet.length);
+    el.focus();
+    el.setSelectionRange(caret, caret);
+    setCalcExpression(next);
+  };
+
+  const calcNewNameTrimmed = calcNewName.trim();
+  const calcNameCollides =
+    calcMode === "create" &&
+    calcNewNameTrimmed !== "" &&
+    discoveredColumns.includes(calcNewNameTrimmed);
+  const calcHasTarget =
+    calcMode === "create"
+      ? calcNewNameTrimmed !== "" && !calcNameCollides
+      : calcTargetField !== "";
+  const calcHasSelection = Boolean(selectedFeatureId);
+
+  // Live preview of the expression against a sample feature: the selected row
+  // when present (and a single feature is targeted), else the first row. A
+  // syntax error blocks submission; a runtime error on the sample does not,
+  // since other features may still evaluate cleanly.
+  const calcSampleRow =
+    (calcSelectedOnly && calcHasSelection
+      ? attributeRows.find((row) => row.featureId === selectedFeatureId)
+      : undefined) ?? attributeRows[0];
+  const calcSampleIndex = calcSampleRow
+    ? attributeRows.indexOf(calcSampleRow)
+    : -1;
+  // Stable string keys so the memo skips recompiling the expression on renders
+  // that don't change the inputs (discoveredColumns / the sample row are rebuilt
+  // with fresh identities every render, so they can't be deps directly).
+  // Only serialize while the dialog is open — these exist solely as stable memo
+  // deps, and the memo short-circuits to "empty" when closed anyway.
+  const calcColumnsKey = calcOpen ? JSON.stringify(discoveredColumns) : "";
+  const calcSampleKey =
+    calcOpen && calcSampleRow ? JSON.stringify(calcSampleRow.properties) : "";
+  const calcPreview = useMemo<
+    | { kind: "empty" }
+    | { kind: "ok"; value: unknown }
+    | { kind: "syntax"; message: string }
+    | { kind: "runtime"; message: string }
+  >(() => {
+    if (!calcOpen || calcExpression.trim() === "") return { kind: "empty" };
+    try {
+      const compiled = compileExpression(calcExpression, discoveredColumns);
+      if (!calcSampleRow) return { kind: "ok", value: null };
+      try {
+        const raw = compiled.evaluate(calcSampleRow.properties, calcSampleIndex);
+        return { kind: "ok", value: coerceComputedValue(raw, calcOutputType) };
+      } catch (error) {
+        return {
+          kind: "runtime",
+          message:
+            error instanceof Error ? error.message : "Evaluation failed.",
+        };
+      }
+    } catch (error) {
+      return {
+        kind: "syntax",
+        message: error instanceof Error ? error.message : "Invalid expression.",
+      };
+    }
+    // Keyed on the stable strings above rather than the rebuilt arrays/objects.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    calcOpen,
+    calcExpression,
+    calcOutputType,
+    calcColumnsKey,
+    calcSampleKey,
+    calcSampleIndex,
+  ]);
+  const calcCanSubmit =
+    features.length > 0 &&
+    calcHasTarget &&
+    calcExpression.trim() !== "" &&
+    calcPreview.kind !== "syntax";
+
+  const confirmCalculate = () => {
+    if (!layer || !calcCanSubmit) return;
+    const targetName =
+      calcMode === "create" ? calcNewNameTrimmed : calcTargetField;
+    const scope =
+      calcSelectedOnly && selectedFeatureId
+        ? new Set([selectedFeatureId])
+        : undefined;
+    const result = calculateField(
+      layer,
+      discoveredColumns,
+      targetName,
+      calcMode === "create",
+      calcExpression,
+      calcOutputType,
+      scope,
+    );
+    if (!result) {
+      setCalcError("Could not apply the calculation to this layer.");
+      return;
+    }
+    if ("error" in result) {
+      setCalcError(result.error);
+      return;
+    }
+    updateLayer(layer.id, result.patch);
+    if (result.errors > 0) {
+      // The calculation was applied, but some rows threw and were written as
+      // null. Keep the dialog open and report it rather than showing a silent
+      // success over a column of nulls.
+      setCalcError(
+        `Applied, but ${result.errors} of ${result.evaluated} feature(s) errored and were written as null.`,
+      );
+      return;
+    }
+    setCalcError(null);
+    setCalcOpen(false);
   };
 
   const sortableHeader = (key: SortKey, label: string) => (
@@ -837,30 +1148,17 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
     );
   };
 
+  // Hidden by default: render nothing when closed. The panel is opened on
+  // demand from a vector layer's context menu, which sets attributeTableOpen
+  // to true.
   if (!attributeTableOpen) {
-    return (
-      <section className="flex h-11 shrink-0 items-center gap-2 border-t bg-card px-2">
-        <Button
-          variant="ghost"
-          size="icon"
-          className="h-8 w-8"
-          title="Expand attribute table"
-          aria-label="Expand attribute table"
-          onClick={() => setAttributeTableOpen(true)}
-        >
-          <PanelBottomOpen className="h-4 w-4" />
-        </Button>
-        <TableProperties className="h-4 w-4 text-muted-foreground" />
-        <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          Attribute table
-        </span>
-      </section>
-    );
+    return null;
   }
 
   return (
     <section
       ref={tableSectionRef}
+      aria-label="Attribute table"
       className="relative flex shrink-0 flex-col border-t bg-card"
       style={{ height: tableHeight }}
     >
@@ -900,6 +1198,13 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
         {exportError ? (
           <span className="max-w-48 truncate text-xs text-destructive">
             {exportError}
+          </span>
+        ) : exportWarning ? (
+          <span
+            className="max-w-48 truncate text-xs text-amber-600"
+            title={exportWarning}
+          >
+            {exportWarning}
           </span>
         ) : null}
         <Button
@@ -952,6 +1257,32 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
           <span className="hidden sm:inline">Save</span>
         </Button>
         {canManageColumns && !isEditing ? (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 px-2"
+            title="Add a new field"
+            aria-label="Add field"
+            onClick={openAddColumn}
+          >
+            <Plus className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Add field</span>
+          </Button>
+        ) : null}
+        {canManageColumns && !isEditing ? (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 px-2"
+            title="Calculate field values from an expression"
+            aria-label="Field calculator"
+            onClick={openCalculator}
+          >
+            <Calculator className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Calculate</span>
+          </Button>
+        ) : null}
+        {canManageColumns && !isEditing ? (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
@@ -994,6 +1325,42 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
             </DropdownMenuContent>
           </DropdownMenu>
         ) : null}
+        {!isEditing ? (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 px-2"
+            title={
+              hasAttributeSource
+                ? "Field statistics summary"
+                : "Statistics require a vector or DuckDB query layer"
+            }
+            aria-label="Field statistics"
+            disabled={!hasAttributeSource}
+            onClick={() => setStatsOpen(true)}
+          >
+            <Sigma className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Statistics</span>
+          </Button>
+        ) : null}
+        {!isEditing ? (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 px-2"
+            title={
+              hasAttributeSource
+                ? "Chart numeric fields"
+                : "Charts require a vector or DuckDB query layer"
+            }
+            aria-label="Charts"
+            disabled={!hasAttributeSource}
+            onClick={() => setChartOpen(true)}
+          >
+            <ChartColumn className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Charts</span>
+          </Button>
+        ) : null}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button
@@ -1018,6 +1385,12 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
             </DropdownMenuItem>
             <DropdownMenuItem onSelect={() => void exportLayer("geoparquet")}>
               GeoParquet
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => void exportLayer("geopackage")}>
+              GeoPackage
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => void exportLayer("shapefile")}>
+              Shapefile (zipped)
             </DropdownMenuItem>
             <DropdownMenuItem onSelect={() => void exportLayer("csv")}>
               CSV (attributes only)
@@ -1072,6 +1445,7 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
       */}
       <ScrollArea
         type="always"
+        viewportRef={scrollViewportRef}
         className="flex-1 [&_[data-orientation=vertical]]:!top-11 [&_[data-orientation=vertical]]:!h-[calc(100%-3.625rem)]"
       >
         {!hasAttributeSource ? (
@@ -1082,6 +1456,7 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
           </p>
         ) : (
           <table
+            data-testid="attribute-table"
             className="table-fixed caption-bottom text-sm"
             style={{ minWidth: "100%", width: tableWidth }}
           >
@@ -1103,11 +1478,19 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {sorted.map(({ featureId, properties }) => {
+              {paddingTop > 0 ? (
+                <tr aria-hidden="true">
+                  <td colSpan={tableColumns.length} style={{ height: paddingTop }} />
+                </tr>
+              ) : null}
+              {virtualRows.map((virtualRow) => {
+                const { featureId, properties } = sorted[virtualRow.index];
                 const selected = selectedFeatureId === featureId;
                 return (
                   <TableRow
                     key={featureId}
+                    data-index={virtualRow.index}
+                    ref={rowVirtualizer.measureElement}
                     data-state={selected ? "selected" : undefined}
                     className="cursor-pointer"
                     onClick={() => {
@@ -1161,6 +1544,14 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
                   </TableRow>
                 );
               })}
+              {paddingBottom > 0 ? (
+                <tr aria-hidden="true">
+                  <td
+                    colSpan={tableColumns.length}
+                    style={{ height: paddingBottom }}
+                  />
+                </tr>
+              ) : null}
             </TableBody>
           </table>
         )}
@@ -1191,6 +1582,278 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
           </div>
         </DialogContent>
       </Dialog>
+      <Dialog
+        open={addingColumn}
+        onOpenChange={(open: boolean) => setAddingColumn(open)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Add field</DialogTitle>
+            <DialogDescription>
+              {`Add a new field to every feature in "${layer?.name ?? ""}".`}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-3 py-1">
+            <div className="grid gap-1.5">
+              <Label htmlFor="new-field-name">Field name</Label>
+              <Input
+                id="new-field-name"
+                autoFocus
+                value={newColumnName}
+                placeholder="e.g. category"
+                aria-invalid={newColumnCollides || undefined}
+                onChange={(event) => setNewColumnName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && canSubmitNewColumn) {
+                    event.preventDefault();
+                    confirmAddColumn();
+                  }
+                }}
+              />
+              {newColumnCollides ? (
+                <span className="text-xs text-destructive">
+                  A field named "{newColumnNameTrimmed}" already exists.
+                </span>
+              ) : null}
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="new-field-type">Type</Label>
+              <Select
+                id="new-field-type"
+                value={newColumnType}
+                onChange={(event) =>
+                  changeNewColumnType(event.target.value as NewColumnType)
+                }
+              >
+                <option value="text">Text</option>
+                <option value="number">Number</option>
+                <option value="boolean">Boolean</option>
+              </Select>
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="new-field-default">Default value</Label>
+              {newColumnType === "boolean" ? (
+                <Select
+                  id="new-field-default"
+                  value={newColumnDefault}
+                  onChange={(event) => setNewColumnDefault(event.target.value)}
+                >
+                  <option value="">(no default)</option>
+                  <option value="false">false</option>
+                  <option value="true">true</option>
+                </Select>
+              ) : (
+                <Input
+                  id="new-field-default"
+                  type={newColumnType === "number" ? "number" : "text"}
+                  value={newColumnDefault}
+                  placeholder="Leave blank for empty"
+                  onChange={(event) => setNewColumnDefault(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && canSubmitNewColumn) {
+                      event.preventDefault();
+                      confirmAddColumn();
+                    }
+                  }}
+                />
+              )}
+            </div>
+            {!canAddColumn ? (
+              <span className="text-xs text-destructive">
+                This layer has no features to add a field to.
+              </span>
+            ) : null}
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setAddingColumn(false)}>
+              Cancel
+            </Button>
+            <Button disabled={!canSubmitNewColumn} onClick={confirmAddColumn}>
+              Add field
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        open={calcOpen}
+        onOpenChange={(open: boolean) => {
+          setCalcOpen(open);
+          if (!open) setCalcError(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>Field calculator</DialogTitle>
+            <DialogDescription>
+              {`Compute values from a JavaScript expression and write them to a field in "${layer?.name ?? ""}".`}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-3 py-1">
+            <div className="grid gap-1.5">
+              <Label htmlFor="calc-target">Target field</Label>
+              <div className="flex gap-2">
+                <Select
+                  id="calc-target-mode"
+                  className="w-40 shrink-0"
+                  value={calcMode}
+                  onChange={(event) =>
+                    setCalcMode(event.target.value as "update" | "create")
+                  }
+                >
+                  <option
+                    value="update"
+                    disabled={discoveredColumns.length === 0}
+                  >
+                    Update field
+                  </option>
+                  <option value="create">Create field</option>
+                </Select>
+                {calcMode === "create" ? (
+                  <Input
+                    id="calc-target"
+                    className="flex-1"
+                    value={calcNewName}
+                    placeholder="New field name"
+                    aria-invalid={calcNameCollides || undefined}
+                    onChange={(event) => setCalcNewName(event.target.value)}
+                  />
+                ) : (
+                  <Select
+                    id="calc-target"
+                    className="flex-1"
+                    value={calcTargetField}
+                    onChange={(event) => setCalcTargetField(event.target.value)}
+                  >
+                    {discoveredColumns.map((col) => (
+                      <option key={col} value={col}>
+                        {col}
+                      </option>
+                    ))}
+                  </Select>
+                )}
+              </div>
+              {calcNameCollides ? (
+                <span className="text-xs text-destructive">
+                  A field named "{calcNewNameTrimmed}" already exists.
+                </span>
+              ) : null}
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="calc-output-type">Output type</Label>
+              <Select
+                id="calc-output-type"
+                value={calcOutputType}
+                onChange={(event) =>
+                  setCalcOutputType(event.target.value as CalcOutputType)
+                }
+              >
+                <option value="auto">Auto (keep computed type)</option>
+                <option value="text">Text</option>
+                <option value="number">Number</option>
+                <option value="boolean">Boolean</option>
+              </Select>
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="calc-expression">Expression</Label>
+              <Textarea
+                id="calc-expression"
+                ref={calcExpressionRef}
+                className="min-h-20 font-mono text-xs"
+                value={calcExpression}
+                placeholder='e.g. pop / area, or upper(name), or pop > 100 ? "big" : "small"'
+                onChange={(event) => setCalcExpression(event.target.value)}
+              />
+              {discoveredColumns.length > 0 ? (
+                <div className="flex flex-wrap items-center gap-1">
+                  <span className="text-xs text-muted-foreground">Fields:</span>
+                  {discoveredColumns.map((col) => (
+                    <button
+                      key={col}
+                      type="button"
+                      className="rounded border border-input bg-muted/40 px-1.5 py-0.5 font-mono text-[11px] hover:bg-muted"
+                      title={`Insert ${col}`}
+                      onClick={() => insertExpressionSnippet(fieldReference(col))}
+                    >
+                      {col}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              <div className="flex flex-wrap items-center gap-1">
+                <span className="text-xs text-muted-foreground">
+                  Functions:
+                </span>
+                {Object.keys(EXPRESSION_HELPERS).map((fn) => (
+                  <button
+                    key={fn}
+                    type="button"
+                    className="rounded border border-input bg-muted/40 px-1.5 py-0.5 font-mono text-[11px] hover:bg-muted"
+                    title={`Insert ${fn}()`}
+                    onClick={() =>
+                      // Land the caret between the parens so the user can type
+                      // the argument straight away.
+                      insertExpressionSnippet(`${fn}()`, fn.length + 1)
+                    }
+                  >
+                    {fn}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {calcPreview.kind === "syntax" ? (
+              <span className="text-xs text-destructive">
+                {calcPreview.message}
+              </span>
+            ) : calcPreview.kind === "runtime" ? (
+              <span className="text-xs text-amber-600 dark:text-amber-500">
+                {`Sample row errored (other rows may still compute): ${calcPreview.message}`}
+              </span>
+            ) : calcPreview.kind === "ok" ? (
+              <span className="truncate text-xs text-muted-foreground">
+                Preview:{" "}
+                <span className="font-mono text-foreground">
+                  {formatAttributeValue(calcPreview.value)}
+                </span>
+              </span>
+            ) : null}
+            <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={calcSelectedOnly}
+                disabled={!calcHasSelection}
+                onChange={(event) => setCalcSelectedOnly(event.target.checked)}
+              />
+              Only update the selected feature
+            </label>
+            {calcError ? (
+              <span className="text-xs text-destructive">{calcError}</span>
+            ) : null}
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setCalcOpen(false)}>
+              Cancel
+            </Button>
+            <Button disabled={!calcCanSubmit} onClick={confirmCalculate}>
+              Calculate
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+      <AttributeChartDialog
+        open={chartOpen}
+        onOpenChange={setChartOpen}
+        rows={attributeRows}
+        columns={discoveredColumns}
+        layerName={layer?.name ?? ""}
+      />
+      <AttributeStatsDialog
+        open={statsOpen}
+        onOpenChange={setStatsOpen}
+        rows={attributeRows}
+        filteredRows={filtered}
+        columns={discoveredColumns}
+        layerName={layer?.name ?? ""}
+      />
     </section>
   );
 }

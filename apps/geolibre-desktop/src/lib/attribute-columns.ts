@@ -4,6 +4,11 @@ import {
   type LayerStyle,
 } from "@geolibre/core";
 import type { FeatureCollection } from "geojson";
+import {
+  coerceComputedValue,
+  compileExpression,
+  type CalcOutputType,
+} from "./attribute-expression";
 
 /**
  * Per-layer attribute-table column settings, persisted under
@@ -19,6 +24,9 @@ export interface ColumnSettings {
 }
 
 export type ColumnMoveDirection = "left" | "right";
+
+/** Data type chosen when creating a new attribute field. */
+export type NewColumnType = "text" | "number" | "boolean";
 
 const COLUMN_SETTINGS_KEY = "columnSettings";
 
@@ -122,12 +130,12 @@ export function hiddenColumns(
   return orderColumns(discovered, settings).filter((key) => hidden.has(key));
 }
 
-// NOTE: renameFieldInGeojson/deleteFieldInGeojson rewrite every feature's
-// property object synchronously on the main thread. This is fine for typical
-// in-browser GeoJSON sizes but will visibly jank on very large layers (tens of
-// thousands of features); chunking or a worker would be needed if that becomes
-// a real workflow. Kept synchronous deliberately — these run on a user-initiated
-// one-off action, not in a hot path.
+// NOTE: renameFieldInGeojson/deleteFieldInGeojson/addFieldInGeojson rewrite every
+// feature's property object synchronously on the main thread. This is fine for
+// typical in-browser GeoJSON sizes but will visibly jank on very large layers
+// (tens of thousands of features); chunking or a worker would be needed if that
+// becomes a real workflow. Kept synchronous deliberately — these run on a
+// user-initiated one-off action, not in a hot path.
 function renameFieldInGeojson(
   geojson: FeatureCollection,
   oldKey: string,
@@ -161,6 +169,39 @@ function deleteFieldInGeojson(
       return { ...feature, properties: rest };
     }),
   };
+}
+
+function addFieldInGeojson(
+  geojson: FeatureCollection,
+  key: string,
+  value: unknown,
+): FeatureCollection {
+  return {
+    ...geojson,
+    features: geojson.features.map((feature) => ({
+      ...feature,
+      // Append the new key last so it is discovered (and thus rendered) at the
+      // end of the table. A feature with null properties gains a fresh object.
+      properties: { ...(feature.properties ?? {}), [key]: value },
+    })),
+  };
+}
+
+/**
+ * Coerce the raw default-value string into the value seeded into every feature.
+ * An empty string means "no default" → null, which mirrors how GIS tools leave
+ * a freshly added field unset. A non-null default also lets the inline cell
+ * editor infer the field's type (see parseAttributeDraft in AttributeTable).
+ */
+function defaultValueForType(type: NewColumnType, raw: string): unknown {
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+  if (type === "number") {
+    const next = Number(trimmed);
+    return Number.isFinite(next) ? next : null;
+  }
+  if (type === "boolean") return trimmed.toLowerCase() === "true";
+  return trimmed;
 }
 
 function renameFieldInStyle(
@@ -204,6 +245,147 @@ function removeKeyFromSettings(
     hidden: settings.hidden?.filter((entry) => entry !== key),
     order: settings.order?.filter((entry) => entry !== key),
   };
+}
+
+/**
+ * Append a key to settings.order so a new column lands at the end of an explicit
+ * ordering. When no explicit order exists, return the settings untouched and let
+ * discovery order place the (last-added) key last on its own.
+ */
+function appendKeyToOrder(
+  settings: ColumnSettings,
+  key: string,
+): ColumnSettings {
+  if (!settings.order?.length) return settings;
+  return { ...settings, order: [...settings.order, key] };
+}
+
+/**
+ * Add a new attribute field, seeding every feature with a type-appropriate
+ * default value. Returns null (no-op) when the name is empty, collides with an
+ * existing column, when the layer has no in-store GeoJSON, or when it has no
+ * features. A field is only discoverable through feature property keys, so on a
+ * zero-row layer the column would never appear (and the collision guard would
+ * never trip, letting the same name be added repeatedly) — reject it instead.
+ */
+export function addColumn(
+  layer: GeoLibreLayer,
+  discovered: string[],
+  rawName: string,
+  type: NewColumnType,
+  rawDefault: string,
+): Partial<GeoLibreLayer> | null {
+  const name = rawName.trim();
+  if (!layer.geojson || layer.geojson.features.length === 0 || !name) {
+    return null;
+  }
+  if (discovered.includes(name)) return null; // would clobber another column
+  const value = defaultValueForType(type, rawDefault);
+  const settings = getColumnSettings(layer);
+  return {
+    geojson: addFieldInGeojson(layer.geojson, name, value),
+    metadata: metadataWithSettings(layer, appendKeyToOrder(settings, name)),
+  };
+}
+
+/** The id the attribute table uses for a feature: its own id, else its index. */
+function featureKey(
+  feature: FeatureCollection["features"][number],
+  index: number,
+): string {
+  return String(feature.id ?? index);
+}
+
+/** Outcome of a field calculation: a layer patch plus per-run statistics. */
+export interface FieldCalculationResult {
+  patch: Partial<GeoLibreLayer>;
+  /** How many features had the expression evaluated against them. */
+  evaluated: number;
+  /** How many of those threw at runtime and were written as null instead. */
+  errors: number;
+}
+
+/**
+ * Compute a field's values from a JavaScript expression and return a layer patch
+ * that writes them into the GeoJSON. The target is either an existing field or a
+ * new one (`createField: true`), and values can be limited to a subset of
+ * features (`targetFeatureIds`) — e.g. only the selected row.
+ *
+ * A SyntaxError from the expression compiler is returned as a string in
+ * `{ error }` so the caller can surface it without mutating the layer. Features
+ * whose expression throws at runtime keep a null value and are counted in
+ * `errors`. When creating a field while scoped to a subset, out-of-scope
+ * features still receive the field (as null) so the column is consistent.
+ *
+ * Returns null (no-op) when the layer has no in-store GeoJSON or no features,
+ * when a new field's name is empty or collides, or when an existing target is
+ * absent.
+ */
+export function calculateField(
+  layer: GeoLibreLayer,
+  discovered: string[],
+  rawTargetName: string,
+  createField: boolean,
+  expression: string,
+  outputType: CalcOutputType,
+  targetFeatureIds?: ReadonlySet<string>,
+): FieldCalculationResult | { error: string } | null {
+  if (!layer.geojson || layer.geojson.features.length === 0) return null;
+
+  const target = rawTargetName.trim();
+  if (!target) return null;
+  if (createField && discovered.includes(target)) return null; // would clobber
+  if (!createField && !discovered.includes(target)) return null; // nothing to set
+
+  let compiled;
+  try {
+    compiled = compileExpression(expression, discovered);
+  } catch (error) {
+    return {
+      error: error instanceof Error ? error.message : "Invalid expression.",
+    };
+  }
+
+  const scoped = targetFeatureIds ?? null;
+  let evaluated = 0;
+  let errors = 0;
+
+  const features = layer.geojson.features.map((feature, index) => {
+    const inScope =
+      scoped === null || scoped.has(featureKey(feature, index));
+    if (!inScope) {
+      // Out-of-scope feature on a new field: seed null so the column exists for
+      // every feature. An existing field is left exactly as it was.
+      if (!createField) return feature;
+      return {
+        ...feature,
+        properties: { ...(feature.properties ?? {}), [target]: null },
+      };
+    }
+
+    const props = (feature.properties ?? {}) as Record<string, unknown>;
+    let value: unknown;
+    try {
+      value = coerceComputedValue(compiled.evaluate(props, index), outputType);
+      evaluated += 1;
+    } catch {
+      value = null;
+      evaluated += 1;
+      errors += 1;
+    }
+    return { ...feature, properties: { ...props, [target]: value } };
+  });
+
+  const geojson: FeatureCollection = { ...layer.geojson, features };
+  const settings = getColumnSettings(layer);
+  const patch: Partial<GeoLibreLayer> = createField
+    ? {
+        geojson,
+        metadata: metadataWithSettings(layer, appendKeyToOrder(settings, target)),
+      }
+    : { geojson };
+
+  return { patch, evaluated, errors };
 }
 
 /**

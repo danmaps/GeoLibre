@@ -4,9 +4,15 @@ import type { MapController, MapDiagnosticEvent } from "@geolibre/map";
 import { MapCanvas } from "@geolibre/map";
 import {
   addRasterToMap,
+  DECK_VIZ_PLUGIN_ID,
+  DIRECTIONS_PLUGIN_ID,
   EFFECTS_PLUGIN_ID,
   endLayerGeometryEdit,
   getGeometryEditTargetLayerId,
+  restoreDeckViz,
+  restoreDirections,
+  restoreReverseGeocode,
+  REVERSE_GEOCODE_PLUGIN_ID,
   restoreEffects,
   restoreRasterLayers,
   restoreThreeDTilesLayers,
@@ -17,7 +23,7 @@ import {
 import {
   type CSSProperties,
   type DragEvent,
-  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
   lazy,
   Suspense,
   useCallback,
@@ -26,7 +32,6 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import { runSqlQuery } from "../../lib/sql-workspace";
 import {
   isTauri,
   loadDroppedRasterFiles,
@@ -35,27 +40,57 @@ import {
   loadDroppedVectorPaths,
   type DroppedRaster,
 } from "../../lib/tauri-io";
+import type { LargeVectorDataset } from "../../lib/duckdb-vector-guard";
+import i18n from "../../i18n";
+import {
+  addOsmPbfLayers,
+  isOsmPbfFileName,
+  loadOsmPbf,
+  osmPbfBaseName,
+  OSM_PBF_SIZE_WARN_BYTES,
+} from "../../lib/osm-pbf-loader";
 import {
   createAppAPI,
   getPluginManager,
   useExternalPluginsReady,
 } from "../../hooks/usePlugins";
 import { registerMbtilesProtocol } from "../../lib/mbtiles";
+import { hasReverseGeocodeConsent } from "../../lib/reverse-geocode-consent";
 import { registerXyzTileProtocol } from "../../lib/xyz-url";
 import { useEmbedBridge } from "../../hooks/useEmbedBridge";
+import { RemoteCursorsOverlay } from "./RemoteCursorsOverlay";
+import { useCommandBridge } from "../../hooks/useCommandBridge";
 import {
   appendDiagnostic,
   useDiagnosticsSnapshot,
 } from "../../lib/diagnostics";
+import { SectionErrorBoundary } from "../common/error-boundaries";
 import { AttributeTable } from "../panels/AttributeTable";
 import { LayerPanel } from "../panels/LayerPanel";
 import { StylePanel } from "../panels/StylePanel";
+import { StoryMapPanel } from "../storymap/StoryMapPanel";
+import { StoryMapPresenter } from "../storymap/StoryMapPresenter";
 import { DiagnosticsDialog } from "./DiagnosticsDialog";
 import { StatusBar } from "./StatusBar";
 import { TopToolbar } from "./TopToolbar";
 import type { LayoutOptions } from "../../hooks/useLayoutOptions";
 import type { ThemeMode } from "../../hooks/useThemeMode";
 import type { ProjectUrlLoadState } from "../../hooks/useProjectUrlLoader";
+
+/**
+ * Confirm loading a vector source whose feature count tripped the loader's
+ * large-dataset guard. Mirrors the OSM PBF drop guard's blocking
+ * `window.confirm` (see the handlers below): a `false` return aborts that one
+ * file's load without affecting the rest of a multi-file drop.
+ */
+function confirmLargeVectorDataset({ name, featureCount }: LargeVectorDataset) {
+  return window.confirm(
+    i18n.t("toolbar.item.largeVectorDesc", {
+      name,
+      count: featureCount.toLocaleString(),
+    }),
+  );
+}
 
 const ProcessingDialog = lazy(() =>
   import("../processing/ProcessingDialog")
@@ -101,6 +136,62 @@ const VectorToolsDialog = lazy(() =>
     }),
 );
 
+const ModelBuilderDialog = lazy(() =>
+  import("../processing/ModelBuilderDialog")
+    .then((module) => ({
+      default: module.ModelBuilderDialog,
+    }))
+    .catch((error) => {
+      // Same chunk-load fallback rationale as ProcessingDialog above.
+      console.error("Failed to load ModelBuilderDialog", error);
+      const Fallback = (() =>
+        null) as unknown as typeof import("../processing/ModelBuilderDialog").ModelBuilderDialog;
+      return { default: Fallback };
+    }),
+);
+
+const NetworkToolsDialog = lazy(() =>
+  import("../processing/NetworkToolsDialog")
+    .then((module) => ({
+      default: module.NetworkToolsDialog,
+    }))
+    .catch((error) => {
+      // Same chunk-load fallback rationale as ProcessingDialog above.
+      console.error("Failed to load NetworkToolsDialog", error);
+      const Fallback = (() =>
+        null) as unknown as typeof import("../processing/NetworkToolsDialog").NetworkToolsDialog;
+      return { default: Fallback };
+    }),
+);
+
+const StatisticsToolsDialog = lazy(() =>
+  import("../processing/StatisticsToolsDialog")
+    .then((module) => ({
+      default: module.StatisticsToolsDialog,
+    }))
+    .catch((error) => {
+      // Same chunk-load fallback rationale as ProcessingDialog above.
+      console.error("Failed to load StatisticsToolsDialog", error);
+      const Fallback = (() =>
+        null) as unknown as typeof import("../processing/StatisticsToolsDialog").StatisticsToolsDialog;
+      return { default: Fallback };
+    }),
+);
+
+const GeocodeDialog = lazy(() =>
+  import("../processing/GeocodeDialog")
+    .then((module) => ({
+      default: module.GeocodeDialog,
+    }))
+    .catch((error) => {
+      // Same chunk-load fallback rationale as ProcessingDialog above.
+      console.error("Failed to load GeocodeDialog", error);
+      const Fallback = (() =>
+        null) as unknown as typeof import("../processing/GeocodeDialog").GeocodeDialog;
+      return { default: Fallback };
+    }),
+);
+
 const RasterToolsDialog = lazy(() =>
   import("../processing/RasterToolsDialog")
     .then((module) => ({
@@ -115,6 +206,19 @@ const RasterToolsDialog = lazy(() =>
     }),
 );
 
+const SegmentationDialog = lazy(() =>
+  import("../processing/SegmentationDialog")
+    .then((module) => ({
+      default: module.SegmentationDialog,
+    }))
+    .catch((error) => {
+      console.error("Failed to load SegmentationDialog", error);
+      const Fallback = (() =>
+        null) as unknown as typeof import("../processing/SegmentationDialog").SegmentationDialog;
+      return { default: Fallback };
+    }),
+);
+
 const SqlWorkspaceDialog = lazy(() =>
   import("../processing/SqlWorkspaceDialog")
     .then((module) => ({
@@ -125,6 +229,34 @@ const SqlWorkspaceDialog = lazy(() =>
       console.error("Failed to load SqlWorkspaceDialog", error);
       const Fallback = (() =>
         null) as unknown as typeof import("../processing/SqlWorkspaceDialog").SqlWorkspaceDialog;
+      return { default: Fallback };
+    }),
+);
+
+const AssistantPanel = lazy(() =>
+  import("../panels/AssistantPanel")
+    .then((module) => ({
+      default: module.AssistantPanel,
+    }))
+    .catch((error) => {
+      // Same chunk-load fallback rationale as the dialogs above.
+      console.error("Failed to load AssistantPanel", error);
+      const Fallback = (() =>
+        null) as unknown as typeof import("../panels/AssistantPanel").AssistantPanel;
+      return { default: Fallback };
+    }),
+);
+
+const PythonConsolePanel = lazy(() =>
+  import("../panels/PythonConsolePanel")
+    .then((module) => ({
+      default: module.PythonConsolePanel,
+    }))
+    .catch((error) => {
+      // Same chunk-load fallback rationale as the dialogs above.
+      console.error("Failed to load PythonConsolePanel", error);
+      const Fallback = (() =>
+        null) as unknown as typeof import("../panels/PythonConsolePanel").PythonConsolePanel;
       return { default: Fallback };
     }),
 );
@@ -173,6 +305,10 @@ export function DesktopShell({
 }: DesktopShellProps) {
   const shellRef = useRef<HTMLDivElement>(null);
   const verticalResizeGuideRef = useRef<HTMLDivElement>(null);
+  // Teardown for an in-progress panel resize, so a pointercancel or an unmount
+  // mid-drag still detaches the global listeners and restores document.body.
+  const activeResizeCleanupRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => activeResizeCleanupRef.current?.(), []);
   const mapControllerRef = useRef<MapController | null>(null);
   const dragDepthRef = useRef(0);
   const dropMessageTimeoutRef = useRef<number | null>(null);
@@ -180,6 +316,8 @@ export function DesktopShell({
   const togglingGeometryEditRef = useRef(false);
   const addGeoJsonLayer = useAppStore((s) => s.addGeoJsonLayer);
   const projectGeneration = useAppStore((s) => s.projectGeneration);
+  const pythonConsoleOpen = useAppStore((s) => s.ui.pythonConsoleOpen);
+  const assistantOpen = useAppStore((s) => s.ui.assistantOpen);
   const geometryEditLayerId = useSyncExternalStore(
     subscribeGeometryEdit,
     getGeometryEditTargetLayerId,
@@ -194,6 +332,9 @@ export function DesktopShell({
   // Sync the project with an embedding host (the GeoLibre Jupyter widget) over
   // postMessage. Inert when the app is not embedded.
   useEmbedBridge(mapControllerRef);
+  // Request/reply + event channel backing the Python scripting API (live
+  // queries, processing, map events). Also inert when not embedded.
+  useCommandBridge(mapControllerRef);
   const [layerPanelWidth, setLayerPanelWidth] = useState(
     DEFAULT_SIDE_PANEL_WIDTH,
   );
@@ -312,6 +453,14 @@ export function DesktopShell({
       try {
         // The query is the layer's own stored SQL from the user's project; it is
         // intentionally run unrestricted against the in-memory DuckDB instance.
+        // Import the DuckDB-WASM engine lazily here, not at module load: a static
+        // import would pull the heavy `@duckdb/duckdb-wasm` chunk into the app's
+        // boot graph (DesktopShell is eagerly imported by App), which then has to
+        // load before the shell renders. That broke the offline cold boot — the
+        // chunk is runtime-cached, not precached, so a cache miss failed the boot
+        // and the map never mounted (see e2e/pwa.spec.ts). Loading it on first
+        // materialize keeps DuckDB out of the offline-critical boot path.
+        const { runSqlQuery } = await import("../../lib/sql-workspace");
         const result = await runSqlQuery(query, useAppStore.getState().layers);
         if (!result.geojson) {
           throw new Error("The query did not return a geometry column.");
@@ -370,6 +519,27 @@ export function DesktopShell({
     // called, so the effects engine must be kicked explicitly to match the
     // restored active state (idempotent).
     restoreEffects(appAPI, pluginManager.isActive(EFFECTS_PLUGIN_ID));
+    // Rebind the directions tool to the (possibly new) map instance after a
+    // map re-init, since restoreProjectState skips an already-active plugin.
+    restoreDirections(appAPI, pluginManager.isActive(DIRECTIONS_PLUGIN_ID));
+    // Reverse geocode sends clicked coordinates to a public geocoder. If a
+    // restored project marks it active but this device never acknowledged the
+    // privacy notice, deactivate it so no coordinates are sent without consent;
+    // the user must re-enable it (which shows the notice). This makes the
+    // consent gate cover every activation path, not just the toolbar toggle.
+    if (
+      pluginManager.isActive(REVERSE_GEOCODE_PLUGIN_ID) &&
+      !hasReverseGeocodeConsent()
+    ) {
+      pluginManager.deactivate(REVERSE_GEOCODE_PLUGIN_ID, appAPI);
+    }
+    restoreReverseGeocode(
+      appAPI,
+      pluginManager.isActive(REVERSE_GEOCODE_PLUGIN_ID),
+    );
+    // Same contract for the deck.gl overlay: re-attach it to the current map
+    // and re-render any deckgl-viz layers a restored project carries.
+    restoreDeckViz(appAPI, pluginManager.isActive(DECK_VIZ_PLUGIN_ID));
     const search = window.location.search;
     void pluginManager
       .handleUrlParameters(
@@ -483,10 +653,90 @@ export function DesktopShell({
 
           try {
             const paths = event.payload.paths;
-            const rasterCount = await addDroppedRasters(
-              await loadDroppedRasterPaths(paths),
+            // OSM PBF files split into three layers, so they bypass the normal
+            // single-FeatureCollection pipeline (which would otherwise route a
+            // .pbf to DuckDB ST_Read and merge it).
+            const pbfPaths = paths.filter((path) => isOsmPbfFileName(path));
+            const otherPaths = paths.filter(
+              (path) => !isOsmPbfFileName(path),
             );
-            finishDrop(await loadDroppedVectorPaths(paths), rasterCount);
+
+            if (pbfPaths.length > 0) {
+              const { readFile, stat } = await import("@tauri-apps/plugin-fs");
+              for (const path of pbfPaths) {
+                const name = path.split(/[/\\]/).pop() || "osm";
+                try {
+                  // Check the size via metadata before reading the file into
+                  // memory, so the guard runs before a huge extract is loaded.
+                  const { size } = await stat(path);
+                  if (size >= OSM_PBF_SIZE_WARN_BYTES) {
+                    const sizeMb = Math.round(size / (1024 * 1024));
+                    // window.confirm is blocking and adequate here; note that a
+                    // few webview builds may suppress JS dialogs, in which case
+                    // it returns false and the file is skipped.
+                    if (
+                      !window.confirm(
+                        `${name} is about ${sizeMb} MB. Parsing it may use a lot of memory. Continue?`,
+                      )
+                    ) {
+                      continue;
+                    }
+                  }
+                  setDropMessage(`Parsing ${name}…`);
+                  const bytes = await readFile(path);
+                  // Guard against a subview Uint8Array: .buffer would include
+                  // extra bytes and corrupt the parse, so slice to the exact view.
+                  const buffer =
+                    bytes.byteOffset === 0 &&
+                    bytes.byteLength === bytes.buffer.byteLength
+                      ? (bytes.buffer as ArrayBuffer)
+                      : (bytes.buffer.slice(
+                          bytes.byteOffset,
+                          bytes.byteOffset + bytes.byteLength,
+                        ) as ArrayBuffer);
+                  const layers = await loadOsmPbf(buffer);
+                  const added = addOsmPbfLayers(
+                    addGeoJsonLayer,
+                    osmPbfBaseName(name),
+                    path,
+                    layers,
+                  );
+                  if (added > 0 && layers.bounds) {
+                    mapControllerRef.current?.fitBounds(layers.bounds);
+                  }
+                  setDropMessage(
+                    added > 0
+                      ? `Added ${added} layer${added === 1 ? "" : "s"} from ${name}.`
+                      : `No features found in ${name}.`,
+                  );
+                } catch (err) {
+                  // Isolate per-file failures so one bad PBF doesn't abandon the
+                  // rest of the drop.
+                  setDropMessage(null);
+                  setDropError(
+                    `Could not parse ${name}: ${err instanceof Error ? err.message : String(err)}`,
+                  );
+                }
+              }
+            }
+
+            if (otherPaths.length > 0) {
+              const rasterCount = await addDroppedRasters(
+                await loadDroppedRasterPaths(otherPaths),
+              );
+              const importedLayers = await loadDroppedVectorPaths(otherPaths, {
+                onLargeDataset: confirmLargeVectorDataset,
+              });
+              // See the browser handler: skip finishDrop's empty-input error
+              // when PBF files were present (even if rejected/failed).
+              if (
+                importedLayers.length > 0 ||
+                rasterCount > 0 ||
+                pbfPaths.length === 0
+              ) {
+                finishDrop(importedLayers, rasterCount);
+              }
+            }
           } catch (error) {
             setDropMessage(null);
             setDropError(
@@ -514,7 +764,7 @@ export function DesktopShell({
       disposed = true;
       unlisten?.();
     };
-  }, [clearDropMessageLater, finishDrop, addDroppedRasters]);
+  }, [clearDropMessageLater, finishDrop, addDroppedRasters, addGeoJsonLayer]);
 
   const handleDragEnter = useCallback((event: DragEvent<HTMLDivElement>) => {
     if (!hasDroppedFiles(event)) return;
@@ -546,11 +796,79 @@ export function DesktopShell({
       setDropMessage("Importing data...");
 
       try {
-        const files = event.dataTransfer.files;
-        const rasterCount = await addDroppedRasters(
-          loadDroppedRasterFiles(files),
+        const allFiles = Array.from(event.dataTransfer.files);
+        // OSM PBF files produce three separate layers (points/lines/polygons),
+        // so they bypass the single-FeatureCollection vector drop pipeline.
+        // Handle them first, then run the rest through the normal pipeline —
+        // finishDrop throws on an empty list, so only call it when non-PBF
+        // files were dropped.
+        const pbfFiles = allFiles.filter((file) => isOsmPbfFileName(file.name));
+        const otherFiles = allFiles.filter(
+          (file) => !isOsmPbfFileName(file.name),
         );
-        finishDrop(await loadDroppedVectorFiles(files), rasterCount);
+
+        for (const file of pbfFiles) {
+          // Mirror the file-picker path's large-file guard (parsing a huge
+          // extract can exhaust memory even off the main thread).
+          if (file.size >= OSM_PBF_SIZE_WARN_BYTES) {
+            const sizeMb = Math.round(file.size / (1024 * 1024));
+            if (
+              !window.confirm(
+                `${file.name} is about ${sizeMb} MB. Parsing it may use a lot of memory. Continue?`,
+              )
+            ) {
+              continue;
+            }
+          }
+          setDropMessage(`Parsing ${file.name}…`);
+          let layers;
+          try {
+            layers = await loadOsmPbf(await file.arrayBuffer());
+          } catch (err) {
+            // Isolate per-file failures so one bad PBF doesn't abandon the rest
+            // of the drop (including any co-dropped non-PBF files).
+            setDropMessage(null);
+            setDropError(
+              `Could not parse ${file.name}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            continue;
+          }
+          const added = addOsmPbfLayers(
+            addGeoJsonLayer,
+            osmPbfBaseName(file.name),
+            file.name,
+            layers,
+          );
+          if (added > 0 && layers.bounds) {
+            mapControllerRef.current?.fitBounds(layers.bounds);
+          }
+          setDropMessage(
+            added > 0
+              ? `Added ${added} layer${added === 1 ? "" : "s"} from ${file.name}.`
+              : `No features found in ${file.name}.`,
+          );
+        }
+
+        if (otherFiles.length > 0) {
+          const rasterCount = await addDroppedRasters(
+            loadDroppedRasterFiles(otherFiles),
+          );
+          const importedLayers = await loadDroppedVectorFiles(otherFiles, {
+            onLargeDataset: confirmLargeVectorDataset,
+          });
+          // Call finishDrop (which reports success or throws the empty-input
+          // error) only when the other files produced something, or when the
+          // drop contained no PBF files at all. If PBF files were present —
+          // even if they were all rejected or failed — its empty-input error
+          // would wrongly clobber the PBF outcome.
+          if (
+            importedLayers.length > 0 ||
+            rasterCount > 0 ||
+            pbfFiles.length === 0
+          ) {
+            finishDrop(importedLayers, rasterCount);
+          }
+        }
       } catch (error) {
         setDropMessage(null);
         setDropError(
@@ -560,13 +878,16 @@ export function DesktopShell({
         clearDropMessageLater();
       }
     },
-    [clearDropMessageLater, finishDrop, addDroppedRasters],
+    [clearDropMessageLater, finishDrop, addDroppedRasters, addGeoJsonLayer],
   );
 
   const startLayerPanelResize = useCallback(
-    (event: ReactMouseEvent<HTMLDivElement>) => {
+    (event: ReactPointerEvent<HTMLDivElement>) => {
       event.preventDefault();
       event.stopPropagation();
+      // Route all pointer events for this drag to the handle, so a touch that
+      // slides off it (or off-screen) still reaches the listeners below.
+      event.currentTarget.setPointerCapture?.(event.pointerId);
 
       const startX = event.clientX;
       const startWidth = layerPanelWidth;
@@ -580,7 +901,7 @@ export function DesktopShell({
       document.body.style.userSelect = "none";
       window.dispatchEvent(new Event(PANEL_RESIZE_START_EVENT));
 
-      const onMouseMove = (moveEvent: MouseEvent) => {
+      const onPointerMove = (moveEvent: PointerEvent) => {
         nextWidth = clamp(
           startWidth + moveEvent.clientX - startX,
           MIN_SIDE_PANEL_WIDTH,
@@ -605,9 +926,11 @@ export function DesktopShell({
         });
       };
 
-      const onMouseUp = () => {
-        window.removeEventListener("mousemove", onMouseMove);
-        window.removeEventListener("mouseup", onMouseUp);
+      const onPointerUp = () => {
+        window.removeEventListener("pointermove", onPointerMove);
+        window.removeEventListener("pointerup", onPointerUp);
+        window.removeEventListener("pointercancel", onPointerUp);
+        activeResizeCleanupRef.current = null;
         if (resizeFrame !== null) {
           window.cancelAnimationFrame(resizeFrame);
           resizeFrame = null;
@@ -623,16 +946,23 @@ export function DesktopShell({
         document.body.style.userSelect = previousUserSelect;
       };
 
-      window.addEventListener("mousemove", onMouseMove);
-      window.addEventListener("mouseup", onMouseUp);
+      // pointercancel fires when the gesture is interrupted (OS scroll, app
+      // backgrounded); run the same teardown so styles/listeners don't stick.
+      activeResizeCleanupRef.current = onPointerUp;
+      window.addEventListener("pointermove", onPointerMove);
+      window.addEventListener("pointerup", onPointerUp);
+      window.addEventListener("pointercancel", onPointerUp);
     },
     [deferPanelResize, layerPanelWidth],
   );
 
   const startStylePanelResize = useCallback(
-    (event: ReactMouseEvent<HTMLDivElement>) => {
+    (event: ReactPointerEvent<HTMLDivElement>) => {
       event.preventDefault();
       event.stopPropagation();
+      // Route all pointer events for this drag to the handle, so a touch that
+      // slides off it (or off-screen) still reaches the listeners below.
+      event.currentTarget.setPointerCapture?.(event.pointerId);
 
       const startX = event.clientX;
       const startWidth = stylePanelWidth;
@@ -646,7 +976,7 @@ export function DesktopShell({
       document.body.style.userSelect = "none";
       window.dispatchEvent(new Event(PANEL_RESIZE_START_EVENT));
 
-      const onMouseMove = (moveEvent: MouseEvent) => {
+      const onPointerMove = (moveEvent: PointerEvent) => {
         nextWidth = clamp(
           startWidth + startX - moveEvent.clientX,
           MIN_SIDE_PANEL_WIDTH,
@@ -671,9 +1001,11 @@ export function DesktopShell({
         });
       };
 
-      const onMouseUp = () => {
-        window.removeEventListener("mousemove", onMouseMove);
-        window.removeEventListener("mouseup", onMouseUp);
+      const onPointerUp = () => {
+        window.removeEventListener("pointermove", onPointerMove);
+        window.removeEventListener("pointerup", onPointerUp);
+        window.removeEventListener("pointercancel", onPointerUp);
+        activeResizeCleanupRef.current = null;
         if (resizeFrame !== null) {
           window.cancelAnimationFrame(resizeFrame);
           resizeFrame = null;
@@ -689,8 +1021,12 @@ export function DesktopShell({
         document.body.style.userSelect = previousUserSelect;
       };
 
-      window.addEventListener("mousemove", onMouseMove);
-      window.addEventListener("mouseup", onMouseUp);
+      // pointercancel fires when the gesture is interrupted (OS scroll, app
+      // backgrounded); run the same teardown so styles/listeners don't stick.
+      activeResizeCleanupRef.current = onPointerUp;
+      window.addEventListener("pointermove", onPointerMove);
+      window.addEventListener("pointerup", onPointerUp);
+      window.addEventListener("pointercancel", onPointerUp);
     },
     [deferPanelResize, stylePanelWidth],
   );
@@ -706,56 +1042,89 @@ export function DesktopShell({
       onDrop={handleDrop}
     >
       {layoutOptions.toolbarVisible ? (
-        <TopToolbar
-          compact={layoutOptions.compact}
-          diagnosticsErrorCount={diagnostics.errorCount}
-          mapControllerRef={mapControllerRef}
-          showLabels={layoutOptions.toolbarLabels}
-          showProjectInfo={layoutOptions.showProjectInfo}
-          themeMode={themeMode}
-          onOpenDiagnostics={() => setDiagnosticsOpen(true)}
-          onToggleThemeMode={onToggleThemeMode}
-        />
-      ) : null}
-      <div className="flex min-h-0 flex-1 flex-col md:flex-row">
-        {layoutOptions.layerPanelVisible ? (
-          <LayerPanel
+        <SectionErrorBoundary label="Toolbar">
+          <TopToolbar
+            compact={layoutOptions.compact}
+            diagnosticsErrorCount={diagnostics.errorCount}
             mapControllerRef={mapControllerRef}
-            onResizeStart={startLayerPanelResize}
-            geometryEditLayerId={geometryEditLayerId}
-            onToggleGeometryEdit={handleToggleGeometryEdit}
-            onCancelGeometryEdit={handleCancelGeometryEdit}
-            onMaterializeDuckDBLayer={handleMaterializeDuckDBLayer}
+            showLabels={layoutOptions.toolbarLabels}
+            showProjectInfo={layoutOptions.showProjectInfo}
+            themeMode={themeMode}
+            onOpenDiagnostics={() => setDiagnosticsOpen(true)}
+            onToggleThemeMode={onToggleThemeMode}
           />
+        </SectionErrorBoundary>
+      ) : null}
+      <div className="relative flex min-h-0 flex-1 flex-col md:flex-row">
+        {layoutOptions.layerPanelVisible ? (
+          <SectionErrorBoundary label="Layer panel">
+            <LayerPanel
+              mapControllerRef={mapControllerRef}
+              onResizeStart={startLayerPanelResize}
+              geometryEditLayerId={geometryEditLayerId}
+              onToggleGeometryEdit={handleToggleGeometryEdit}
+              onCancelGeometryEdit={handleCancelGeometryEdit}
+              onMaterializeDuckDBLayer={handleMaterializeDuckDBLayer}
+            />
+          </SectionErrorBoundary>
         ) : null}
         <main
           className={`relative min-w-0 flex-1 overflow-hidden ${
             layoutOptions.compact ? "min-h-0" : "min-h-72 md:min-h-0"
           }`}
         >
-          <MapCanvas
-            controllerRef={mapControllerRef}
-            onMapDiagnosticEvent={handleMapDiagnosticEvent}
-            onControllerReady={handleMapControllerReady}
-          />
+          {/* Visually-hidden page title: gives the document the single
+              top-level heading that assistive tech (and the axe
+              `page-has-heading-one` check) expect, without altering the
+              chrome-free visual layout. Placed inside the main landmark so it
+              is not flagged as content outside a landmark. */}
+          <h1 className="sr-only">GeoLibre map workspace</h1>
+          <SectionErrorBoundary label="Map" fallbackClassName="h-full w-full">
+            <MapCanvas
+              controllerRef={mapControllerRef}
+              onMapDiagnosticEvent={handleMapDiagnosticEvent}
+              onControllerReady={handleMapControllerReady}
+            />
+            <RemoteCursorsOverlay mapControllerRef={mapControllerRef} />
+          </SectionErrorBoundary>
         </main>
         {layoutOptions.stylePanelVisible ? (
-          <StylePanel
-            mapControllerRef={mapControllerRef}
-            onResizeStart={startStylePanelResize}
-          />
+          <SectionErrorBoundary label="Style panel">
+            <StylePanel
+              mapControllerRef={mapControllerRef}
+              onResizeStart={startStylePanelResize}
+            />
+          </SectionErrorBoundary>
         ) : null}
       </div>
       {layoutOptions.attributePanelVisible ? (
-        <AttributeTable mapControllerRef={mapControllerRef} />
+        <SectionErrorBoundary label="Attribute table">
+          <AttributeTable mapControllerRef={mapControllerRef} />
+        </SectionErrorBoundary>
+      ) : null}
+      {pythonConsoleOpen ? (
+        <SectionErrorBoundary label="Python console">
+          <Suspense fallback={null}>
+            <PythonConsolePanel mapControllerRef={mapControllerRef} />
+          </Suspense>
+        </SectionErrorBoundary>
+      ) : null}
+      {assistantOpen ? (
+        <SectionErrorBoundary label="Assistant">
+          <Suspense fallback={null}>
+            <AssistantPanel mapControllerRef={mapControllerRef} />
+          </Suspense>
+        </SectionErrorBoundary>
       ) : null}
       {layoutOptions.statusBarVisible ? (
-        <StatusBar
-          compact={layoutOptions.compact}
-          diagnosticsErrorCount={diagnostics.errorCount}
-          diagnosticsWarningCount={diagnostics.warningCount}
-          onOpenDiagnostics={() => setDiagnosticsOpen(true)}
-        />
+        <SectionErrorBoundary label="Status bar">
+          <StatusBar
+            compact={layoutOptions.compact}
+            diagnosticsErrorCount={diagnostics.errorCount}
+            diagnosticsWarningCount={diagnostics.warningCount}
+            onOpenDiagnostics={() => setDiagnosticsOpen(true)}
+          />
+        </SectionErrorBoundary>
       ) : null}
       <DiagnosticsDialog
         diagnostics={diagnostics}
@@ -772,11 +1141,28 @@ export function DesktopShell({
         <VectorToolsDialog mapControllerRef={mapControllerRef} />
       </Suspense>
       <Suspense fallback={null}>
-        <RasterToolsDialog />
+        <NetworkToolsDialog mapControllerRef={mapControllerRef} />
+      </Suspense>
+      <Suspense fallback={null}>
+        <ModelBuilderDialog mapControllerRef={mapControllerRef} />
+      </Suspense>
+      <Suspense fallback={null}>
+        <StatisticsToolsDialog mapControllerRef={mapControllerRef} />
+      </Suspense>
+      <Suspense fallback={null}>
+        <GeocodeDialog mapControllerRef={mapControllerRef} />
+      </Suspense>
+      <Suspense fallback={null}>
+        <RasterToolsDialog mapControllerRef={mapControllerRef} />
+      </Suspense>
+      <Suspense fallback={null}>
+        <SegmentationDialog mapControllerRef={mapControllerRef} />
       </Suspense>
       <Suspense fallback={null}>
         <SqlWorkspaceDialog />
       </Suspense>
+      <StoryMapPanel mapControllerRef={mapControllerRef} />
+      <StoryMapPresenter mapControllerRef={mapControllerRef} />
       <div
         ref={verticalResizeGuideRef}
         className="pointer-events-none fixed bottom-7 top-11 z-50 hidden w-px bg-primary shadow-[0_0_0_1px_hsl(var(--primary)/0.25)]"

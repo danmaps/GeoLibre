@@ -47,10 +47,14 @@ nav:
       - Attribute Table: user-guide/attribute-table.md
       - Map Controls & Tools: user-guide/map-controls.md
       - Processing Tools: user-guide/processing.md
+      - AI Segmentation: user-guide/segmentation.md
       - SQL Workspace: user-guide/sql-workspace.md
+      - Python Console: user-guide/python-console.md
+      - AI Assistant: user-guide/ai-assistant.md
       - Data Integrations: user-guide/data-integrations.md
       - Plugins & Marketplace: user-guide/plugins.md
       - Settings & Preferences: user-guide/settings.md
+      - Story Maps: user-guide/storymaps.md
       - Embedding & Sharing: user-guide/embedding.md
   - Tutorials:
       - Overview: tutorials/index.md
@@ -62,8 +66,10 @@ nav:
       - Sharing & Embedding: tutorials/sharing-embedding.md
   - Reference:
       - Architecture: architecture.md
+      - Android: android.md
       - Project Format: project-format.md
       - Plugin API: plugin-api.md
+      - Internationalization: i18n.md
       - Python Package: python.md
       - Roadmap: roadmap.md
       - Contributing: contributing.md

@@ -1,8 +1,14 @@
 import {
   DEFAULT_LAYER_STYLE,
   type LayerType,
+  type PointRenderer,
+  VECTOR_COLOR_RAMPS,
   type VectorStyleMode,
   type VectorStyleStop,
+  createEqualIntervalBreaks,
+  createQuantileBreaks,
+  getVectorColorRamp,
+  interpolateRampColors,
   styleValue,
   useAppStore,
 } from "@geolibre/core";
@@ -15,7 +21,9 @@ import {
   Separator,
   Slider,
 } from "@geolibre/ui";
+import { RASTER_SOURCE_KIND } from "@geolibre/plugins";
 import type { MapController } from "@geolibre/map";
+import { RasterSymbologySection } from "./RasterSymbologySection";
 import {
   ChevronDown,
   ChevronUp,
@@ -26,22 +34,17 @@ import {
   Trash2,
 } from "lucide-react";
 import {
-  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
   type RefObject,
   useEffect,
+  useMemo,
   useState,
 } from "react";
+import { getIsMobileViewport } from "../../hooks/useIsMobileViewport";
 
 interface StylePanelProps {
   mapControllerRef: RefObject<MapController | null>;
-  onResizeStart: (event: ReactMouseEvent<HTMLDivElement>) => void;
-}
-
-function isMobileViewport(): boolean {
-  return (
-    typeof window !== "undefined" &&
-    window.matchMedia("(max-width: 767px)").matches
-  );
+  onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
 }
 
 function isRasterPaintLayer(type: LayerType): boolean {
@@ -129,6 +132,23 @@ function hasPolygonGeometryMetadata(value: unknown): boolean {
   );
 }
 
+/**
+ * True when a GeoJSON layer contains only point geometry, so the heatmap and
+ * cluster renderers (which only make sense for points) can be offered.
+ */
+function isPointOnlyGeoJsonLayer(layer: {
+  type: LayerType;
+  geojson?: { features?: Array<{ geometry?: { type?: string } | null }> };
+}): boolean {
+  if (layer.type !== "geojson") return false;
+  const features = layer.geojson?.features ?? [];
+  if (features.length === 0) return false;
+  return features.every((feature) => {
+    const type = feature.geometry?.type;
+    return type === "Point" || type === "MultiPoint";
+  });
+}
+
 function getMetadataFieldNames(metadata: Record<string, unknown>): string[] {
   const fieldValues = [
     metadata.fields,
@@ -213,59 +233,6 @@ const VECTOR_STYLE_COLORS = [
 const VECTOR_STYLE_CLASS_COUNTS = Array.from({ length: 12 }, (_, index) =>
   index + 1,
 );
-
-const VECTOR_COLOR_RAMPS = [
-  {
-    value: "viridis",
-    label: "Viridis",
-    colors: ["#440154", "#31688e", "#35b779", "#fde725"],
-  },
-  {
-    value: "plasma",
-    label: "Plasma",
-    colors: ["#0d0887", "#9c179e", "#ed7953", "#f0f921"],
-  },
-  {
-    value: "inferno",
-    label: "Inferno",
-    colors: ["#000004", "#781c6d", "#ed6925", "#fcffa4"],
-  },
-  {
-    value: "magma",
-    label: "Magma",
-    colors: ["#000004", "#721f81", "#f1605d", "#fcfdbf"],
-  },
-  {
-    value: "cividis",
-    label: "Cividis",
-    colors: ["#00204d", "#575d6d", "#a59c74", "#ffea46"],
-  },
-  {
-    value: "turbo",
-    label: "Turbo",
-    colors: ["#30123b", "#4777ef", "#1ccfd0", "#b9e642", "#fb8022", "#7a0403"],
-  },
-  {
-    value: "spectral",
-    label: "Spectral",
-    colors: ["#9e0142", "#f46d43", "#ffffbf", "#66c2a5", "#5e4fa2"],
-  },
-  {
-    value: "blues",
-    label: "Blues",
-    colors: ["#eff6ff", "#93c5fd", "#2563eb", "#1e3a8a"],
-  },
-  {
-    value: "greens",
-    label: "Greens",
-    colors: ["#f0fdf4", "#86efac", "#16a34a", "#14532d"],
-  },
-  {
-    value: "oranges",
-    label: "Oranges",
-    colors: ["#fff7ed", "#fdba74", "#f97316", "#7c2d12"],
-  },
-] as const;
 
 const GRADUATED_CLASSIFICATION_SCHEMES = [
   { value: "equal-interval", label: "Equal interval" },
@@ -416,75 +383,6 @@ function normalizeClassificationScheme(
   return options.some((option) => option.value === scheme)
     ? scheme
     : defaultClassificationScheme(mode);
-}
-
-function getVectorColorRamp(value: string) {
-  return (
-    VECTOR_COLOR_RAMPS.find((colorRamp) => colorRamp.value === value) ??
-    VECTOR_COLOR_RAMPS[0]
-  );
-}
-
-function interpolateRampColors(colorRamp: string, count: number): string[] {
-  const colors = getVectorColorRamp(colorRamp).colors;
-  if (count <= 1) return [colors[colors.length - 1]];
-  return Array.from({ length: count }, (_, index) => {
-    const scaled = (index / (count - 1)) * (colors.length - 1);
-    const lowerIndex = Math.floor(scaled);
-    const upperIndex = Math.min(colors.length - 1, Math.ceil(scaled));
-    const ratio = scaled - lowerIndex;
-    return interpolateHexColor(colors[lowerIndex], colors[upperIndex], ratio);
-  });
-}
-
-function interpolateHexColor(from: string, to: string, ratio: number): string {
-  const start = parseHexColor(from);
-  const end = parseHexColor(to);
-  return rgbToHex({
-    r: Math.round(start.r + (end.r - start.r) * ratio),
-    g: Math.round(start.g + (end.g - start.g) * ratio),
-    b: Math.round(start.b + (end.b - start.b) * ratio),
-  });
-}
-
-function parseHexColor(value: string): { b: number; g: number; r: number } {
-  const numeric = Number.parseInt(value.slice(1), 16);
-  return {
-    r: (numeric >> 16) & 255,
-    g: (numeric >> 8) & 255,
-    b: numeric & 255,
-  };
-}
-
-function rgbToHex(color: { b: number; g: number; r: number }): string {
-  return `#${[color.r, color.g, color.b]
-    .map((channel) => channel.toString(16).padStart(2, "0"))
-    .join("")}`;
-}
-
-function createEqualIntervalBreaks(
-  min: number,
-  max: number,
-  count: number,
-): number[] {
-  return Array.from({ length: count }, (_, index) => {
-    const ratio = count === 1 ? 0 : index / (count - 1);
-    return min + (max - min) * ratio;
-  });
-}
-
-function createQuantileBreaks(values: number[], count: number): number[] {
-  const sorted = [...values].sort((a, b) => a - b);
-  return Array.from({ length: count }, (_, index) => {
-    const position =
-      count === 1 ? 0 : (index / (count - 1)) * (sorted.length - 1);
-    const lowerIndex = Math.floor(position);
-    const upperIndex = Math.min(sorted.length - 1, Math.ceil(position));
-    const ratio = position - lowerIndex;
-    return (
-      sorted[lowerIndex] + (sorted[upperIndex] - sorted[lowerIndex]) * ratio
-    );
-  });
 }
 
 const MAX_NATURAL_BREAK_SAMPLES = 1000;
@@ -717,9 +615,10 @@ function clampNumber(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-// Shared shell classes for every StylePanel return branch.
+// Shared shell classes for every expanded StylePanel return branch. On phones
+// (max-md) it overlays the map as a bottom sheet instead of squeezing it.
 const STYLE_PANEL_ASIDE_CLASS =
-  "relative flex max-h-[min(24rem,42vh)] supports-[max-height:1dvh]:max-h-[min(24rem,42dvh)] w-full shrink-0 flex-col border-t bg-card md:max-h-none md:w-[var(--style-panel-width)] md:border-l md:border-t-0";
+  "relative flex max-h-[min(24rem,42vh)] supports-[max-height:1dvh]:max-h-[min(24rem,42dvh)] w-full shrink-0 flex-col border-t bg-card max-md:absolute max-md:inset-x-0 max-md:bottom-0 max-md:z-30 max-md:shadow-xl md:max-h-none md:w-[var(--style-panel-width)] md:border-l md:border-t-0";
 
 const MIN_LAYER_ZOOM = DEFAULT_LAYER_STYLE.minZoom;
 const MAX_LAYER_ZOOM = DEFAULT_LAYER_STYLE.maxZoom;
@@ -887,6 +786,7 @@ function RasterStyleSlider({
         </span>
       </div>
       <Slider
+        aria-label={label}
         min={min}
         max={max}
         step={step}
@@ -909,7 +809,7 @@ export function StylePanel({
   const setLayerStyle = useAppStore((s) => s.setLayerStyle);
   const updateLayer = useAppStore((s) => s.updateLayer);
   const moveLayer = useAppStore((s) => s.moveLayer);
-  const [isCollapsed, setIsCollapsed] = useState(isMobileViewport);
+  const [isCollapsed, setIsCollapsed] = useState(getIsMobileViewport);
   const [draftBeforeId, setDraftBeforeId] = useState("");
   const [draftColorExpression, setDraftColorExpression] = useState("");
   const [draftHeightExpression, setDraftHeightExpression] = useState("");
@@ -1049,19 +949,33 @@ export function StylePanel({
     layer?.style.vectorStyleStops,
   ]);
 
+  // Heatmap/cluster apply to point layers in two render paths: core GeoJSON
+  // layers (drag-drop, processing results) and Add Vector Layer point layers in
+  // the geojson render mode (the maplibre-gl-vector control renders those, so
+  // type stays "geojson"; tile-rendered layers become "vector-tiles"). Memoize
+  // the point-only scan so a large layer isn't re-scanned on every panel render.
+  // Must run before the early returns below so the hook order stays stable.
+  const isPointOnly = useMemo(
+    () => (layer ? isPointOnlyGeoJsonLayer(layer) : false),
+    [layer],
+  );
+
   const resizeHandle = (
     <div
       role="separator"
       aria-orientation="vertical"
       aria-label="Resize Style panel"
-      className="absolute -left-1 top-0 z-20 hidden h-full w-2 cursor-col-resize select-none border-l border-transparent hover:border-primary md:block"
-      onMouseDown={onResizeStart}
+      className="absolute -left-1 top-0 z-20 hidden h-full w-2 cursor-col-resize touch-none select-none border-l border-transparent hover:border-primary md:block"
+      onPointerDown={onResizeStart}
     />
   );
 
   if (isCollapsed) {
     return (
-      <aside className="flex h-11 w-full shrink-0 items-center gap-2 border-t bg-card px-2 md:h-auto md:w-11 md:flex-col md:border-l md:border-t-0 md:py-2">
+      <aside
+        aria-label="Layer style (collapsed)"
+        className="flex h-11 w-full shrink-0 items-center gap-2 border-t bg-card px-2 md:h-auto md:w-11 md:flex-col md:border-l md:border-t-0 md:py-2"
+      >
         <Button
           variant="ghost"
           size="icon"
@@ -1084,7 +998,7 @@ export function StylePanel({
 
   if (!layer) {
     return (
-      <aside className={STYLE_PANEL_ASIDE_CLASS}>
+      <aside aria-label="Layer style" className={STYLE_PANEL_ASIDE_CLASS}>
         {resizeHandle}
         <div className="flex items-center justify-between border-b px-3 py-1.5">
           <span className="text-sm font-semibold">Style</span>
@@ -1133,6 +1047,19 @@ export function StylePanel({
     isRasterPaintLayer(layer.type) || isRasterTileLayer || isDeckRasterLayer;
   const hasTextMarkerControls =
     layer.type === "geojson" && hasTextMarkerFeatures(layer);
+  // isPointOnly is memoized above the early returns to keep hook order stable.
+  const isCoreGeoJsonPoint =
+    isPointOnly &&
+    !hasExternalNativeLayers(layer) &&
+    !hasExternalDeckLayer(layer);
+  const isVectorControlPoint =
+    hasExternalNativeLayers(layer) &&
+    !hasExternalDeckLayer(layer) &&
+    layer.type === "geojson" &&
+    layer.metadata.sourceKind === "maplibre-gl-vector" &&
+    layer.metadata.geometryType === "point";
+  const supportsPointRenderer = isCoreGeoJsonPoint || isVectorControlPoint;
+  const pointRenderer = styleValue(style, "pointRenderer");
   const extrusionEnabled = styleValue(style, "extrusionEnabled");
   const extrusionHeightPropertyOptions = getAttributePropertyNames(layer);
   const vectorStylePropertyOptions = extrusionHeightPropertyOptions;
@@ -1676,6 +1603,83 @@ export function StylePanel({
   );
   const twoDimensionalControls = (
     <>
+      {supportsPointRenderer ? (
+        <>
+          <div className="space-y-2">
+            <Label htmlFor="pointRenderer">Point renderer</Label>
+            <Select
+              id="pointRenderer"
+              value={pointRenderer}
+              onChange={(event) =>
+                setLayerStyle(layer.id, {
+                  pointRenderer: event.target.value as PointRenderer,
+                })
+              }
+            >
+              <option value="single">Single symbol</option>
+              <option value="heatmap">Heatmap</option>
+              <option value="cluster">Clustered</option>
+            </Select>
+          </div>
+          {pointRenderer === "heatmap" ? (
+            <>
+              <NumericStyleInput
+                id="heatmapRadius"
+                label="Heatmap radius"
+                min={1}
+                max={100}
+                step={1}
+                value={styleValue(style, "heatmapRadius")}
+                onChange={(heatmapRadius) =>
+                  setLayerStyle(layer.id, { heatmapRadius })
+                }
+              />
+              <NumericStyleInput
+                id="heatmapIntensity"
+                label="Heatmap intensity"
+                min={0.1}
+                max={5}
+                step={0.1}
+                value={styleValue(style, "heatmapIntensity")}
+                onChange={(heatmapIntensity) =>
+                  setLayerStyle(layer.id, { heatmapIntensity })
+                }
+              />
+            </>
+          ) : null}
+          {pointRenderer === "cluster" ? (
+            <>
+              <NumericStyleInput
+                id="clusterRadius"
+                label="Cluster radius (px)"
+                min={10}
+                max={200}
+                step={5}
+                value={styleValue(style, "clusterRadius")}
+                onChange={(clusterRadius) =>
+                  setLayerStyle(layer.id, { clusterRadius })
+                }
+              />
+              <NumericStyleInput
+                id="clusterMaxZoom"
+                label="Cluster max zoom"
+                min={0}
+                max={24}
+                step={1}
+                value={styleValue(style, "clusterMaxZoom")}
+                onChange={(clusterMaxZoom) =>
+                  setLayerStyle(layer.id, { clusterMaxZoom })
+                }
+              />
+            </>
+          ) : null}
+          <Separator />
+        </>
+      ) : null}
+      {/* The heatmap renderer ignores fill/stroke/circle/data-driven styling, so
+          hide those controls when it is selected. */}
+      {pointRenderer === "heatmap" ? null : (
+        <>
       {draftVectorStyleMode === "single" ? (
         <div className="space-y-2">
           <Label htmlFor="fillColor">Fill color</Label>
@@ -1774,6 +1778,8 @@ export function StylePanel({
           />
         </>
       ) : null}
+        </>
+      )}
     </>
   );
   const extrusionControls = (
@@ -1886,7 +1892,7 @@ export function StylePanel({
 
   if (hasRasterPaintControls) {
     return (
-      <aside className={STYLE_PANEL_ASIDE_CLASS}>
+      <aside aria-label="Layer style" className={STYLE_PANEL_ASIDE_CLASS}>
         {resizeHandle}
         <div className="flex items-center justify-between gap-2 border-b px-3 py-1.5">
           <span className="truncate text-sm font-semibold">
@@ -1970,6 +1976,9 @@ export function StylePanel({
                 />
               </>
             )}
+            {layer.metadata.sourceKind === RASTER_SOURCE_KIND && (
+              <RasterSymbologySection layer={layer} />
+            )}
           </div>
         </ScrollArea>
         <Separator />
@@ -1984,7 +1993,7 @@ export function StylePanel({
 
   if (!hasVectorPaintControls) {
     return (
-      <aside className={STYLE_PANEL_ASIDE_CLASS}>
+      <aside aria-label="Layer style" className={STYLE_PANEL_ASIDE_CLASS}>
         {resizeHandle}
         <div className="flex items-center justify-between gap-2 border-b px-3 py-1.5">
           <span className="truncate text-sm font-semibold">
@@ -2014,7 +2023,7 @@ export function StylePanel({
   }
 
   return (
-    <aside className={STYLE_PANEL_ASIDE_CLASS}>
+    <aside aria-label="Layer style" className={STYLE_PANEL_ASIDE_CLASS}>
       {resizeHandle}
       <div className="flex items-center justify-between gap-2 border-b px-3 py-1.5">
         <span className="truncate text-sm font-semibold">
@@ -2066,7 +2075,8 @@ export function StylePanel({
               </div>
             </div>
           )}
-          {vectorSymbologyControls}
+          {/* Data-driven coloring doesn't apply to the heatmap renderer. */}
+          {pointRenderer === "heatmap" ? null : vectorSymbologyControls}
           {!hasExtrusionControls || !extrusionEnabled ? (
             twoDimensionalControls
           ) : (

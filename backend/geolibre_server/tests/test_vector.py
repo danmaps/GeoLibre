@@ -62,6 +62,15 @@ def test_dispatch_covers_all_tools() -> None:
         "intersection",
         "difference",
         "union",
+        "spatial-join",
+        "attribute-join",
+        "select-by-value",
+        "select-by-location",
+        "reproject",
+        "explode",
+        "aggregate",
+        "smooth",
+        "voronoi",
     }
     assert set(_DISPATCH) == expected
 
