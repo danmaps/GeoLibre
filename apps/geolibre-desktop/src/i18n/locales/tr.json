@@ -20,26 +20,24 @@
       "map": "Harita",
       "layout": "Düzen",
       "environment": "Ortam",
-      "project": "Proje",
       "account": "Hesap"
     },
     "menu": {
       "mapPreferences": "Harita Tercihleri",
       "layoutSettings": "Düzen Ayarları",
       "environmentVariables": "Ortam Değişkenleri",
-      "projectSettings": "Proje Ayarları",
       "managePlugins": "Eklentileri Yönet",
       "urlOverrideNote": "URL düzen parametreleri kayıtlı ayarları geçersiz kılar."
     },
     "map": {
       "constraintsTitle": "Harita kısıtlamaları",
-      "constraintsDescription": "Kısıtlamalar proje açıkken geçerlidir.",
       "restrictBounds": "Harita sınırlarını kısıtla",
       "west": "Batı",
       "south": "Güney",
       "east": "Doğu",
       "north": "Kuzey",
       "useCurrentView": "Mevcut Görünümü Kullan",
+      "useCurrentViewGlobeHint": "Bunu kullanmadan önce Mercator projeksiyonuna geçin. Küre projeksiyonunda harita, yakalanan sınırların biraz dışına kayabilir.",
       "minZoom": "Minimum yakınlaştırma",
       "maxZoom": "Maksimum yakınlaştırma",
       "maxPitch": "Maksimum eğim",
@@ -80,14 +78,6 @@
       "removeAria": "{{name}} öğesini kaldır",
       "errorNamePattern": "Ortam değişkeni adları bir harf veya alt çizgi ile başlamalı; yalnızca harf, rakam ve alt çizgi içermelidir.",
       "errorDuplicate": "\"{{name}}\" ortam değişkeni yinelendi."
-    },
-    "project": {
-      "title": "Proje",
-      "description": "Ayarlar `.geolibre.json` projesiyle kaydedilir.",
-      "name": "Ad",
-      "file": "Proje dosyası",
-      "notSaved": "Kaydedilmedi",
-      "format": "Proje biçimi"
     }
   },
   "toolbar": {
@@ -287,7 +277,7 @@
       "webServices": "Web Servisleri",
       "commandPalette": "Komut Paleti",
       "openProjectFromUrl": "URL'den proje aç",
-      "openProjectFromUrlDesc": "Genel bir `.geolibre.json` projesini yükleyin ve son projelere ekleyin.",
+      "openProjectFromUrlDesc": "Bir `.geolibre.json` projesini yükleyin ve son projelere ekleyin.",
       "projectUrl": "Proje URL'si",
       "opening": "Açılıyor...",
       "open": "Aç",

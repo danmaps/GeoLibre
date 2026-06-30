@@ -20,26 +20,24 @@
       "map": "Karte",
       "layout": "Layout",
       "environment": "Umgebung",
-      "project": "Projekt",
       "account": "Konto"
     },
     "menu": {
       "mapPreferences": "Karteneinstellungen",
       "layoutSettings": "Layout-Einstellungen",
       "environmentVariables": "Umgebungsvariablen",
-      "projectSettings": "Projekteinstellungen",
       "managePlugins": "Plugins verwalten",
       "urlOverrideNote": "URL-Layout-Parameter überschreiben gespeicherte Einstellungen."
     },
     "map": {
       "constraintsTitle": "Kartenbeschränkungen",
-      "constraintsDescription": "Einschränkungen gelten, solange das Projekt geöffnet ist.",
       "restrictBounds": "Kartenausschnitt einschränken",
       "west": "West",
       "south": "Süd",
       "east": "Ost",
       "north": "Nord",
       "useCurrentView": "Aktuelle Ansicht verwenden",
+      "useCurrentViewGlobeHint": "Wechseln Sie zur Mercator-Projektion, bevor Sie dies verwenden. In der Globus-Projektion kann die Karte noch leicht über die erfassten Grenzen hinaus verschoben werden.",
       "minZoom": "Min. Zoom",
       "maxZoom": "Max. Zoom",
       "maxPitch": "Max. Neigung",
@@ -80,14 +78,6 @@
       "removeAria": "{{name}} entfernen",
       "errorNamePattern": "Namen von Umgebungsvariablen müssen mit einem Buchstaben oder Unterstrich beginnen und dürfen nur Buchstaben, Zahlen und Unterstriche enthalten.",
       "errorDuplicate": "Die Umgebungsvariable \"{{name}}\" ist doppelt vorhanden."
-    },
-    "project": {
-      "title": "Projekt",
-      "description": "Einstellungen werden mit dem `.geolibre.json`-Projekt gespeichert.",
-      "name": "Name",
-      "file": "Projektdatei",
-      "notSaved": "Nicht gespeichert",
-      "format": "Projektformat"
     }
   },
   "toolbar": {
@@ -287,7 +277,7 @@
       "webServices": "Webdienste",
       "commandPalette": "Befehlspalette",
       "openProjectFromUrl": "Projekt aus URL öffnen",
-      "openProjectFromUrlDesc": "Ein öffentliches `.geolibre.json`-Projekt laden und zu zuletzt geöffneten Projekten hinzufügen.",
+      "openProjectFromUrlDesc": "Ein `.geolibre.json`-Projekt laden und zu zuletzt geöffneten Projekten hinzufügen.",
       "projectUrl": "Projekt-URL",
       "opening": "Wird geöffnet...",
       "open": "Öffnen",

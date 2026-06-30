@@ -8,6 +8,7 @@ import {
   Input,
   Label,
 } from "@geolibre/ui";
+import { useRef } from "react";
 import { useTranslation } from "react-i18next";
 import type { useProjectFileActions } from "../../../hooks/useProjectFileActions";
 
@@ -15,9 +16,20 @@ interface ProjectFileDialogsProps {
   projectFiles: ReturnType<typeof useProjectFileActions>;
 }
 
-/** The project-file dialogs: Open-from-URL, the error dialog, and the env-var strip prompt. */
+/** The project-file dialogs: Open-from-URL, the error dialog, the save-name prompt, and the env-var strip prompt. */
 export function ProjectFileDialogs({ projectFiles }: ProjectFileDialogsProps) {
   const { t } = useTranslation();
+
+  // The save-name prompt is cleared to null synchronously on submit/cancel,
+  // before the dialog's exit animation finishes. Keep the last non-null copy so
+  // its title/label text stays put through the close transition instead of
+  // flashing blank.
+  const lastSaveNamePrompt = useRef<typeof projectFiles.saveNamePrompt>(null);
+  if (projectFiles.saveNamePrompt) {
+    lastSaveNamePrompt.current = projectFiles.saveNamePrompt;
+  }
+  const saveNameLabels =
+    projectFiles.saveNamePrompt ?? lastSaveNamePrompt.current;
 
   return (
     <>
@@ -86,6 +98,51 @@ export function ProjectFileDialogs({ projectFiles }: ProjectFileDialogsProps) {
         </DialogContent>
       </Dialog>
       <Dialog
+        open={projectFiles.saveNamePrompt !== null}
+        onOpenChange={(open: boolean) => {
+          if (!open) projectFiles.cancelSaveNamePrompt();
+        }}
+      >
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{saveNameLabels?.title}</DialogTitle>
+            <DialogDescription>{saveNameLabels?.description}</DialogDescription>
+          </DialogHeader>
+          <form
+            className="space-y-4"
+            onSubmit={projectFiles.submitSaveNamePrompt}
+          >
+            <div className="space-y-2">
+              <Label htmlFor="save-project-name">{saveNameLabels?.label}</Label>
+              <Input
+                id="save-project-name"
+                autoFocus
+                placeholder={saveNameLabels?.placeholder}
+                value={projectFiles.saveNameInput}
+                onChange={(event) =>
+                  projectFiles.setSaveNameInput(event.target.value)
+                }
+              />
+            </div>
+            <div className="flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => projectFiles.cancelSaveNamePrompt()}
+              >
+                {t("common.cancel")}
+              </Button>
+              <Button
+                type="submit"
+                disabled={!projectFiles.saveNameInput.trim()}
+              >
+                {t("common.save")}
+              </Button>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
+      <Dialog
         open={projectFiles.envStripPrompt !== null}
         onOpenChange={(open: boolean) => {
           if (!open) projectFiles.resolveEnvStripPrompt("cancel");
@@ -119,6 +176,82 @@ export function ProjectFileDialogs({ projectFiles }: ProjectFileDialogsProps) {
           </div>
         </DialogContent>
       </Dialog>
+      <Dialog
+        open={projectFiles.embedVectorDataPrompt !== null}
+        onOpenChange={(open: boolean) => {
+          if (!open) projectFiles.resolveEmbedVectorDataPrompt("cancel");
+        }}
+      >
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{t("toolbar.item.embedVectorTitle")}</DialogTitle>
+            <DialogDescription>
+              {t(
+                projectFiles.embedVectorDataPrompt?.desktop
+                  ? "toolbar.item.embedVectorDescDesktop"
+                  : "toolbar.item.embedVectorDesc",
+                {
+                  count: projectFiles.embedVectorDataPrompt?.count ?? 0,
+                  size: formatByteSize(
+                    projectFiles.embedVectorDataPrompt?.bytes ?? 0,
+                  ),
+                },
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex justify-end gap-2">
+            <Button
+              variant="outline"
+              onClick={() =>
+                projectFiles.resolveEmbedVectorDataPrompt("cancel")
+              }
+            >
+              {t("common.cancel")}
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() =>
+                projectFiles.resolveEmbedVectorDataPrompt("noembed")
+              }
+            >
+              {t(
+                projectFiles.embedVectorDataPrompt?.desktop
+                  ? "toolbar.item.embedVectorReferenceButton"
+                  : "toolbar.item.embedVectorSkipButton",
+              )}
+            </Button>
+            <Button
+              onClick={() => projectFiles.resolveEmbedVectorDataPrompt("embed")}
+            >
+              {t("toolbar.item.embedVectorEmbedButton")}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </>
   );
+}
+
+/**
+ * Formats a byte count as a short, human-readable size (e.g. "3.4 MB") for the
+ * embed-data prompt's size warning.
+ *
+ * @param bytes - The size in bytes.
+ * @returns A localized-ish size string with one decimal for MB and above.
+ */
+function formatByteSize(bytes: number): string {
+  // One decimal, with the user's locale decimal separator (e.g. "3,4 MB").
+  const oneDecimal = (value: number) =>
+    value.toLocaleString(undefined, {
+      minimumFractionDigits: 1,
+      maximumFractionDigits: 1,
+    });
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  // < 1023.5 so a value that rounds up to 1024 prints "1.0 MB", not "1024 KB".
+  if (kb < 1023.5) return `${Math.round(kb).toLocaleString()} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${oneDecimal(mb)} MB`;
+  const gb = mb / 1024;
+  return `${oneDecimal(gb)} GB`;
 }

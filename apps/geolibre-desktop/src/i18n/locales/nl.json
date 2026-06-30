@@ -20,26 +20,24 @@
       "map": "Kaart",
       "layout": "Indeling",
       "environment": "Omgeving",
-      "project": "Project",
       "account": "Account"
     },
     "menu": {
       "mapPreferences": "Kaartvoorkeuren",
       "layoutSettings": "Indelingsinstellingen",
       "environmentVariables": "Omgevingsvariabelen",
-      "projectSettings": "Projectinstellingen",
       "managePlugins": "Plug-ins beheren",
       "urlOverrideNote": "URL-indelingsparameters overschrijven opgeslagen instellingen."
     },
     "map": {
       "constraintsTitle": "Kaartbeperkingen",
-      "constraintsDescription": "Limieten gelden zolang het project open is.",
       "restrictBounds": "Kaartgrenzen beperken",
       "west": "West",
       "south": "Zuid",
       "east": "Oost",
       "north": "Noord",
       "useCurrentView": "Huidige weergave gebruiken",
+      "useCurrentViewGlobeHint": "Schakel over naar de Mercator-projectie voordat u dit gebruikt. In de Wereldbol-projectie kan de kaart nog steeds iets buiten de vastgelegde grenzen schuiven.",
       "minZoom": "Minimale zoom",
       "maxZoom": "Maximale zoom",
       "maxPitch": "Maximale hellingshoek",
@@ -80,14 +78,6 @@
       "removeAria": "{{name}} verwijderen",
       "errorNamePattern": "Namen van omgevingsvariabelen moeten beginnen met een letter of onderstrepingsteken en mogen alleen letters, cijfers en onderstrepingstekens bevatten.",
       "errorDuplicate": "Omgevingsvariabele \"{{name}}\" is gedupliceerd."
-    },
-    "project": {
-      "title": "Project",
-      "description": "Instellingen worden opgeslagen met het `.geolibre.json`-project.",
-      "name": "Naam",
-      "file": "Projectbestand",
-      "notSaved": "Niet opgeslagen",
-      "format": "Projectformaat"
     }
   },
   "toolbar": {
@@ -287,7 +277,7 @@
       "webServices": "Webservices",
       "commandPalette": "Opdrachtpalet",
       "openProjectFromUrl": "Project openen vanuit URL",
-      "openProjectFromUrlDesc": "Laad een openbaar `.geolibre.json`-project en voeg het toe aan recente projecten.",
+      "openProjectFromUrlDesc": "Laad een `.geolibre.json`-project en voeg het toe aan recente projecten.",
       "projectUrl": "Project-URL",
       "opening": "Openen...",
       "open": "Openen",

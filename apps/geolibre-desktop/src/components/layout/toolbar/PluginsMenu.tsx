@@ -1,7 +1,9 @@
 import {
+  COMPONENTS_PLUGIN_ID,
   DECK_VIZ_PLUGIN_ID,
   DIRECTIONS_PLUGIN_ID,
   type GeoLibreMapControlPosition,
+  GRATICULE_PLUGIN_ID,
   REVERSE_GEOCODE_PLUGIN_ID,
   EFFECTS_PLUGIN_ID,
   WEB_SERVICE_PLUGIN_IDS,
@@ -43,6 +45,8 @@ interface PluginsMenuProps {
   toggle: PluginRegistry["toggle"];
   getMapControlPosition: PluginRegistry["getMapControlPosition"];
   setMapControlPosition: PluginRegistry["setMapControlPosition"];
+  /** Plugin ids hidden by the active UI profile (issue #500). */
+  hiddenPluginIds: Set<string>;
 }
 
 /** The Plugins menu: one toggle per registered plugin, with position submenus. */
@@ -54,6 +58,7 @@ export function PluginsMenu({
   toggle,
   getMapControlPosition,
   setMapControlPosition,
+  hiddenPluginIds,
 }: PluginsMenuProps) {
   const { t } = useTranslation();
 
@@ -107,8 +112,8 @@ export function PluginsMenu({
     );
   };
 
-  const webServicePlugins = plugins.filter((p) =>
-    WEB_SERVICE_PLUGIN_ID_SET.has(p.id),
+  const webServicePlugins = plugins.filter(
+    (p) => WEB_SERVICE_PLUGIN_ID_SET.has(p.id) && !hiddenPluginIds.has(p.id),
   );
   // The web service plugins render as one grouped submenu, placed where the
   // first of them appears in registration order (just above Esri Wayback).
@@ -131,22 +136,35 @@ export function PluginsMenu({
         <DropdownMenuLabel>{t("toolbar.item.activatePlugin")}</DropdownMenuLabel>
         <DropdownMenuSeparator />
         {plugins.map((p) => {
-          // Atmosphere Effects, Directions, and Reverse Geocode are toggled
-          // from the Controls menu instead, so they are omitted here to avoid a
-          // duplicate toggle. The deck.gl viz overlay is an internal renderer
-          // driven by the Add Data → "Deck.gl Layer" dialog, not a user-facing
-          // toggle, so it is hidden here too.
+          // Atmospheric Effects, Directions, Reverse Geocode, and Gridlines are
+          // toggled from the Controls menu instead, so they are omitted here to
+          // avoid a duplicate toggle. The deck.gl viz overlay is an internal
+          // renderer driven by the Add Data → "Deck.gl Layer" dialog, not a
+          // user-facing toggle, so it is hidden here too. The Components plugin
+          // stays registered for in-app use, but its catch-all grid is hidden
+          // from the menu now that its panels are reachable through dedicated
+          // plugins.
           if (
             p.id === EFFECTS_PLUGIN_ID ||
             p.id === DIRECTIONS_PLUGIN_ID ||
             p.id === REVERSE_GEOCODE_PLUGIN_ID ||
-            p.id === DECK_VIZ_PLUGIN_ID
+            p.id === GRATICULE_PLUGIN_ID ||
+            p.id === DECK_VIZ_PLUGIN_ID ||
+            p.id === COMPONENTS_PLUGIN_ID
           ) {
+            return null;
+          }
+          // Hidden by the active UI profile (issue #500).
+          if (hiddenPluginIds.has(p.id)) {
             return null;
           }
           if (!WEB_SERVICE_PLUGIN_ID_SET.has(p.id)) {
             return renderPluginMenuItem(p);
           }
+          // Reaching here means `p` is a visible web service plugin, so the
+          // submenu has at least one entry. When all web service plugins are
+          // hidden no plugin reaches this branch and the submenu simply never
+          // renders.
           if (webServicesRendered) return null;
           webServicesRendered = true;
           return (

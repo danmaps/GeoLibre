@@ -170,6 +170,62 @@ describe("project parsing", () => {
     assert.deepEqual(reparsed.legend, legend);
   });
 
+  it("round-trips vector symbology style fields through projectFromStore", () => {
+    const layer = geojsonLayer({
+      style: {
+        ...DEFAULT_LAYER_STYLE,
+        vectorStyleMode: "rule-based",
+        vectorRules: [
+          {
+            id: "1",
+            label: "Parks",
+            filter: '["==", ["get", "TYPE"], "park"]',
+            color: "#00ff00",
+            isElse: false,
+          },
+          { id: "e", label: "Else", filter: "", color: "#cccccc", isElse: true },
+        ],
+        proportionalSizeEnabled: true,
+        proportionalSizeProperty: "pop",
+        proportionalSizeMaxValue: 5000,
+        fillPattern: "hatch",
+        fillPatternColor: "#112233",
+        markerEnabled: true,
+        markerShape: "star",
+        markerColor: "#ff8800",
+        markerSize: 24,
+      },
+    });
+    const project = projectFromStore({
+      projectName: "Symbology",
+      mapView: { center: [0, 0], zoom: 2, bearing: 0, pitch: 0 },
+      basemapStyleUrl: DEFAULT_BASEMAP,
+      basemapVisible: true,
+      basemapOpacity: 1,
+      layers: [layer],
+      preferences: createEmptyProject().preferences,
+      metadata: {},
+    });
+    const reparsed = parseProject(serializeProject(project));
+    const style = reparsed.styles[layer.id];
+    assert.equal(style.vectorStyleMode, "rule-based");
+    assert.equal(style.vectorRules.length, 2);
+    assert.equal(style.vectorRules[0].label, "Parks");
+    assert.equal(style.vectorRules[0].filter, '["==", ["get", "TYPE"], "park"]');
+    assert.equal(style.vectorRules[0].color, "#00ff00");
+    assert.equal(style.vectorRules[0].isElse, false);
+    assert.equal(style.vectorRules[1].isElse, true);
+    assert.equal(style.proportionalSizeEnabled, true);
+    assert.equal(style.proportionalSizeProperty, "pop");
+    assert.equal(style.proportionalSizeMaxValue, 5000);
+    assert.equal(style.fillPattern, "hatch");
+    assert.equal(style.fillPatternColor, "#112233");
+    assert.equal(style.markerEnabled, true);
+    assert.equal(style.markerShape, "star");
+    assert.equal(style.markerColor, "#ff8800");
+    assert.equal(style.markerSize, 24);
+  });
+
   it("round-trips saved processing models through projectFromStore", () => {
     const models = [
       {
@@ -321,6 +377,194 @@ describe("project parsing", () => {
     // path (ensureExternalGeoJsonNativeLayer) can re-render them on reopen.
     const reopened = parseProject(serializeProject(project));
     assert.equal(reopened.layers[0].geojson?.features.length, 1);
+  });
+
+  it("drops geojson for Add Vector Layer (maplibre-gl-vector) local-file layers", () => {
+    // These layers restore via the control (file path on desktop, embedded
+    // GeoJSON on the web), not from `geojson` — which is only the attribute
+    // table's copy. Persisting it would silently embed the dataset and bypass
+    // the web embed prompt, so it must be stripped even without a source URL.
+    const project = projectFromStore({
+      projectName: "Add Vector Layer file",
+      mapView: { center: [0, 0], zoom: 2, bearing: 0, pitch: 0 },
+      basemapStyleUrl: DEFAULT_BASEMAP,
+      basemapVisible: true,
+      basemapOpacity: 1,
+      layers: [
+        geojsonLayer({
+          id: "vector-file",
+          source: { type: "geojson" },
+          sourcePath: "/home/user/data/buildings.gpkg",
+          metadata: {
+            externalNativeLayer: true,
+            sourceKind: "maplibre-gl-vector",
+            localFileReloadable: true,
+          },
+          geojson: {
+            type: "FeatureCollection",
+            features: [
+              {
+                type: "Feature",
+                properties: {},
+                geometry: { type: "Point", coordinates: [1, 2] },
+              },
+            ],
+          },
+        }),
+      ],
+      preferences: createEmptyProject().preferences,
+      metadata: {},
+    });
+
+    assert.equal(project.layers[0].geojson, undefined);
+    // The reload path is preserved so the layer still restores on reopen.
+    assert.equal(project.layers[0].sourcePath, "/home/user/data/buildings.gpkg");
+  });
+
+  it("drops geojson for a plain local-file layer flagged localFileReloadable", () => {
+    // A drag-dropped or Add Data desktop layer whose absolute path was captured:
+    // the data is re-read from disk on reopen, so it must not be embedded.
+    const project = projectFromStore({
+      projectName: "Dropped file",
+      mapView: { center: [0, 0], zoom: 2, bearing: 0, pitch: 0 },
+      basemapStyleUrl: DEFAULT_BASEMAP,
+      basemapVisible: true,
+      basemapOpacity: 1,
+      layers: [
+        geojsonLayer({
+          id: "dropped",
+          source: { type: "geojson" },
+          sourcePath: "/home/user/data/cities.geojson",
+          metadata: { localFileReloadable: true },
+          geojson: {
+            type: "FeatureCollection",
+            features: [
+              {
+                type: "Feature",
+                properties: {},
+                geometry: { type: "Point", coordinates: [1, 2] },
+              },
+            ],
+          },
+        }),
+      ],
+      preferences: createEmptyProject().preferences,
+      metadata: {},
+    });
+
+    assert.equal(project.layers[0].geojson, undefined);
+    assert.equal(project.layers[0].sourcePath, "/home/user/data/cities.geojson");
+    assert.equal(project.layers[0].metadata.localFileReloadable, true);
+  });
+});
+
+describe("multi-map grid persistence", () => {
+  it("omits the grid keys for a default single-map project", () => {
+    const project = projectFromStore({
+      projectName: "Single",
+      mapView: { center: [0, 0], zoom: 2, bearing: 0, pitch: 0 },
+      basemapStyleUrl: DEFAULT_BASEMAP,
+      basemapVisible: true,
+      basemapOpacity: 1,
+      layers: [],
+      preferences: createEmptyProject().preferences,
+      metadata: {},
+    });
+    assert.equal(project.mapLayout, undefined);
+    assert.equal(project.secondaryMapViews, undefined);
+  });
+
+  it("round-trips a 2x2 grid with per-pane layer visibility and labels", () => {
+    const secondaryMapViews = [
+      {
+        id: "pane-1",
+        view: { center: [10, 20], zoom: 5, bearing: 0, pitch: 0 },
+        label: "2024",
+        layerVisibility: { "layer-a": false, "layer-b": true },
+      },
+      {
+        id: "pane-2",
+        view: { center: [0, 0], zoom: 2, bearing: 0, pitch: 0 },
+        layerVisibility: { "layer-a": true },
+      },
+      {
+        id: "pane-3",
+        view: { center: [0, 0], zoom: 2, bearing: 0, pitch: 0 },
+        layerVisibility: {},
+      },
+    ];
+    const project = projectFromStore({
+      projectName: "Grid",
+      mapView: { center: [0, 0], zoom: 2, bearing: 0, pitch: 0 },
+      basemapStyleUrl: DEFAULT_BASEMAP,
+      basemapVisible: true,
+      basemapOpacity: 1,
+      layers: [],
+      preferences: createEmptyProject().preferences,
+      mapLayout: { rows: 2, cols: 2, syncView: false },
+      secondaryMapViews,
+      primaryMapLabel: "2020",
+      metadata: {},
+    });
+    assert.deepEqual(project.mapLayout, { rows: 2, cols: 2, syncView: false });
+    assert.deepEqual(project.secondaryMapViews, secondaryMapViews);
+    assert.equal(project.primaryMapLabel, "2020");
+    const reparsed = parseProject(serializeProject(project));
+    assert.deepEqual(reparsed.mapLayout, { rows: 2, cols: 2, syncView: false });
+    assert.deepEqual(reparsed.secondaryMapViews, secondaryMapViews);
+    assert.equal(reparsed.primaryMapLabel, "2020");
+  });
+
+  it("reconciles surplus secondary panes down to rows * cols - 1", () => {
+    const reparsed = parseProject(
+      JSON.stringify({
+        version: "0.2.0",
+        name: "Too many",
+        mapView: { center: [0, 0], zoom: 2, bearing: 0, pitch: 0 },
+        mapLayout: { rows: 1, cols: 2, syncView: true },
+        secondaryMapViews: [
+          { id: "a", view: { center: [1, 1], zoom: 3, bearing: 0, pitch: 0 } },
+          { id: "b", view: { center: [2, 2], zoom: 4, bearing: 0, pitch: 0 } },
+          { id: "c", view: { center: [3, 3], zoom: 5, bearing: 0, pitch: 0 } },
+        ],
+      }),
+    );
+    // A 1x2 grid has exactly one secondary pane; surplus entries are dropped.
+    assert.equal(reparsed.secondaryMapViews?.length, 1);
+    assert.equal(reparsed.secondaryMapViews?.[0].id, "a");
+  });
+
+  it("fills missing secondary panes by cloning the primary map", () => {
+    const reparsed = parseProject(
+      JSON.stringify({
+        version: "0.2.0",
+        name: "Too few",
+        mapView: { center: [7, 8], zoom: 6, bearing: 0, pitch: 0 },
+        basemapStyleUrl: "https://tiles.openfreemap.org/styles/dark",
+        mapLayout: { rows: 2, cols: 2, syncView: true },
+        secondaryMapViews: [
+          { id: "a", view: { center: [1, 1], zoom: 3, bearing: 0, pitch: 0 } },
+        ],
+      }),
+    );
+    // A 2x2 grid needs three secondary panes; the two missing ones clone primary.
+    assert.equal(reparsed.secondaryMapViews?.length, 3);
+    assert.deepEqual(reparsed.secondaryMapViews?.[1].view.center, [7, 8]);
+    // Cloned panes start with no visibility overrides (they inherit the primary).
+    assert.deepEqual(reparsed.secondaryMapViews?.[1].layerVisibility, {});
+  });
+
+  it("ignores a 1x1 grid so single-map files stay clean", () => {
+    const reparsed = parseProject(
+      JSON.stringify({
+        version: "0.2.0",
+        name: "One pane",
+        mapView: { center: [0, 0], zoom: 2, bearing: 0, pitch: 0 },
+        mapLayout: { rows: 1, cols: 1, syncView: true },
+      }),
+    );
+    assert.equal(reparsed.mapLayout, undefined);
+    assert.equal(reparsed.secondaryMapViews, undefined);
   });
 });
 
@@ -511,6 +755,44 @@ describe("story maps", () => {
     assert.equal(settingsOnly.storymap?.chapters.length, 0);
   });
 
+  it("normalizes hideChapterNav and start/closing slide settings", () => {
+    const base = {
+      version: "0.1.0",
+      name: "Story",
+      mapView: { center: [0, 0], zoom: 2, bearing: 0, pitch: 0 },
+    };
+    // Valid values round-trip; an invalid slide mode falls back to "none".
+    const project = parseProject(
+      JSON.stringify({
+        ...base,
+        storymap: {
+          hideChapterNav: true,
+          startSlide: "global",
+          endSlide: "warp",
+          chapters: [chapter()],
+        },
+      }),
+    );
+    assert.ok(project.storymap);
+    assert.equal(project.storymap.hideChapterNav, true);
+    assert.equal(project.storymap.startSlide, "global");
+    assert.equal(project.storymap.endSlide, "none");
+
+    // Defaults when omitted.
+    const defaults = parseProject(
+      JSON.stringify({ ...base, storymap: { chapters: [chapter()] } }),
+    );
+    assert.equal(defaults.storymap?.hideChapterNav, false);
+    assert.equal(defaults.storymap?.startSlide, "none");
+    assert.equal(defaults.storymap?.endSlide, "none");
+
+    // A settings-only story is kept when it only sets a non-default slide.
+    const settingsOnly = parseProject(
+      JSON.stringify({ ...base, storymap: { startSlide: "black", chapters: [] } }),
+    );
+    assert.equal(settingsOnly.storymap?.startSlide, "black");
+  });
+
   it("round-trips a story map through the store and back to a project", () => {
     const store = useAppStore.getState();
     store.addStoryChapter(chapter() as never);
@@ -676,5 +958,163 @@ describe("story map import/export", () => {
     // Missing ids are generated.
     assert.ok(restored.chapters[0].id);
     assert.notEqual(restored.chapters[0].id, restored.chapters[1].id);
+  });
+
+  it("grows and shrinks the secondary panes when the grid resizes", () => {
+    const store = useAppStore.getState();
+    assert.equal(store.secondaryMapViews.length, 0);
+
+    store.setMapGrid(2, 2);
+    // A 2x2 grid keeps three secondary panes (pane 0 is the primary map).
+    assert.equal(useAppStore.getState().secondaryMapViews.length, 3);
+    assert.deepEqual(useAppStore.getState().mapLayout, {
+      rows: 2,
+      cols: 2,
+      syncView: true,
+    });
+
+    useAppStore.getState().setMapGrid(1, 2);
+    assert.equal(useAppStore.getState().secondaryMapViews.length, 1);
+
+    useAppStore.getState().setMapGrid(1, 1);
+    assert.equal(useAppStore.getState().secondaryMapViews.length, 0);
+  });
+
+  it("clamps grid dimensions into the supported range", () => {
+    useAppStore.getState().setMapGrid(99, 0);
+    const { mapLayout } = useAppStore.getState();
+    assert.equal(mapLayout.rows, 4);
+    assert.equal(mapLayout.cols, 1);
+  });
+
+  it("toggles synchronized views", () => {
+    useAppStore.getState().setSyncView(false);
+    assert.equal(useAppStore.getState().mapLayout.syncView, false);
+    useAppStore.getState().setSyncView(true);
+    assert.equal(useAppStore.getState().mapLayout.syncView, true);
+  });
+
+  it("patches a secondary pane's camera and per-layer visibility by id", () => {
+    useAppStore.getState().setMapGrid(1, 2);
+    const paneId = useAppStore.getState().secondaryMapViews[0].id;
+
+    useAppStore
+      .getState()
+      .setSecondaryMapView(paneId, { zoom: 9, center: [5, 6] });
+    useAppStore
+      .getState()
+      .setSecondaryLayerVisibility(paneId, "layer-a", false);
+    useAppStore.getState().setSecondaryLayerVisibility(paneId, "layer-b", true);
+
+    const pane = useAppStore
+      .getState()
+      .secondaryMapViews.find((p) => p.id === paneId);
+    assert.equal(pane?.view.zoom, 9);
+    assert.deepEqual(pane?.view.center, [5, 6]);
+    assert.deepEqual(pane?.layerVisibility, {
+      "layer-a": false,
+      "layer-b": true,
+    });
+  });
+
+  it("sets the primary and secondary pane labels", () => {
+    useAppStore.getState().setMapGrid(1, 2);
+    const paneId = useAppStore.getState().secondaryMapViews[0].id;
+
+    useAppStore.getState().setPrimaryMapLabel("Before");
+    useAppStore.getState().setSecondaryMapLabel(paneId, "After");
+
+    assert.equal(useAppStore.getState().primaryMapLabel, "Before");
+    assert.equal(
+      useAppStore.getState().secondaryMapViews[0].label,
+      "After",
+    );
+  });
+
+  it("removes a secondary pane and collapses the grid", () => {
+    useAppStore.getState().setMapGrid(2, 2);
+    const target = useAppStore.getState().secondaryMapViews[1].id;
+
+    useAppStore.getState().removeSecondaryMapView(target);
+
+    const state = useAppStore.getState();
+    assert.equal(state.secondaryMapViews.length, 2);
+    assert.ok(!state.secondaryMapViews.some((p) => p.id === target));
+    // Three panes total now (primary + 2 secondary); the grid shrank to fit.
+    assert.equal(state.mapLayout.rows * state.mapLayout.cols, 3);
+  });
+});
+
+describe("annotation layer persistence", () => {
+  // The Annotations plugin stores decoration as a tagged in-memory GeoJSON
+  // layer (a text marker, an arrow shaft line, and its filled arrowhead). It
+  // has no source URL, so the embedded geojson is the only copy and must survive
+  // the on-disk round-trip, along with the `annotation` sourceKind and the
+  // forced `simpleStyleEnabled` that makes per-feature stroke/fill render.
+  it("round-trips annotation features, sourceKind, and simpleStyleEnabled", () => {
+    const project = projectFromStore({
+      projectName: "Annotations",
+      mapView: { center: [0, 0], zoom: 2, bearing: 0, pitch: 0 },
+      basemapStyleUrl: DEFAULT_BASEMAP,
+      basemapVisible: true,
+      basemapOpacity: 1,
+      layers: [
+        geojsonLayer({
+          id: "annotation-layer",
+          name: "Annotations",
+          metadata: { sourceKind: "annotation" },
+          sourcePath: "annotations://layer",
+          style: { ...DEFAULT_LAYER_STYLE, simpleStyleEnabled: true },
+          geojson: {
+            type: "FeatureCollection",
+            features: [
+              {
+                type: "Feature",
+                properties: { __annotation: "text", shape: "text_marker", text: "Study Area" },
+                geometry: { type: "Point", coordinates: [1, 2] },
+              },
+              {
+                type: "Feature",
+                properties: {
+                  __annotation: "line",
+                  annotationId: "a1",
+                  stroke: "#ef4444",
+                  "stroke-width": 3,
+                },
+                geometry: { type: "LineString", coordinates: [[0, 0], [1, 1]] },
+              },
+              {
+                type: "Feature",
+                properties: {
+                  __annotation: "arrowhead",
+                  annotationId: "a1",
+                  fill: "#ef4444",
+                  "fill-opacity": 1,
+                },
+                geometry: {
+                  type: "Polygon",
+                  coordinates: [[[1, 1], [0.9, 1.1], [1.1, 0.9], [1, 1]]],
+                },
+              },
+            ],
+          },
+        }),
+      ],
+      preferences: createEmptyProject().preferences,
+      metadata: {},
+    });
+
+    // The source-less annotation layer keeps its embedded geojson on save.
+    assert.equal(project.layers[0].geojson?.features.length, 3);
+
+    const reopened = parseProject(serializeProject(project));
+    assert.equal(reopened.layers[0].geojson?.features.length, 3);
+    assert.equal(reopened.layers[0].metadata.sourceKind, "annotation");
+    assert.equal(reopened.styles["annotation-layer"]?.simpleStyleEnabled, true);
+    // The arrow shaft and its head stay grouped so they delete together.
+    const head = reopened.layers[0].geojson?.features.find(
+      (feature) => feature.properties?.__annotation === "arrowhead",
+    );
+    assert.equal(head?.properties?.annotationId, "a1");
   });
 });

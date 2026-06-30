@@ -12,37 +12,44 @@ import type {
 // not block) when a very large payload would bloat saved projects.
 export const DECK_VIZ_SIZE_WARN_BYTES = 10 * 1024 * 1024;
 
-export const KIND_LABELS: Record<AddDataKind, string> = {
-  xyz: "Add XYZ Layer",
-  wms: "Add WMS Layer",
-  wfs: "Add WFS Layer",
-  wmts: "Add WMTS Layer",
-  gpx: "Add GPX Layer",
-  "delimited-text": "Add Delimited Text Layer",
-  mbtiles: "Add MBTiles Layer",
-  arcgis: "Add ArcGIS Layer",
-  postgres: "Add PostgreSQL Layer",
-  "deckgl-viz": "Add Deck.gl Layer",
-  video: "Add Video Layer",
-};
+/** The `addData.kind.<key>` segments, kept as a literal union so the dialog's
+ * `t(\`addData.kind.${key}.label\`)` lookups stay type-checked against en.json. */
+export type KindI18nKey =
+  | "xyz"
+  | "wms"
+  | "wfs"
+  | "wmts"
+  | "gpx"
+  | "georss"
+  | "delimitedText"
+  | "cad"
+  | "photos"
+  | "mbtiles"
+  | "arcgis"
+  | "postgres"
+  | "deckglViz"
+  | "video";
 
-export const KIND_DESCRIPTIONS: Record<AddDataKind, string> = {
-  xyz: "Add a raster tile template using x, y, and z placeholders.",
-  wms: "Add a WMS GetMap service as a tiled raster layer.",
-  wfs: "Add WFS features by requesting GeoJSON from a GetFeature service.",
-  wmts: "Add a WMTS tile URL template as a raster layer.",
-  gpx: "Add GPX waypoints, routes, and tracks as one or more vector layers.",
-  "delimited-text":
-    "Add a delimited text file or URL as a point layer using longitude and latitude fields.",
-  mbtiles: "Add a local MBTiles file as a raster or vector tile layer.",
-  arcgis:
-    "Add an ArcGIS FeatureServer layer, VectorTileServer layer, or portal item.",
-  postgres:
-    "Start Martin locally, discover PostGIS sources, and add a source as vector tiles.",
-  video:
-    "Add a georeferenced video overlay by supplying an MP4 URL and four corner coordinates.",
-  "deckgl-viz":
-    "Pick a deck.gl layer type, then load the example data or upload a CSV/JSON/GeoJSON file or URL.",
+/**
+ * Maps each Add Data kind to its `addData.kind.<key>` i18n segment. The dialog
+ * title and description are resolved via `t()` from these keys; `en.json` is the
+ * source of truth (see `i18n/locales/en.json`).
+ */
+export const KIND_I18N_KEY: Record<AddDataKind, KindI18nKey> = {
+  xyz: "xyz",
+  wms: "wms",
+  wfs: "wfs",
+  wmts: "wmts",
+  gpx: "gpx",
+  georss: "georss",
+  "delimited-text": "delimitedText",
+  cad: "cad",
+  photos: "photos",
+  mbtiles: "mbtiles",
+  arcgis: "arcgis",
+  postgres: "postgres",
+  "deckgl-viz": "deckglViz",
+  video: "video",
 };
 
 export const DEFAULT_XYZ_URL =
@@ -56,12 +63,15 @@ export const DEFAULT_WMTS_URL =
   "https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/119/{z}/{y}/{x}";
 export const DEFAULT_GPX_URL =
   "https://data.source.coop/giswqs/opengeos/fells_loop.gpx";
+// USGS "Magnitude 2.5+ Earthquakes, Past Day" Atom feed (Simple georss:point).
+export const DEFAULT_GEORSS_URL =
+  "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.atom";
 export const DEFAULT_DELIMITED_TEXT_URL =
   "https://data.source.coop/giswqs/opengeos/us_cities.csv";
 export const DEFAULT_DELIMITED_TEXT_LATITUDE_FIELD = "latitude";
 export const DEFAULT_DELIMITED_TEXT_LONGITUDE_FIELD = "longitude";
-// MapLibre's "Add a video" sample (a drone clip over San Francisco), pre-filled
-// so the dialog works out of the box. The corners are [lng, lat] pairs.
+// MapLibre's georeferenced video sample, pre-filled so the dialog works out of
+// the box. The corners are [lng, lat] pairs.
 export const DEFAULT_VIDEO_MP4_URL =
   "https://static-assets.mapbox.com/mapbox-gl-js/drone.mp4";
 export const DEFAULT_VIDEO_WEBM_URL =
@@ -85,6 +95,51 @@ export const GPX_PROXY_PATH = "/__geolibre_gpx_proxy";
 export const POSTGRES_CONNECTIONS_STORAGE_KEY =
   "geolibre.postgres.connectionStrings";
 export const MAX_SAVED_POSTGRES_CONNECTIONS = 10;
+// Cross-project catalog of reusable web-service layer definitions (see
+// service-library.ts). Bumping the key would orphan a user's saved services.
+export const SERVICE_LIBRARY_STORAGE_KEY = "geolibre.serviceLibrary";
+export const MAX_SAVED_SERVICES = 200;
+// A short list of common coordinate systems offered as quick presets in the Add
+// CAD Layer dialog (CAD files carry no CRS of their own, so the user names one).
+// The labels are CRS proper names and stay untranslated; selecting one fills the
+// free-text EPSG field, which remains the source of truth.
+export const CAD_CRS_PRESETS: readonly { label: string; value: string }[] = [
+  { label: "WGS 84 (EPSG:4326)", value: "EPSG:4326" },
+  { label: "Web Mercator (EPSG:3857)", value: "EPSG:3857" },
+  { label: "NAD83 (EPSG:4269)", value: "EPSG:4269" },
+  { label: "NAD83 / UTM zone 15N (EPSG:26915)", value: "EPSG:26915" },
+  { label: "NAD83 / Conus Albers (EPSG:5070)", value: "EPSG:5070" },
+  { label: "British National Grid (EPSG:27700)", value: "EPSG:27700" },
+  { label: "ETRS89 / UTM zone 32N (EPSG:25832)", value: "EPSG:25832" },
+];
+
+// Sample CAD drawings offered in the Add CAD Layer dialog's "Load sample data"
+// dropdown. Each is a recognizable dataset written in a known CRS (CAD carries
+// none), so selecting one fetches the file and pre-fills the matching EPSG; a
+// blank `crs` loads the drawing as-is (already lon/lat). Hosted on Source
+// Cooperative alongside the other GeoLibre samples.
+export const CAD_SAMPLES: readonly {
+  label: string;
+  url: string;
+  crs: string;
+}[] = [
+  {
+    label: "US states (Albers, EPSG:5070)",
+    url: "https://data.source.coop/giswqs/opengeos/us_states_albers_5070.dxf",
+    crs: "EPSG:5070",
+  },
+  {
+    label: "NYC boroughs (State Plane, EPSG:2263)",
+    url: "https://data.source.coop/giswqs/opengeos/nyc_boroughs_stateplane_2263.dxf",
+    crs: "EPSG:2263",
+  },
+  {
+    label: "World populated places (WGS84)",
+    url: "https://data.source.coop/giswqs/opengeos/ne_populated_places_wgs84.dxf",
+    crs: "",
+  },
+];
+
 export const DELIMITED_TEXT_DELIMITERS: Record<
   Exclude<DelimitedTextDelimiter, "custom">,
   string

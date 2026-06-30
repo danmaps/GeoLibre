@@ -45,14 +45,18 @@ import {
   Columns3,
   Download,
   EyeOff,
+  LayoutDashboard,
   MoreHorizontal,
+  MousePointerSquareDashed,
   Pencil,
   PanelBottomClose,
+  PanelBottomOpen,
   Plus,
   RotateCcw,
   Save,
   Sigma,
   TableProperties,
+  Telescope,
   Trash2,
   X,
 } from "lucide-react";
@@ -89,6 +93,7 @@ import {
 } from "../../lib/attribute-expression";
 import { AttributeChartDialog } from "./AttributeChartDialog";
 import { AttributeStatsDialog } from "./AttributeStatsDialog";
+import { ColumnExplorerDialog } from "./ColumnExplorerDialog";
 import {
   exportVectorLayer,
   formatAttributeValue,
@@ -97,6 +102,10 @@ import {
   shapefileFieldWarnings,
   type VectorExportFormat,
 } from "../../lib/vector-export";
+import {
+  PANEL_RESIZE_END_EVENT,
+  PANEL_RESIZE_START_EVENT,
+} from "../../lib/panel-resize";
 
 type SortDirection = "asc" | "desc";
 type SortKey = "__featureId" | string;
@@ -120,8 +129,6 @@ const ESTIMATED_ROW_HEIGHT = 37;
 const DEFAULT_TABLE_HEIGHT = 192;
 const MIN_TABLE_HEIGHT = 96;
 const MAX_TABLE_HEIGHT = 520;
-const PANEL_RESIZE_START_EVENT = "geolibre:panel-resize-start";
-const PANEL_RESIZE_END_EVENT = "geolibre:panel-resize-end";
 
 function compareAttributeValues(a: unknown, b: unknown): number {
   if (a == null && b == null) return 0;
@@ -262,6 +269,7 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
   const selectFeature = useAppStore((s) => s.selectFeature);
   const attributeTableOpen = useAppStore((s) => s.ui.attributeTableOpen);
   const setAttributeTableOpen = useAppStore((s) => s.setAttributeTableOpen);
+  const setDashboardOpen = useAppStore((s) => s.setDashboardOpen);
   const updateLayer = useAppStore((s) => s.updateLayer);
   const zoomToSelectedFeature = useAppStore(
     (s) => s.ui.zoomToSelectedFeature,
@@ -278,6 +286,9 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
   });
   const [columnWidths, setColumnWidths] = useState<ColumnWidths>({});
   const [tableHeight, setTableHeight] = useState(DEFAULT_TABLE_HEIGHT);
+  // Collapsed shows only the toolbar header, hiding the table body, while the
+  // panel stays open. Distinct from closing the panel entirely (the X button).
+  const [collapsed, setCollapsed] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [drafts, setDrafts] = useState<AttributeDrafts>({});
   const [exportError, setExportError] = useState<string | null>(null);
@@ -303,6 +314,8 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
   const [chartOpen, setChartOpen] = useState(false);
   // Field-statistics dialog state.
   const [statsOpen, setStatsOpen] = useState(false);
+  // Column-explorer dialog state.
+  const [explorerOpen, setExplorerOpen] = useState(false);
   // Field-calculator dialog state.
   const [calcOpen, setCalcOpen] = useState(false);
   const [calcMode, setCalcMode] = useState<"update" | "create">("update");
@@ -428,6 +441,12 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
   useEffect(() => {
     if (!selectedFeatureId) setCalcSelectedOnly(false);
   }, [selectedFeatureId]);
+
+  // Always reopen the table expanded: a panel left collapsed before it was
+  // closed should not reappear collapsed the next time it is opened.
+  useEffect(() => {
+    if (!attributeTableOpen) setCollapsed(false);
+  }, [attributeTableOpen]);
 
   const filterLower = attributeFilter.toLowerCase();
   const filtered = attributeRows.filter(({ properties, featureId }) => {
@@ -1160,30 +1179,22 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
       ref={tableSectionRef}
       aria-label="Attribute table"
       className="relative flex shrink-0 flex-col border-t bg-card"
-      style={{ height: tableHeight }}
+      style={{ height: collapsed ? undefined : tableHeight }}
     >
-      <div
-        role="separator"
-        aria-orientation="horizontal"
-        aria-label="Resize attribute table"
-        className="absolute -top-1 left-0 right-0 z-20 h-2 cursor-row-resize select-none border-t border-transparent hover:border-primary"
-        onMouseDown={startTableResize}
-      />
+      {!collapsed ? (
+        <div
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="Resize attribute table"
+          className="absolute -top-1 left-0 right-0 z-20 h-2 cursor-row-resize select-none border-t border-transparent hover:border-primary"
+          onMouseDown={startTableResize}
+        />
+      ) : null}
       <div
         ref={tableResizeGuideRef}
         className="pointer-events-none fixed left-0 right-0 z-50 hidden h-px bg-primary shadow-[0_0_0_1px_hsl(var(--primary)/0.25)]"
       />
       <div className="flex flex-wrap items-center gap-2 border-b px-3 py-1.5 md:flex-nowrap">
-        <Button
-          variant="ghost"
-          size="icon"
-          className="h-8 w-8"
-          title="Collapse attribute table"
-          aria-label="Collapse attribute table"
-          onClick={() => setAttributeTableOpen(false)}
-        >
-          <PanelBottomClose className="h-4 w-4" />
-        </Button>
         <TableProperties className="h-4 w-4 text-muted-foreground" />
         <span className="text-sm font-semibold">Attribute table</span>
         {layer ? (
@@ -1332,6 +1343,24 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
             className="h-7 px-2"
             title={
               hasAttributeSource
+                ? "Explore all fields at a glance"
+                : "Column explorer requires a vector or DuckDB query layer"
+            }
+            aria-label="Column explorer"
+            disabled={!hasAttributeSource}
+            onClick={() => setExplorerOpen(true)}
+          >
+            <Telescope className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Explore</span>
+          </Button>
+        ) : null}
+        {!isEditing ? (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 px-2"
+            title={
+              hasAttributeSource
                 ? "Field statistics summary"
                 : "Statistics require a vector or DuckDB query layer"
             }
@@ -1359,6 +1388,19 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
           >
             <ChartColumn className="h-3.5 w-3.5" />
             <span className="hidden sm:inline">Charts</span>
+          </Button>
+        ) : null}
+        {!isEditing ? (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 px-2"
+            title="Open the dashboard to build chart widgets"
+            aria-label="Dashboard"
+            onClick={() => setDashboardOpen(true)}
+          >
+            <LayoutDashboard className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Dashboard</span>
           </Button>
         ) : null}
         <DropdownMenu>
@@ -1427,13 +1469,39 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
           Zoom to selection
         </label>
         <Button
-          variant="ghost"
+          variant="outline"
           size="icon"
           className="h-7 w-7"
           title="Clear selected feature"
           aria-label="Clear selected feature"
           disabled={!selectedFeatureId}
           onClick={() => selectFeature(null)}
+        >
+          <MousePointerSquareDashed className="h-3.5 w-3.5" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7"
+          title={collapsed ? "Expand attribute table" : "Collapse attribute table"}
+          aria-label={
+            collapsed ? "Expand attribute table" : "Collapse attribute table"
+          }
+          onClick={() => setCollapsed((value) => !value)}
+        >
+          {collapsed ? (
+            <PanelBottomOpen className="h-4 w-4" />
+          ) : (
+            <PanelBottomClose className="h-4 w-4" />
+          )}
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7"
+          title="Close attribute table"
+          aria-label="Close attribute table"
+          onClick={() => setAttributeTableOpen(false)}
         >
           <X className="h-4 w-4" />
         </Button>
@@ -1443,119 +1511,121 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
         header (top-11) plus 0.875rem for the horizontal scrollbar (h-3.5),
         so the two scrollbars do not overlap.
       */}
-      <ScrollArea
-        type="always"
-        viewportRef={scrollViewportRef}
-        className="flex-1 [&_[data-orientation=vertical]]:!top-11 [&_[data-orientation=vertical]]:!h-[calc(100%-3.625rem)]"
-      >
-        {!hasAttributeSource ? (
-          <p className="p-4 text-xs text-muted-foreground">
-            {loadingVectorGeojson
-              ? "Loading layer attributes…"
-              : "Attribute table requires a vector or DuckDB query layer."}
-          </p>
-        ) : (
-          <table
-            data-testid="attribute-table"
-            className="table-fixed caption-bottom text-sm"
-            style={{ minWidth: "100%", width: tableWidth }}
-          >
-            <colgroup>
-              {tableColumns.map((col) => (
-                <col key={col} style={{ width: columnWidth(col) }} />
-              ))}
-            </colgroup>
-            <TableHeader className="sticky top-0 z-10 bg-card shadow-xs">
-              <TableRow>
-                <TableHead className="bg-card">
-                  {sortableHeader("__featureId", "#")}
-                </TableHead>
-                {columns.map((col, index) => (
-                  <TableHead key={col} className="bg-card">
-                    {attributeColumnHeader(col, index)}
-                  </TableHead>
+      {!collapsed ? (
+        <ScrollArea
+          type="always"
+          viewportRef={scrollViewportRef}
+          className="flex-1 [&_[data-orientation=vertical]]:!top-11 [&_[data-orientation=vertical]]:!h-[calc(100%-3.625rem)]"
+        >
+          {!hasAttributeSource ? (
+            <p className="p-4 text-xs text-muted-foreground">
+              {loadingVectorGeojson
+                ? "Loading layer attributes…"
+                : "Attribute table requires a vector or DuckDB query layer."}
+            </p>
+          ) : (
+            <table
+              data-testid="attribute-table"
+              className="table-fixed caption-bottom text-sm"
+              style={{ minWidth: "100%", width: tableWidth }}
+            >
+              <colgroup>
+                {tableColumns.map((col) => (
+                  <col key={col} style={{ width: columnWidth(col) }} />
                 ))}
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {paddingTop > 0 ? (
-                <tr aria-hidden="true">
-                  <td colSpan={tableColumns.length} style={{ height: paddingTop }} />
-                </tr>
-              ) : null}
-              {virtualRows.map((virtualRow) => {
-                const { featureId, properties } = sorted[virtualRow.index];
-                const selected = selectedFeatureId === featureId;
-                return (
-                  <TableRow
-                    key={featureId}
-                    data-index={virtualRow.index}
-                    ref={rowVirtualizer.measureElement}
-                    data-state={selected ? "selected" : undefined}
-                    className="cursor-pointer"
-                    onClick={() => {
-                      selectFeature(featureId);
-                    }}
-                  >
-                    <TableCell>{featureId}</TableCell>
-                    {columns.map((col) => {
-                      const value = properties[col];
-                      const draft = drafts[featureId]?.[col];
-                      const changed = draft !== undefined;
-                      const invalid =
-                        draft !== undefined &&
-                        isInvalidObjectDraft(draft, value);
-                      const inputClassName = invalid
-                        ? "h-7 min-w-0 border-destructive bg-destructive/10 px-2 text-xs"
-                        : changed
-                          ? "h-7 min-w-0 border-primary/60 bg-primary/10 px-2 text-xs"
-                          : "h-7 min-w-0 px-2 text-xs";
-                      return (
-                        <TableCell
-                          key={col}
-                          data-state={changed ? "edited" : undefined}
-                          className="data-[state=edited]:bg-primary/10 data-[state=edited]:shadow-[inset_3px_0_0_hsl(var(--primary))]"
-                        >
-                          {isEditing ? (
-                            <Input
-                              className={inputClassName}
-                              aria-invalid={invalid || undefined}
-                              title={
-                                invalid ? "Invalid JSON" : undefined
-                              }
-                              aria-label={`Edit ${col} for feature ${featureId}`}
-                              value={draft ?? formatAttributeValue(value)}
-                              onClick={(event) => event.stopPropagation()}
-                              onChange={(event) =>
-                                updateCellDraft(
-                                  featureId,
-                                  col,
-                                  event.target.value,
-                                  value,
-                                )
-                              }
-                            />
-                          ) : (
-                            formatAttributeValue(value)
-                          )}
-                        </TableCell>
-                      );
-                    })}
-                  </TableRow>
-                );
-              })}
-              {paddingBottom > 0 ? (
-                <tr aria-hidden="true">
-                  <td
-                    colSpan={tableColumns.length}
-                    style={{ height: paddingBottom }}
-                  />
-                </tr>
-              ) : null}
-            </TableBody>
-          </table>
-        )}
-      </ScrollArea>
+              </colgroup>
+              <TableHeader className="sticky top-0 z-10 bg-card shadow-xs">
+                <TableRow>
+                  <TableHead className="bg-card">
+                    {sortableHeader("__featureId", "#")}
+                  </TableHead>
+                  {columns.map((col, index) => (
+                    <TableHead key={col} className="bg-card">
+                      {attributeColumnHeader(col, index)}
+                    </TableHead>
+                  ))}
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {paddingTop > 0 ? (
+                  <tr aria-hidden="true">
+                    <td colSpan={tableColumns.length} style={{ height: paddingTop }} />
+                  </tr>
+                ) : null}
+                {virtualRows.map((virtualRow) => {
+                  const { featureId, properties } = sorted[virtualRow.index];
+                  const selected = selectedFeatureId === featureId;
+                  return (
+                    <TableRow
+                      key={featureId}
+                      data-index={virtualRow.index}
+                      ref={rowVirtualizer.measureElement}
+                      data-state={selected ? "selected" : undefined}
+                      className="cursor-pointer"
+                      onClick={() => {
+                        selectFeature(featureId);
+                      }}
+                    >
+                      <TableCell>{featureId}</TableCell>
+                      {columns.map((col) => {
+                        const value = properties[col];
+                        const draft = drafts[featureId]?.[col];
+                        const changed = draft !== undefined;
+                        const invalid =
+                          draft !== undefined &&
+                          isInvalidObjectDraft(draft, value);
+                        const inputClassName = invalid
+                          ? "h-7 min-w-0 border-destructive bg-destructive/10 px-2 text-xs"
+                          : changed
+                            ? "h-7 min-w-0 border-primary/60 bg-primary/10 px-2 text-xs"
+                            : "h-7 min-w-0 px-2 text-xs";
+                        return (
+                          <TableCell
+                            key={col}
+                            data-state={changed ? "edited" : undefined}
+                            className="data-[state=edited]:bg-primary/10 data-[state=edited]:shadow-[inset_3px_0_0_hsl(var(--primary))]"
+                          >
+                            {isEditing ? (
+                              <Input
+                                className={inputClassName}
+                                aria-invalid={invalid || undefined}
+                                title={
+                                  invalid ? "Invalid JSON" : undefined
+                                }
+                                aria-label={`Edit ${col} for feature ${featureId}`}
+                                value={draft ?? formatAttributeValue(value)}
+                                onClick={(event) => event.stopPropagation()}
+                                onChange={(event) =>
+                                  updateCellDraft(
+                                    featureId,
+                                    col,
+                                    event.target.value,
+                                    value,
+                                  )
+                                }
+                              />
+                            ) : (
+                              formatAttributeValue(value)
+                            )}
+                          </TableCell>
+                        );
+                      })}
+                    </TableRow>
+                  );
+                })}
+                {paddingBottom > 0 ? (
+                  <tr aria-hidden="true">
+                    <td
+                      colSpan={tableColumns.length}
+                      style={{ height: paddingBottom }}
+                    />
+                  </tr>
+                ) : null}
+              </TableBody>
+            </table>
+          )}
+        </ScrollArea>
+      ) : null}
       <Dialog
         open={columnPendingDelete !== null}
         onOpenChange={(open: boolean) => {
@@ -1849,6 +1919,14 @@ export function AttributeTable({ mapControllerRef }: AttributeTableProps) {
       <AttributeStatsDialog
         open={statsOpen}
         onOpenChange={setStatsOpen}
+        rows={attributeRows}
+        filteredRows={filtered}
+        columns={discoveredColumns}
+        layerName={layer?.name ?? ""}
+      />
+      <ColumnExplorerDialog
+        open={explorerOpen}
+        onOpenChange={setExplorerOpen}
         rows={attributeRows}
         filteredRows={filtered}
         columns={discoveredColumns}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import maplibregl from "maplibre-gl";
 import type { MapController } from "@geolibre/map";
@@ -20,6 +20,7 @@ import {
   Check,
   ClipboardList,
   Crosshair,
+  ImagePlus,
   Loader2,
   MapPin,
   Navigation,
@@ -51,6 +52,7 @@ import {
   validateForm,
   type Vertex,
 } from "../../lib/field-collection";
+import { releaseBodyPointerEvents } from "../../lib/radix-compat";
 
 interface FieldCollectionDialogProps {
   open: boolean;
@@ -131,17 +133,6 @@ function removeDrawPreview(map: maplibregl.Map): void {
     if (map.getLayer(id)) map.removeLayer(id);
   }
   if (map.getSource(DRAW_SOURCE)) map.removeSource(DRAW_SOURCE);
-}
-
-/**
- * Radix locks `document.body { pointer-events: none }` while a modal dialog is
- * open and can leave it set after a programmatic close, which would stop the map
- * from receiving the capture click. Clear it whenever we hide the dialog to draw.
- */
-function releaseBodyPointerEvents(): void {
-  if (document.body.style.pointerEvents === "none") {
-    document.body.style.pointerEvents = "";
-  }
 }
 
 /**
@@ -325,6 +316,16 @@ export function FieldCollectionDialog({
     setPicking(true);
     onOpenChange(false);
   }, [getMap, onOpenChange]);
+
+  // Cancel an active point-pick from the placement banner. Mirrors the Escape
+  // path in the picking effect: stop picking and reopen the dialog without
+  // capturing a point, suppressing the reopen reset so the in-progress form is
+  // kept.
+  const handleCancelPick = useCallback(() => {
+    setPicking(false);
+    suppressResetRef.current = true;
+    onOpenChange(true);
+  }, [onOpenChange]);
 
   useEffect(() => {
     if (!picking) return;
@@ -658,12 +659,20 @@ export function FieldCollectionDialog({
         />
       )}
 
+      {picking && <PickBanner onCancel={handleCancelPick} />}
+
       <Dialog open={open} onOpenChange={onOpenChange}>
         <DialogContent className="max-w-md">
           <DialogHeader>
             <DialogTitle>{t("fieldCollection.title")}</DialogTitle>
             <DialogDescription>
-              {t("fieldCollection.description")}
+              {t(
+                inSetup
+                  ? "fieldCollection.description"
+                  : pending
+                    ? "fieldCollection.captureReviewDescription"
+                    : "fieldCollection.captureDescription",
+              )}
             </DialogDescription>
           </DialogHeader>
 
@@ -811,6 +820,50 @@ function DrawToolbar({
           {t("fieldCollection.finish")}
         </Button>
         <Button variant="ghost" size="sm" onClick={onCancel}>
+          {t("common.cancel")}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Floating banner shown while waiting for a point pick (the dialog is hidden so
+ * the map is clear). Without it the only cue is the crosshair cursor, leaving
+ * the app looking like ordinary navigation mode (#711).
+ */
+function PickBanner({ onCancel }: { onCancel: () => void }) {
+  const { t } = useTranslation();
+  // Instance-scoped so the aria-describedby link holds even if more than one
+  // banner is ever mounted at once (#720 review).
+  const hintId = useId();
+  return (
+    <div className="fixed bottom-6 left-1/2 z-50 flex max-w-[95vw] -translate-x-1/2 flex-col gap-2 rounded-lg border bg-card p-3 shadow-xl">
+      {/* Only the non-interactive status text is the live region, with the
+          Cancel button as a sibling, so screen readers don't re-read the button
+          on region mutations (ARIA APG). The button also takes focus on mount
+          (the dialog that held focus just closed) and is described by the hint,
+          so the placement instructions reach keyboard/SR users reliably even
+          where a region injected on mount is missed (#720 review). */}
+      <div role="status" className="flex flex-col gap-2">
+        <div className="flex items-center gap-2 text-sm">
+          <Crosshair className="h-4 w-4 text-primary" />
+          <span className="font-medium">
+            {t("fieldCollection.pickBannerTitle")}
+          </span>
+        </div>
+        <p id={hintId} className="text-xs text-muted-foreground">
+          {t("fieldCollection.pickBannerHint")}
+        </p>
+      </div>
+      <div className="flex justify-end">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={onCancel}
+          autoFocus
+          aria-describedby={hintId}
+        >
           {t("common.cancel")}
         </Button>
       </div>
@@ -988,24 +1041,38 @@ function CaptureStep({
 }: CaptureStepProps) {
   const { t } = useTranslation();
   const isPoint = geometry === "point";
+  // Hidden behind a custom trigger button so the photo control shows one
+  // localized label rather than the browser's native file-input text (#711).
+  const photoInputRef = useRef<HTMLInputElement>(null);
 
   return (
     <div className="space-y-3">
       {isPoint ? (
-        <div className="grid grid-cols-2 gap-2">
-          <Button variant="outline" onClick={onUseGps} disabled={locating}>
-            {locating ? (
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-            ) : (
-              <Navigation className="mr-2 h-4 w-4" />
-            )}
-            {locating ? t("fieldCollection.locating") : t("fieldCollection.useGps")}
-          </Button>
-          <Button variant="outline" onClick={onPickOnMap}>
+        pending ? (
+          // A point is already captured, so GPS would silently discard the
+          // current selection; offer only an explicit reposition (#711).
+          <Button variant="outline" className="w-full" onClick={onPickOnMap}>
             <Crosshair className="mr-2 h-4 w-4" />
-            {t("fieldCollection.pickOnMap")}
+            {t("fieldCollection.reposition")}
           </Button>
-        </div>
+        ) : (
+          <div className="grid grid-cols-2 gap-2">
+            <Button variant="outline" onClick={onUseGps} disabled={locating}>
+              {locating ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <Navigation className="mr-2 h-4 w-4" />
+              )}
+              {locating
+                ? t("fieldCollection.locating")
+                : t("fieldCollection.useGps")}
+            </Button>
+            <Button variant="outline" onClick={onPickOnMap}>
+              <Crosshair className="mr-2 h-4 w-4" />
+              {t("fieldCollection.pickOnMap")}
+            </Button>
+          </div>
+        )
       ) : (
         <Button variant="outline" className="w-full" onClick={onStartDrawing}>
           <Pencil className="mr-2 h-4 w-4" />
@@ -1072,8 +1139,18 @@ function CaptureStep({
             );
           })}
 
+          {/* Save sits above the optional photo so the primary action is
+              reachable without scrolling past the upload, and the photo reads
+              as the optional extra it is (#711). */}
+          <Button className="w-full" onClick={onSave}>
+            <Save className="mr-2 h-4 w-4" />
+            {t(`fieldCollection.save.${geometry}`)}
+          </Button>
+
           <div className="space-y-1.5">
-            <Label htmlFor="fc-photo">{t("fieldCollection.photo")}</Label>
+            <Label htmlFor="fc-photo">
+              {t("fieldCollection.photoOptional")}
+            </Label>
             {photo ? (
               <div className="flex items-center gap-2">
                 <img
@@ -1087,21 +1164,30 @@ function CaptureStep({
                 </Button>
               </div>
             ) : (
-              // No `capture` attribute: let the user pick an existing photo or
-              // take a new one (capture="environment" forces the camera on iOS).
-              <Input
-                id="fc-photo"
-                type="file"
-                accept="image/*"
-                onChange={onPhoto}
-              />
+              <>
+                {/* No `capture` attribute: let the user pick an existing photo
+                    or take a new one (capture="environment" forces the camera
+                    on iOS). Hidden; the button below is the visible trigger. */}
+                <input
+                  ref={photoInputRef}
+                  id="fc-photo"
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={onPhoto}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full"
+                  onClick={() => photoInputRef.current?.click()}
+                >
+                  <ImagePlus className="mr-2 h-4 w-4" />
+                  {t("fieldCollection.choosePhoto")}
+                </Button>
+              </>
             )}
           </div>
-
-          <Button className="w-full" onClick={onSave}>
-            <Save className="mr-2 h-4 w-4" />
-            {t(`fieldCollection.save.${geometry}`)}
-          </Button>
         </>
       )}
     </div>

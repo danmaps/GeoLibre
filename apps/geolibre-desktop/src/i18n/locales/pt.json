@@ -20,26 +20,24 @@
       "map": "Mapa",
       "layout": "Disposição",
       "environment": "Ambiente",
-      "project": "Projeto",
       "account": "Conta"
     },
     "menu": {
       "mapPreferences": "Preferências do Mapa",
       "layoutSettings": "Definições de Disposição",
       "environmentVariables": "Variáveis de Ambiente",
-      "projectSettings": "Definições do Projeto",
       "managePlugins": "Gerir Plugins",
       "urlOverrideNote": "Os parâmetros de disposição do URL substituem as definições guardadas."
     },
     "map": {
       "constraintsTitle": "Restrições do mapa",
-      "constraintsDescription": "Os limites aplicam-se enquanto o projeto estiver aberto.",
       "restrictBounds": "Restringir limites do mapa",
       "west": "Oeste",
       "south": "Sul",
       "east": "Este",
       "north": "Norte",
       "useCurrentView": "Usar Vista Atual",
+      "useCurrentViewGlobeHint": "Mude para a projeção de Mercator antes de usar isto. Na projeção de Globo, o mapa ainda pode deslizar ligeiramente além dos limites capturados.",
       "minZoom": "Zoom mínimo",
       "maxZoom": "Zoom máximo",
       "maxPitch": "Inclinação máxima",
@@ -80,14 +78,6 @@
       "removeAria": "Remover {{name}}",
       "errorNamePattern": "Os nomes de variáveis de ambiente devem começar com uma letra ou sublinhado e conter apenas letras, números e sublinhados.",
       "errorDuplicate": "A variável de ambiente \"{{name}}\" está duplicada."
-    },
-    "project": {
-      "title": "Projeto",
-      "description": "As definições são guardadas com o projeto `.geolibre.json`.",
-      "name": "Nome",
-      "file": "Ficheiro do projeto",
-      "notSaved": "Não guardado",
-      "format": "Formato do projeto"
     }
   },
   "toolbar": {
@@ -287,7 +277,7 @@
       "webServices": "Serviços Web",
       "commandPalette": "Paleta de Comandos",
       "openProjectFromUrl": "Abrir projeto a partir de URL",
-      "openProjectFromUrlDesc": "Carrega um projeto público `.geolibre.json` e adiciona-o aos projetos recentes.",
+      "openProjectFromUrlDesc": "Carrega um projeto `.geolibre.json` e adiciona-o aos projetos recentes.",
       "projectUrl": "URL do projeto",
       "opening": "A abrir...",
       "open": "Abrir",

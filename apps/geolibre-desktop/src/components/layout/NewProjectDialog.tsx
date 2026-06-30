@@ -2,9 +2,15 @@ import {
   BLANK_BASEMAP,
   createDefaultMapView,
   OPENFREEMAP_BASEMAPS,
+  PROTOMAPS_BASEMAPS,
   useAppStore,
   type MapViewState,
 } from "@geolibre/core";
+import {
+  LIBERTY_3D_ID,
+  resolveProtomapsPresets,
+  type PresetBasemap,
+} from "../../lib/basemap-presets";
 import {
   Button,
   cn,
@@ -17,7 +23,14 @@ import {
   Label,
 } from "@geolibre/ui";
 import type { FormEvent } from "react";
-import { useMemo, useState } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useTranslation } from "react-i18next";
 
 const DEFAULT_BASEMAP_ID = "liberty";
 const CUSTOM_BASEMAP_ID = "custom";
@@ -31,11 +44,40 @@ const THREE_D_MAP_VIEW: MapViewState = {
   pitch: 60,
 };
 
-type PresetBasemapId = (typeof OPENFREEMAP_BASEMAPS)[number]["id"];
+// Well-known basemap ids stay type-checked. Protomaps ids are still dynamic
+// (only present when a key is configured), but they come from the const array,
+// so the union catches typos and stale sentinel values.
 type BasemapChoice =
-  | PresetBasemapId
+  | (typeof OPENFREEMAP_BASEMAPS)[number]["id"]
+  | (typeof PROTOMAPS_BASEMAPS)[number]["id"]
   | typeof CUSTOM_BASEMAP_ID
   | typeof BLANK_BASEMAP_ID;
+
+interface BasemapButtonProps {
+  id: BasemapChoice;
+  name: string;
+  selected: boolean;
+  onSelect: (id: BasemapChoice) => void;
+}
+
+function BasemapButton({ id, name, selected, onSelect }: BasemapButtonProps) {
+  return (
+    <button
+      type="button"
+      aria-pressed={selected}
+      className={cn(
+        "h-10 rounded-md border px-3 text-sm font-medium transition-colors",
+        "hover:bg-accent hover:text-accent-foreground",
+        selected
+          ? "border-primary bg-primary text-primary-foreground hover:bg-primary hover:text-primary-foreground"
+          : "border-input bg-background",
+      )}
+      onClick={() => onSelect(id)}
+    >
+      {name}
+    </button>
+  );
+}
 
 interface NewProjectDialogProps {
   open: boolean;
@@ -50,20 +92,55 @@ export function NewProjectDialog({
   onSaveCurrentProject,
   onProjectCreated,
 }: NewProjectDialogProps) {
+  const { t } = useTranslation();
   const newProject = useAppStore((s) => s.newProject);
-  const isDirty = useAppStore((s) => s.isDirty);
   const [selectedBasemapId, setSelectedBasemapId] =
     useState<BasemapChoice>(DEFAULT_BASEMAP_ID);
   const [projectName, setProjectName] = useState(DEFAULT_PROJECT_NAME);
   const [customUrl, setCustomUrl] = useState("");
   const [showSavePrompt, setShowSavePrompt] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const customUrlRef = useRef<HTMLInputElement>(null);
 
   const customStyleUrl = customUrl.trim();
   const isCustomSelected = selectedBasemapId === CUSTOM_BASEMAP_ID;
   const isBlankSelected = selectedBasemapId === BLANK_BASEMAP_ID;
-  const selectedPreset = OPENFREEMAP_BASEMAPS.find(
-    (basemap) => basemap.id === selectedBasemapId,
+  // Protomaps styles need an API key (VITE_PROTOMAPS_API_KEY). It can come from
+  // the build or from Settings → Environment variables, so re-resolve when the
+  // dialog opens and whenever the runtime env changes; an absent key hides the
+  // section.
+  const [protomapsPresets, setProtomapsPresets] = useState<PresetBasemap[]>(
+    resolveProtomapsPresets,
+  );
+  useEffect(() => {
+    if (!open) return;
+    const refresh = () => setProtomapsPresets(resolveProtomapsPresets());
+    refresh();
+    window.addEventListener("geolibre:runtime-env-change", refresh);
+    return () =>
+      window.removeEventListener("geolibre:runtime-env-change", refresh);
+  }, [open]);
+  // Move focus into the custom URL field the moment the user selects the
+  // "Custom URL" basemap, so the now-unlocked input is ready to type into.
+  useEffect(() => {
+    if (isCustomSelected) customUrlRef.current?.focus();
+  }, [isCustomSelected]);
+  // Prioritize data preservation: when the dialog opens with unsaved changes,
+  // ask to save the current project before showing the new-project form (#990),
+  // matching standard desktop and web GIS conventions. With no unsaved changes,
+  // go straight to the configuration form. Read the dirty flag once on open
+  // (not as a reactive dep) so "Do not save" doesn't re-trigger the prompt while
+  // the project is still dirty. useLayoutEffect (not useEffect) commits this
+  // before paint, so a dirty open never flashes the config form first.
+  useLayoutEffect(() => {
+    if (open) setShowSavePrompt(useAppStore.getState().isDirty);
+  }, [open]);
+  const selectedPreset = useMemo<PresetBasemap | undefined>(
+    () =>
+      [...OPENFREEMAP_BASEMAPS, ...protomapsPresets].find(
+        (basemap) => basemap.id === selectedBasemapId,
+      ),
+    [protomapsPresets, selectedBasemapId],
   );
   const isCustomUrlValid = useMemo(() => {
     if (!customStyleUrl) return false;
@@ -105,7 +182,7 @@ export function NewProjectDialog({
       name: projectName.trim() || DEFAULT_PROJECT_NAME,
       basemapStyleUrl,
       mapView:
-        selectedBasemapId === "liberty-3d"
+        selectedBasemapId === LIBERTY_3D_ID
           ? THREE_D_MAP_VIEW
           : createDefaultMapView(),
     });
@@ -116,21 +193,19 @@ export function NewProjectDialog({
 
   const handleCreate = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!canCreate) return;
-
-    if (isDirty) {
-      setShowSavePrompt(true);
-      return;
-    }
-
+    // Any unsaved changes were already resolved by the save prompt shown when
+    // the dialog opened, so creating here is safe. createProject() still guards
+    // on canCreate internally, so the removed call-site check is not a regression.
     createProject();
   };
 
-  const handleSaveThenCreate = async () => {
+  const handleSaveThenContinue = async () => {
     setIsSaving(true);
     try {
       const saved = await onSaveCurrentProject();
-      if (saved) createProject();
+      // Advance to the configuration form only once the current project is
+      // safely saved; a cancelled or failed save keeps the prompt up.
+      if (saved) setShowSavePrompt(false);
     } catch (error) {
       console.error("Failed to save project", error);
     } finally {
@@ -144,10 +219,9 @@ export function NewProjectDialog({
         {showSavePrompt ? (
           <>
             <DialogHeader>
-              <DialogTitle>Save current project?</DialogTitle>
+              <DialogTitle>{t("newProject.savePromptTitle")}</DialogTitle>
               <DialogDescription>
-                The current project has unsaved changes. Save them before
-                creating a new map?
+                {t("newProject.savePromptDescription")}
               </DialogDescription>
             </DialogHeader>
             <div className="flex justify-end gap-2">
@@ -155,34 +229,35 @@ export function NewProjectDialog({
                 type="button"
                 variant="outline"
                 disabled={isSaving}
-                onClick={() => setShowSavePrompt(false)}
+                onClick={() => handleOpenChange(false)}
               >
-                Cancel
+                {t("common.cancel")}
               </Button>
               <Button
                 type="button"
                 variant="secondary"
                 disabled={isSaving}
-                onClick={createProject}
+                onClick={() => setShowSavePrompt(false)}
               >
-                Do not save
+                {t("newProject.doNotSave")}
               </Button>
               <Button
                 type="button"
                 disabled={isSaving}
-                onClick={handleSaveThenCreate}
+                onClick={handleSaveThenContinue}
               >
-                {isSaving ? "Saving..." : "Save"}
+                {isSaving ? t("newProject.saving") : t("common.save")}
               </Button>
             </div>
           </>
         ) : (
           <>
             <DialogHeader>
-              <DialogTitle>New map</DialogTitle>
+              <DialogTitle>New project</DialogTitle>
               <DialogDescription>
-                Choose a blank background, an OpenFreeMap basemap, or a MapLibre
-                style URL.
+                {protomapsPresets.length > 0
+                  ? t("newProject.basemapDescription")
+                  : t("newProject.basemapDescriptionNoProtomaps")}
               </DialogDescription>
             </DialogHeader>
             <form className="space-y-5" onSubmit={handleCreate}>
@@ -196,55 +271,80 @@ export function NewProjectDialog({
                 />
               </div>
 
-              <div className="space-y-2">
+              <div className="space-y-4">
                 <Label>Basemap</Label>
-                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-                  {OPENFREEMAP_BASEMAPS.map((basemap) => (
-                    <button
-                      key={basemap.id}
-                      type="button"
-                      aria-pressed={selectedBasemapId === basemap.id}
-                      className={cn(
-                        "h-10 rounded-md border px-3 text-sm font-medium transition-colors",
-                        "hover:bg-accent hover:text-accent-foreground",
-                        selectedBasemapId === basemap.id
-                          ? "border-primary bg-primary text-primary-foreground hover:bg-primary hover:text-primary-foreground"
-                          : "border-input bg-background",
-                      )}
-                      onClick={() => setSelectedBasemapId(basemap.id)}
-                    >
-                      {basemap.name}
-                    </button>
-                  ))}
-                  <button
-                    type="button"
-                    aria-pressed={isBlankSelected}
-                    className={cn(
-                      "h-10 rounded-md border px-3 text-sm font-medium transition-colors",
-                      "hover:bg-accent hover:text-accent-foreground",
-                      isBlankSelected
-                        ? "border-primary bg-primary text-primary-foreground hover:bg-primary hover:text-primary-foreground"
-                        : "border-input bg-background",
-                    )}
-                    onClick={() => setSelectedBasemapId(BLANK_BASEMAP_ID)}
-                  >
-                    Blank
-                  </button>
+
+                <div className="space-y-2">
+                  <p className="text-xs font-medium text-muted-foreground">
+                    {t("newProject.sectionOpenFreeMap")}
+                  </p>
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                    {OPENFREEMAP_BASEMAPS.map((basemap) => (
+                      <BasemapButton
+                        key={basemap.id}
+                        id={basemap.id}
+                        name={basemap.name}
+                        selected={selectedBasemapId === basemap.id}
+                        onSelect={setSelectedBasemapId}
+                      />
+                    ))}
+                  </div>
+                </div>
+
+                {protomapsPresets.length > 0 ? (
+                  <div className="space-y-2">
+                    <p className="text-xs font-medium text-muted-foreground">
+                      {t("newProject.sectionProtomaps")}
+                    </p>
+                    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                      {protomapsPresets.map((basemap) => (
+                        <BasemapButton
+                          key={basemap.id}
+                          id={basemap.id}
+                          name={basemap.name}
+                          selected={selectedBasemapId === basemap.id}
+                          onSelect={setSelectedBasemapId}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+
+                <div className="space-y-2">
+                  <p className="text-xs font-medium text-muted-foreground">
+                    {t("newProject.sectionOther")}
+                  </p>
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                    <BasemapButton
+                      id={BLANK_BASEMAP_ID}
+                      name="Blank"
+                      selected={selectedBasemapId === BLANK_BASEMAP_ID}
+                      onSelect={setSelectedBasemapId}
+                    />
+                    <BasemapButton
+                      id={CUSTOM_BASEMAP_ID}
+                      name={t("newProject.customUrlButton")}
+                      selected={isCustomSelected}
+                      onSelect={setSelectedBasemapId}
+                    />
+                  </div>
                 </div>
               </div>
 
+              {/* The custom URL is a mutually exclusive basemap choice: the
+                  field unlocks only when "Custom URL" is selected above, so it
+                  can never compete with a highlighted preset button. */}
               <div className="space-y-2">
                 <Label htmlFor="custom-basemap-url">Custom URL</Label>
                 <Input
                   id="custom-basemap-url"
+                  ref={customUrlRef}
                   type="url"
                   inputMode="url"
                   placeholder="https://example.com/style.json"
                   value={customUrl}
-                  onChange={(event) => {
-                    setCustomUrl(event.target.value);
-                    setSelectedBasemapId(CUSTOM_BASEMAP_ID);
-                  }}
+                  disabled={!isCustomSelected}
+                  onChange={(event) => setCustomUrl(event.target.value)}
                 />
                 {isCustomSelected && customStyleUrl && !isCustomUrlValid ? (
                   <p className="text-xs text-destructive">

@@ -20,26 +20,24 @@
       "map": "Peta",
       "layout": "Tata Letak",
       "environment": "Lingkungan",
-      "project": "Proyek",
       "account": "Akun"
     },
     "menu": {
       "mapPreferences": "Preferensi Peta",
       "layoutSettings": "Pengaturan Tata Letak",
       "environmentVariables": "Variabel Lingkungan",
-      "projectSettings": "Pengaturan Proyek",
       "managePlugins": "Kelola Plugin",
       "urlOverrideNote": "Parameter tata letak URL menimpa pengaturan yang tersimpan."
     },
     "map": {
       "constraintsTitle": "Batasan peta",
-      "constraintsDescription": "Batasan berlaku saat proyek dibuka.",
       "restrictBounds": "Batasi batas peta",
       "west": "Barat",
       "south": "Selatan",
       "east": "Timur",
       "north": "Utara",
       "useCurrentView": "Gunakan Tampilan Saat Ini",
+      "useCurrentViewGlobeHint": "Beralih ke proyeksi Mercator sebelum menggunakan ini. Pada proyeksi Bola dunia, peta masih dapat bergeser sedikit melampaui batas yang ditangkap.",
       "minZoom": "Zoom minimum",
       "maxZoom": "Zoom maksimum",
       "maxPitch": "Kemiringan maksimum",
@@ -79,14 +77,6 @@
       "removeAria": "Hapus {{name}}",
       "errorNamePattern": "Nama variabel lingkungan harus diawali huruf atau garis bawah dan hanya boleh mengandung huruf, angka, dan garis bawah.",
       "errorDuplicate": "Variabel lingkungan \"{{name}}\" terduplikasi."
-    },
-    "project": {
-      "title": "Proyek",
-      "description": "Pengaturan disimpan bersama proyek `.geolibre.json`.",
-      "name": "Nama",
-      "file": "Berkas proyek",
-      "notSaved": "Belum disimpan",
-      "format": "Format proyek"
     }
   },
   "toolbar": {
@@ -286,7 +276,7 @@
       "webServices": "Layanan Web",
       "commandPalette": "Palet Perintah",
       "openProjectFromUrl": "Buka proyek dari URL",
-      "openProjectFromUrlDesc": "Muat proyek `.geolibre.json` publik dan tambahkan ke proyek terbaru.",
+      "openProjectFromUrlDesc": "Muat proyek `.geolibre.json` dan tambahkan ke proyek terbaru.",
       "projectUrl": "URL Proyek",
       "opening": "Membuka...",
       "open": "Buka",

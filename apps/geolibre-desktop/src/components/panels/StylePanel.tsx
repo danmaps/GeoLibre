@@ -1,32 +1,45 @@
 import {
   DEFAULT_LAYER_STYLE,
+  type FillPattern,
+  type LabelStyle,
   type LayerType,
+  type MarkerShape,
   type PointRenderer,
+  type StrokeWidthUnit,
   VECTOR_COLOR_RAMPS,
+  type VectorRule,
   type VectorStyleMode,
   type VectorStyleStop,
   createEqualIntervalBreaks,
   createQuantileBreaks,
-  getVectorColorRamp,
   interpolateRampColors,
+  parseJsonExpression,
   styleValue,
   useAppStore,
 } from "@geolibre/core";
 import {
   Button,
+  ColorField,
+  ColorRampSelect,
   Input,
   Label,
   ScrollArea,
   Select,
   Separator,
   Slider,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
 } from "@geolibre/ui";
-import { RASTER_SOURCE_KIND } from "@geolibre/plugins";
+import { RASTER_SOURCE_KIND, SKETCHES_SOURCE_KIND } from "@geolibre/plugins";
 import type { MapController } from "@geolibre/map";
+import type { ParseKeys } from "i18next";
+import { useTranslation } from "react-i18next";
 import { RasterSymbologySection } from "./RasterSymbologySection";
 import {
   ChevronDown,
   ChevronUp,
+  Info,
   PanelRightClose,
   PanelRightOpen,
   Plus,
@@ -36,15 +49,40 @@ import {
 import {
   type PointerEvent as ReactPointerEvent,
   type RefObject,
+  useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { getIsMobileViewport } from "../../hooks/useIsMobileViewport";
+import { clamp } from "../../lib/clamp";
 
 interface StylePanelProps {
   mapControllerRef: RefObject<MapController | null>;
   onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  /**
+   * When this flips to `true` the panel collapses to its thin rail (it is not
+   * unmounted). Used to clear room when the notebook opens beside the map; the
+   * user can still expand it again.
+   */
+  autoCollapse?: boolean;
+  /**
+   * Controlled collapse state for the shared right-sidebar (`replace-style`)
+   * mode. When defined, the panel's own collapse state is ignored and the
+   * parent fully owns expand/collapse: the collapse/expand buttons call
+   * {@link onCollapsedChange} instead of toggling internal state, and
+   * `autoCollapse` no longer applies. Leave undefined for the standalone panel.
+   */
+  collapsed?: boolean;
+  /** Notify the parent of a collapse/expand request in controlled mode. */
+  onCollapsedChange?: (collapsed: boolean) => void;
+  /**
+   * In the shared right-sidebar mode, suppress the panel's own collapsed rail:
+   * when collapsed the panel renders nothing because a single shared rail (owned
+   * by the host) lists the Style entry instead of two adjacent rails.
+   */
+  hideOwnRail?: boolean;
 }
 
 function isRasterPaintLayer(type: LayerType): boolean {
@@ -147,6 +185,96 @@ function isPointOnlyGeoJsonLayer(layer: {
     const type = feature.geometry?.type;
     return type === "Point" || type === "MultiPoint";
   });
+}
+
+interface GeometryFlags {
+  hasPoint: boolean;
+  hasLine: boolean;
+  hasPolygon: boolean;
+}
+
+// Sample the layer's geometry so the proportional-size, fill-pattern, and marker
+// sections only appear where they apply. When the layer has no in-memory GeoJSON
+// (tile/external layers whose geometry is unknown here) every flag is true so the
+// controls stay available rather than being hidden incorrectly.
+function getGeometryFlags(layer: {
+  geojson?: { features?: Array<{ geometry?: { type?: string } | null }> };
+}): GeometryFlags {
+  const features = layer.geojson?.features;
+  if (!features || features.length === 0) {
+    return { hasPoint: true, hasLine: true, hasPolygon: true };
+  }
+  const flags: GeometryFlags = {
+    hasPoint: false,
+    hasLine: false,
+    hasPolygon: false,
+  };
+  const limit = Math.min(features.length, 2000);
+  for (let index = 0; index < limit; index += 1) {
+    const type = features[index]?.geometry?.type;
+    if (type === "Point" || type === "MultiPoint") flags.hasPoint = true;
+    else if (type === "LineString" || type === "MultiLineString")
+      flags.hasLine = true;
+    else if (type === "Polygon" || type === "MultiPolygon")
+      flags.hasPolygon = true;
+    if (flags.hasPoint && flags.hasLine && flags.hasPolygon) break;
+  }
+  return flags;
+}
+
+const MARKER_SHAPE_OPTIONS: ReadonlyArray<{
+  value: MarkerShape;
+  labelKey: ParseKeys;
+}> = [
+  { value: "circle", labelKey: "style.symbology.markerShapes.circle" },
+  { value: "square", labelKey: "style.symbology.markerShapes.square" },
+  { value: "triangle", labelKey: "style.symbology.markerShapes.triangle" },
+  { value: "diamond", labelKey: "style.symbology.markerShapes.diamond" },
+  { value: "star", labelKey: "style.symbology.markerShapes.star" },
+  { value: "cross", labelKey: "style.symbology.markerShapes.cross" },
+  { value: "pin", labelKey: "style.symbology.markerShapes.pin" },
+  { value: "custom", labelKey: "style.symbology.markerShapes.custom" },
+];
+
+// Glyphs for the marker gallery preview only; they render in the chosen marker
+// color (currentColor). The map renders the precise canvas-drawn shapes.
+const MARKER_GLYPHS: Record<MarkerShape, string> = {
+  circle: "●",
+  square: "■",
+  triangle: "▲",
+  diamond: "◆",
+  star: "★",
+  cross: "✚",
+  pin: "⦿",
+  custom: "⬢",
+};
+
+const FILL_PATTERN_OPTIONS: ReadonlyArray<{
+  value: FillPattern;
+  labelKey: ParseKeys;
+}> = [
+  { value: "none", labelKey: "style.symbology.fillPatterns.none" },
+  { value: "hatch", labelKey: "style.symbology.fillPatterns.hatch" },
+  { value: "cross-hatch", labelKey: "style.symbology.fillPatterns.crossHatch" },
+  { value: "horizontal", labelKey: "style.symbology.fillPatterns.horizontal" },
+  { value: "vertical", labelKey: "style.symbology.fillPatterns.vertical" },
+  { value: "dots", labelKey: "style.symbology.fillPatterns.dots" },
+  { value: "svg", labelKey: "style.symbology.fillPatterns.svg" },
+];
+
+/** Create a blank rule-based filter rule with a unique id. */
+function createVectorRule(isElse: boolean, color: string): VectorRule {
+  const id =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `rule-${Math.random().toString(36).slice(2)}`;
+  return {
+    id,
+    label: isElse ? "Else" : "",
+    filter: "",
+    color,
+    isElse,
+  };
 }
 
 function getMetadataFieldNames(metadata: Record<string, unknown>): string[] {
@@ -566,6 +694,12 @@ function validateExpressionJson(value: string, label: string): string | null {
     if (!Array.isArray(parsed)) {
       return `${label} must be a JSON array expression.`;
     }
+    // Every MapLibre expression starts with a string operator. Reject e.g.
+    // `["to-number", …]` used as a filter or a bare value array, which parses as
+    // JSON but compiles to an expression MapLibre rejects at runtime.
+    if (typeof parsed[0] !== "string") {
+      return `${label} must start with an operator, e.g. ["==", ["get", "field"], value].`;
+    }
     return null;
   } catch (error) {
     return `${label} is not valid JSON: ${
@@ -611,10 +745,6 @@ function removeTrailingJsonCommas(value: string): string {
   return result;
 }
 
-function clampNumber(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
-
 // Shared shell classes for every expanded StylePanel return branch. On phones
 // (max-md) it overlays the map as a bottom sheet instead of squeezing it.
 const STYLE_PANEL_ASIDE_CLASS =
@@ -636,6 +766,7 @@ interface NumericStyleInputProps {
   max: number;
   step: number;
   onChange: (value: number) => void;
+  tooltip?: string;
 }
 
 function NumericStyleInput({
@@ -646,9 +777,10 @@ function NumericStyleInput({
   max,
   step,
   onChange,
+  tooltip,
 }: NumericStyleInputProps) {
   const normalize = (next: number) =>
-    Number(clampNumber(next, min, max).toFixed(stepPrecision(step)));
+    Number(clamp(next, min, max).toFixed(stepPrecision(step)));
 
   const stepValue = (direction: 1 | -1) => {
     onChange(normalize(value + direction * step));
@@ -656,7 +788,23 @@ function NumericStyleInput({
 
   return (
     <div className="space-y-2">
-      <Label htmlFor={id}>{label}</Label>
+      <div className="flex items-center gap-1.5">
+        <Label htmlFor={id}>{label}</Label>
+        {tooltip ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                aria-label={tooltip}
+                className="inline-flex cursor-help rounded text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <Info className="h-3.5 w-3.5" aria-hidden="true" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>{tooltip}</TooltipContent>
+          </Tooltip>
+        ) : null}
+      </div>
       <div className="relative">
         <Input
           id={id}
@@ -777,13 +925,79 @@ function RasterStyleSlider({
   onChange,
   format = (next) => next.toFixed(2),
 }: RasterStyleSliderProps) {
+  // Double-clicking the value label (or the slider track) swaps the read-only
+  // value for an inline numeric input, so users can type an exact value instead
+  // of dragging to it (#832). Enter/blur commits the clamped value, Escape cancels.
+  const { t } = useTranslation();
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const precision = stepPrecision(step);
+  // Guard so each edit session commits (or cancels) at most once: Enter and
+  // Escape both tear down the input, and React still fires onBlur on the
+  // unmounting element. Without this, blur would re-commit after Enter or
+  // commit a cancelled draft after Escape.
+  const handledRef = useRef(false);
+
+  const commit = (raw: string) => {
+    if (handledRef.current) return;
+    handledRef.current = true;
+    const parsed = Number(raw);
+    // Treat an empty/whitespace entry like Escape: cancel rather than commit 0
+    // (Number("") === 0 would otherwise silently reset the slider to its min).
+    if (raw.trim() !== "" && Number.isFinite(parsed)) {
+      onChange(Number(clamp(parsed, min, max).toFixed(precision)));
+    }
+    setEditing(false);
+  };
+
+  const cancel = () => {
+    handledRef.current = true;
+    setEditing(false);
+  };
+
+  const startEditing = () => {
+    handledRef.current = false;
+    setDraft(String(value));
+    setEditing(true);
+  };
+
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between gap-3">
         <Label className="text-xs">{label}</Label>
-        <span className="shrink-0 font-mono text-xs text-muted-foreground">
-          {format(value)}
-        </span>
+        {editing ? (
+          <Input
+            type="number"
+            min={min}
+            max={max}
+            step={step}
+            autoFocus
+            aria-label={`${label} value`}
+            className="h-6 w-20 px-1.5 py-0 text-right font-mono text-xs [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            onBlur={(event) => commit(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                commit((event.target as HTMLInputElement).value);
+              } else if (event.key === "Escape") {
+                event.preventDefault();
+                cancel();
+              }
+            }}
+          />
+        ) : (
+          <button
+            type="button"
+            className="shrink-0 cursor-text font-mono text-xs text-muted-foreground hover:text-foreground"
+            title={t("style.raster.exactValueHint")}
+            aria-label={`Edit ${label} value`}
+            onDoubleClick={startEditing}
+          >
+            {format(value)}
+          </button>
+        )}
       </div>
       <Slider
         aria-label={label}
@@ -794,6 +1008,7 @@ function RasterStyleSlider({
         onValueChange={([next]: number[]) => {
           if (typeof next === "number") onChange(next);
         }}
+        onDoubleClick={startEditing}
       />
     </div>
   );
@@ -802,15 +1017,56 @@ function RasterStyleSlider({
 export function StylePanel({
   mapControllerRef,
   onResizeStart,
+  autoCollapse = false,
+  collapsed: controlledCollapsed,
+  onCollapsedChange,
+  hideOwnRail = false,
 }: StylePanelProps) {
+  const { t } = useTranslation();
   const selectedLayerId = useAppStore((s) => s.selectedLayerId);
   const layers = useAppStore((s) => s.layers);
   const setLayerOpacity = useAppStore((s) => s.setLayerOpacity);
   const setLayerStyle = useAppStore((s) => s.setLayerStyle);
   const updateLayer = useAppStore((s) => s.updateLayer);
   const moveLayer = useAppStore((s) => s.moveLayer);
-  const [isCollapsed, setIsCollapsed] = useState(getIsMobileViewport);
+  const [internalCollapsed, setInternalCollapsed] = useState(getIsMobileViewport);
+  // In the shared right-sidebar mode the parent owns collapse (controlled);
+  // otherwise the panel manages it locally. `setIsCollapsed` routes to whichever
+  // owner applies so every existing call site keeps working.
+  const isControlled = controlledCollapsed !== undefined;
+  const isCollapsed = isControlled ? controlledCollapsed : internalCollapsed;
+  const setIsCollapsed = useCallback(
+    (value: boolean) => {
+      if (isControlled) onCollapsedChange?.(value);
+      else setInternalCollapsed(value);
+    },
+    [isControlled, onCollapsedChange],
+  );
+  // Collapse to the rail when `autoCollapse` flips on (e.g. the notebook opens),
+  // and restore the prior expand/collapse state when it flips back off (notebook
+  // closes). Both act only on the transition so the user can still toggle the
+  // panel manually while `autoCollapse` stays on. `isCollapsed` is in the deps
+  // only to keep the captured value fresh; the guards make pure `isCollapsed`
+  // changes a no-op while `autoCollapse` is stable. The ref starts as null (not
+  // `autoCollapse`) so a mount with `autoCollapse` already true reads as a
+  // null→true transition and still collapses. Skipped entirely in controlled
+  // mode, where the parent (shared rail) owns collapse and never passes
+  // `autoCollapse`.
+  const prevAutoCollapse = useRef<boolean | null>(null);
+  const collapsedBeforeAuto = useRef(isCollapsed);
+  useEffect(() => {
+    if (isControlled) return;
+    const wasAuto = prevAutoCollapse.current;
+    prevAutoCollapse.current = autoCollapse;
+    if (autoCollapse && !wasAuto) {
+      collapsedBeforeAuto.current = internalCollapsed;
+      setInternalCollapsed(true);
+    } else if (!autoCollapse && wasAuto) {
+      setInternalCollapsed(collapsedBeforeAuto.current);
+    }
+  }, [autoCollapse, internalCollapsed, isControlled]);
   const [draftBeforeId, setDraftBeforeId] = useState("");
+  const [showBasemapStyleLayers, setShowBasemapStyleLayers] = useState(false);
   const [draftColorExpression, setDraftColorExpression] = useState("");
   const [draftHeightExpression, setDraftHeightExpression] = useState("");
   const [draftVectorStyleMode, setDraftVectorStyleMode] =
@@ -949,6 +1205,13 @@ export function StylePanel({
     layer?.style.vectorStyleStops,
   ]);
 
+  // Reset the "show basemap layers" advanced toggle back to its clean default
+  // whenever a different layer is selected. Keyed on the layer id alone so it
+  // does not re-collapse while the user edits other style fields.
+  useEffect(() => {
+    setShowBasemapStyleLayers(false);
+  }, [layer?.id]);
+
   // Heatmap/cluster apply to point layers in two render paths: core GeoJSON
   // layers (drag-drop, processing results) and Add Vector Layer point layers in
   // the geojson render mode (the maplibre-gl-vector control renders those, so
@@ -957,6 +1220,16 @@ export function StylePanel({
   // Must run before the early returns below so the hook order stays stable.
   const isPointOnly = useMemo(
     () => (layer ? isPointOnlyGeoJsonLayer(layer) : false),
+    [layer],
+  );
+  // Memoized so the per-feature geometry scan (up to 2000 features) does not
+  // re-run on every render, e.g. while typing in a rule filter textarea. Kept
+  // before the early returns below so the hook order stays stable.
+  const geometryFlags = useMemo(
+    () =>
+      layer
+        ? getGeometryFlags(layer)
+        : { hasPoint: true, hasLine: true, hasPolygon: true },
     [layer],
   );
 
@@ -971,6 +1244,10 @@ export function StylePanel({
   );
 
   if (isCollapsed) {
+    // In the shared right-sidebar mode the host renders a single rail listing
+    // Style alongside the plugin panel, so the panel shows nothing of its own
+    // when collapsed (avoids two adjacent rails).
+    if (hideOwnRail) return null;
     return (
       <aside
         aria-label="Layer style (collapsed)"
@@ -1059,10 +1336,37 @@ export function StylePanel({
     layer.metadata.sourceKind === "maplibre-gl-vector" &&
     layer.metadata.geometryType === "point";
   const supportsPointRenderer = isCoreGeoJsonPoint || isVectorControlPoint;
+  // The "Sketches" layer mixes geometry types under one style, so "Circle
+  // radius" only applies to its point markers and is misleading otherwise (#483).
+  const isSketchLayer = layer.metadata.sourceKind === SKETCHES_SOURCE_KIND;
+  const strokeWidthUnit = styleValue(style, "strokeWidthUnit");
+  // The unit only affects line/polygon-outline rendering. Point layers always
+  // stroke in pixels, so never present meters semantics (label/range/selector)
+  // for them, even if a hand-edited project set "meters".
+  const strokeWidthInMeters =
+    strokeWidthUnit === "meters" && !supportsPointRenderer;
   const pointRenderer = styleValue(style, "pointRenderer");
   const extrusionEnabled = styleValue(style, "extrusionEnabled");
   const extrusionHeightPropertyOptions = getAttributePropertyNames(layer);
   const vectorStylePropertyOptions = extrusionHeightPropertyOptions;
+  const labels: LabelStyle = {
+    ...DEFAULT_LAYER_STYLE.labels,
+    ...styleValue(style, "labels"),
+  };
+  const updateLabels = (patch: Partial<LabelStyle>) =>
+    setLayerStyle(layer.id, { labels: { ...labels, ...patch } });
+  // The label expression must be a JSON array (a MapLibre expression). Flag a
+  // non-empty value that does not round-trip as an array so the user sees that
+  // it is ignored (layer-sync falls back to the field / no label) instead of
+  // silently producing nothing.
+  const labelExpressionInvalid = (() => {
+    if (!labels.expression.trim()) return false;
+    try {
+      return !Array.isArray(JSON.parse(labels.expression));
+    } catch {
+      return true;
+    }
+  })();
   const extrusionHeightProperties = extrusionHeightPropertyOptions.includes(
     draftExtrusionHeightProperty,
   )
@@ -1322,9 +1626,16 @@ export function StylePanel({
     !otherLayers.some((l) => l.id === draftBeforeId)
       ? draftBeforeId
       : null;
+  // The basemap style exposes dozens of internal layer ids that overwhelm the
+  // dropdown for standard users (issue #834). Keep them behind an opt-in
+  // "advanced" toggle so the default list only shows the user's own layers —
+  // but reveal them automatically if the current value is one of them.
+  const valueIsBasemapStyleLayer = basemapStyleLayerIds.includes(draftBeforeId);
+  const basemapStyleLayersVisible =
+    showBasemapStyleLayers || valueIsBasemapStyleLayer;
   const beforeIdControl = (
     <div className="space-y-2">
-      <Label htmlFor="beforeId">Insert before</Label>
+      <Label htmlFor="beforeId">{t("addData.shared.insertBelow")}</Label>
       <Select
         id="beforeId"
         value={draftBeforeId}
@@ -1345,7 +1656,7 @@ export function StylePanel({
             ))}
           </optgroup>
         )}
-        {basemapStyleLayerIds.length > 0 && (
+        {basemapStyleLayerIds.length > 0 && basemapStyleLayersVisible && (
           <optgroup label="Basemap layers">
             {basemapStyleLayerIds.map((styleLayerId) => (
               <option key={styleLayerId} value={styleLayerId}>
@@ -1355,19 +1666,30 @@ export function StylePanel({
           </optgroup>
         )}
       </Select>
+      {basemapStyleLayerIds.length > 0 && !valueIsBasemapStyleLayer && (
+        <label className="flex items-center gap-2 text-xs text-muted-foreground">
+          <input
+            type="checkbox"
+            aria-controls="beforeId"
+            checked={showBasemapStyleLayers}
+            onChange={(event) => setShowBasemapStyleLayers(event.target.checked)}
+          />
+          {t("addData.shared.showBasemapLayers")}
+        </label>
+      )}
     </div>
   );
   const minZoom = styleValue(style, "minZoom");
   const maxZoom = styleValue(style, "maxZoom");
   const setMinZoom = (value: number) => {
-    const next = clampNumber(value, MIN_LAYER_ZOOM, MAX_LAYER_ZOOM);
+    const next = clamp(value, MIN_LAYER_ZOOM, MAX_LAYER_ZOOM);
     setLayerStyle(layer.id, {
       minZoom: next,
       maxZoom: Math.max(next, maxZoom),
     });
   };
   const setMaxZoom = (value: number) => {
-    const next = clampNumber(value, MIN_LAYER_ZOOM, MAX_LAYER_ZOOM);
+    const next = clamp(value, MIN_LAYER_ZOOM, MAX_LAYER_ZOOM);
     setLayerStyle(layer.id, {
       minZoom: Math.min(next, minZoom),
       maxZoom: next,
@@ -1377,7 +1699,8 @@ export function StylePanel({
     <div className="grid grid-cols-2 gap-3">
       <NumericStyleInput
         id={`${layer.id}-minZoom`}
-        label="Min zoom"
+        label={t("style.visibility.minZoom")}
+        tooltip={t("style.visibility.minZoomTooltip")}
         min={MIN_LAYER_ZOOM}
         max={maxZoom}
         step={1}
@@ -1386,7 +1709,8 @@ export function StylePanel({
       />
       <NumericStyleInput
         id={`${layer.id}-maxZoom`}
-        label="Max zoom"
+        label={t("style.visibility.maxZoom")}
+        tooltip={t("style.visibility.maxZoomTooltip")}
         min={minZoom}
         max={MAX_LAYER_ZOOM}
         step={1}
@@ -1406,8 +1730,87 @@ export function StylePanel({
     (classCount) =>
       draftVectorStyleMode === "categorized" ? true : classCount >= 2,
   );
-  const colorRampPreview =
-    getVectorColorRamp(draftVectorStyleColorRamp).colors;
+
+  // --- Rule-based renderer (immediate writes to style.vectorRules) ---
+  const currentRules = styleValue(style, "vectorRules");
+  const concreteRules = currentRules.filter((rule) => !rule.isElse);
+  const elseRule = currentRules.find((rule) => rule.isElse) ?? null;
+  const setVectorRules = (rules: VectorRule[]) =>
+    setLayerStyle(layer.id, { vectorRules: rules });
+  const updateVectorRule = (id: string, patch: Partial<VectorRule>) =>
+    setVectorRules(
+      currentRules.map((rule) =>
+        rule.id === id ? { ...rule, ...patch } : rule,
+      ),
+    );
+  const addVectorRule = () => {
+    const next = createVectorRule(false, nextStopColor(concreteRules.length));
+    // Keep the catch-all else rule last so it reads as the fallback.
+    setVectorRules(
+      elseRule ? [...concreteRules, next, elseRule] : [...concreteRules, next],
+    );
+  };
+  const removeVectorRule = (id: string) =>
+    setVectorRules(currentRules.filter((rule) => rule.id !== id));
+  const setElseRuleColor = (color: string) => {
+    if (elseRule) {
+      updateVectorRule(elseRule.id, { color });
+      return;
+    }
+    setVectorRules([...currentRules, createVectorRule(true, color)]);
+  };
+
+  // --- Geometry-gated sections (proportional size, fill pattern, markers) ---
+  // geometryFlags is memoized above the early returns.
+  const showProportionalControls =
+    hasVectorPaintControls &&
+    pointRenderer !== "heatmap" &&
+    // A marker symbol layer uses a baked icon (icon-size 1), so proportional
+    // circle-radius sizing would not apply; hide it for points to avoid a silent
+    // no-op. The marker gate stays inside the point branch so that proportional
+    // line-width controls remain available on layers that carry lines (markers
+    // never affect line rendering, even if markerEnabled is set on a mixed
+    // point+line layer via a hand-edited project file).
+    ((geometryFlags.hasPoint &&
+      pointRenderer === "single" &&
+      !styleValue(style, "markerEnabled")) ||
+      geometryFlags.hasLine);
+  const showFillPatternControls =
+    hasVectorPaintControls && !extrusionEnabled && geometryFlags.hasPolygon;
+  const showMarkerControls =
+    hasVectorPaintControls &&
+    supportsPointRenderer &&
+    pointRenderer === "single";
+
+  const proportionalEnabled = styleValue(style, "proportionalSizeEnabled");
+  const proportionalProperty = styleValue(style, "proportionalSizeProperty");
+  const proportionalMinValue = styleValue(style, "proportionalSizeMinValue");
+  const proportionalMaxValue = styleValue(style, "proportionalSizeMaxValue");
+  const proportionalMinRadius = styleValue(style, "proportionalSizeMinRadius");
+  const proportionalMaxRadius = styleValue(style, "proportionalSizeMaxRadius");
+  // A small graduated-size legend: evenly spaced sample values mapped onto the
+  // interpolated radius range, mirroring what the map renders.
+  const proportionalLegend =
+    proportionalEnabled &&
+    proportionalMaxValue > proportionalMinValue &&
+    proportionalMinRadius <= proportionalMaxRadius
+      ? Array.from({ length: 5 }, (_, index) => {
+          const ratio = index / 4;
+          return {
+            value:
+              proportionalMinValue +
+              ratio * (proportionalMaxValue - proportionalMinValue),
+            radius:
+              proportionalMinRadius +
+              ratio * (proportionalMaxRadius - proportionalMinRadius),
+          };
+        })
+      : [];
+
+  const fillPattern = styleValue(style, "fillPattern");
+  const markerEnabled = styleValue(style, "markerEnabled");
+  const markerShape = styleValue(style, "markerShape");
+
   const vectorSymbologyControls = (
     <div className="space-y-3">
       <div className="space-y-2">
@@ -1419,10 +1822,17 @@ export function StylePanel({
             updateDraftVectorStyleMode(event.target.value as VectorStyleMode)
           }
         >
-          <option value="single">Single symbology</option>
-          <option value="graduated">Graduated</option>
-          <option value="categorized">Categorized</option>
-          <option value="expression">Advanced expression</option>
+          <option value="single">{t("style.symbology.modeSingle")}</option>
+          <option value="graduated">{t("style.symbology.modeGraduated")}</option>
+          <option value="categorized">
+            {t("style.symbology.modeCategorized")}
+          </option>
+          <option value="rule-based">
+            {t("style.symbology.modeRuleBased")}
+          </option>
+          <option value="expression">
+            {t("style.symbology.modeExpression")}
+          </option>
         </Select>
       </div>
       {usesAttributeSymbology && (
@@ -1486,28 +1896,15 @@ export function StylePanel({
       )}
       {usesAttributeSymbology && (
         <div className="space-y-2">
-          <Label htmlFor="vectorStyleColorRamp">Colormap</Label>
-          <Select
+          <Label htmlFor="vectorStyleColorRamp">
+            {t("style.symbology.colormap")}
+          </Label>
+          <ColorRampSelect
             id="vectorStyleColorRamp"
+            aria-label={t("style.symbology.colormap")}
             value={draftVectorStyleColorRamp}
-            onChange={(event) =>
-              updateDraftVectorStyleColorRamp(event.target.value)
-            }
-          >
-            {VECTOR_COLOR_RAMPS.map((colorRamp) => (
-              <option key={colorRamp.value} value={colorRamp.value}>
-                {colorRamp.label}
-              </option>
-            ))}
-          </Select>
-          <div
-            aria-hidden="true"
-            className="h-2 rounded-sm border"
-            style={{
-              background: `linear-gradient(90deg, ${colorRampPreview.join(
-                ", ",
-              )})`,
-            }}
+            onValueChange={updateDraftVectorStyleColorRamp}
+            ramps={VECTOR_COLOR_RAMPS}
           />
         </div>
       )}
@@ -1533,16 +1930,18 @@ export function StylePanel({
             {draftVectorStyleStops.map((stop, index) => (
               <div
                 key={index}
-                className="grid grid-cols-[2.25rem_1fr_2rem] items-center gap-2"
+                className="grid grid-cols-[auto_1fr_2rem] items-center gap-2"
               >
-                <Input
-                  type="color"
+                <ColorField
+                  fill={false}
                   aria-label={`Class ${index + 1} color`}
-                  className="h-9 p-1"
+                  eyedropperLabel={`Pick class ${index + 1} color from the screen`}
+                  className="h-9 w-9 p-1"
+                  buttonClassName="h-9 w-9"
                   value={stop.color}
-                  onChange={(event) =>
+                  onChange={(color) =>
                     updateDraftVectorStyleStop(index, {
-                      color: event.target.value,
+                      color,
                     })
                   }
                 />
@@ -1587,6 +1986,104 @@ export function StylePanel({
           />
         </div>
       )}
+      {draftVectorStyleMode === "rule-based" && (
+        <div className="space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <Label>{t("style.symbology.rules")}</Label>
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              className="h-7 w-7"
+              title={t("style.symbology.addRule")}
+              aria-label={t("style.symbology.addRule")}
+              onClick={addVectorRule}
+            >
+              <Plus className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+          {concreteRules.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              {t("style.symbology.noRulesPrefix")}
+              <code>{'["==", ["get", "TYPE"], "park"]'}</code>
+              {t("style.symbology.noRulesSuffix")}
+            </p>
+          ) : null}
+          {concreteRules.map((rule, index) => (
+            <div
+              key={rule.id}
+              className="space-y-2 rounded-md border border-input p-2"
+            >
+              <div className="grid grid-cols-[auto_1fr_2rem] items-center gap-2">
+                <ColorField
+                  fill={false}
+                  aria-label={t("style.symbology.ruleColor", {
+                    index: index + 1,
+                  })}
+                  eyedropperLabel={t("style.symbology.ruleColorPick", {
+                    index: index + 1,
+                  })}
+                  className="h-9 w-9 p-1"
+                  buttonClassName="h-9 w-9"
+                  value={rule.color}
+                  onChange={(color) => updateVectorRule(rule.id, { color })}
+                />
+                <Input
+                  aria-label={t("style.symbology.ruleLabel", {
+                    index: index + 1,
+                  })}
+                  placeholder={t("style.symbology.labelPlaceholder")}
+                  value={rule.label}
+                  onChange={(event) =>
+                    updateVectorRule(rule.id, { label: event.target.value })
+                  }
+                />
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8"
+                  title={t("style.symbology.removeRule")}
+                  aria-label={t("style.symbology.removeRule")}
+                  onClick={() => removeVectorRule(rule.id)}
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+              <textarea
+                aria-label={t("style.symbology.ruleFilter", {
+                  index: index + 1,
+                })}
+                className="min-h-16 w-full rounded-md border border-input bg-background px-2 py-1.5 font-mono text-xs placeholder:text-muted-foreground focus-visible:border-2 focus-visible:border-ring focus-visible:outline-none focus-visible:ring-0"
+                placeholder='["==", ["get", "TYPE"], "park"]'
+                value={rule.filter}
+                onChange={(event) =>
+                  updateVectorRule(rule.id, { filter: event.target.value })
+                }
+              />
+              {rule.filter.trim() && !parseJsonExpression(rule.filter) ? (
+                <p className="text-xs text-destructive">
+                  {t("style.symbology.filterInvalid")}
+                </p>
+              ) : null}
+            </div>
+          ))}
+          <div className="grid grid-cols-[auto_1fr] items-center gap-2 rounded-md border border-dashed border-input p-2">
+            <ColorField
+              fill={false}
+              aria-label={t("style.symbology.elseRuleColor")}
+              eyedropperLabel={t("style.symbology.elseRuleColorPick")}
+              className="h-9 w-9 p-1"
+              buttonClassName="h-9 w-9"
+              value={elseRule?.color ?? style.fillColor}
+              onChange={setElseRuleColor}
+            />
+            <span className="text-xs text-muted-foreground">
+              {t("style.symbology.elseAllOtherFeatures")}
+            </span>
+          </div>
+        </div>
+      )}
       <Button
         type="button"
         size="sm"
@@ -1596,9 +2093,581 @@ export function StylePanel({
       >
         Apply style type
       </Button>
+      {draftVectorStyleMode === "rule-based" &&
+        draftVectorStyleMode !== styleValue(style, "vectorStyleMode") && (
+          <p className="text-xs text-muted-foreground">
+            {t("style.symbology.applyHint")}
+          </p>
+        )}
       {vectorStyleError && (
         <p className="text-xs text-destructive">{vectorStyleError}</p>
       )}
+    </div>
+  );
+  const proportionalSizeControls = (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor="proportionalSizeEnabled">
+          {t("style.symbology.proportionalSize")}
+        </Label>
+        <label className="flex items-center gap-2 text-xs text-muted-foreground">
+          <input
+            id="proportionalSizeEnabled"
+            type="checkbox"
+            checked={proportionalEnabled}
+            onChange={(event) =>
+              setLayerStyle(layer.id, {
+                proportionalSizeEnabled: event.target.checked,
+              })
+            }
+          />
+          {t("style.symbology.sizeByValue")}
+        </label>
+      </div>
+      {proportionalEnabled && (
+        <>
+          <div className="space-y-2">
+            <Label htmlFor="proportionalSizeProperty">
+              {t("style.symbology.sizeField")}
+            </Label>
+            <Select
+              id="proportionalSizeProperty"
+              value={proportionalProperty}
+              onChange={(event) =>
+                setLayerStyle(layer.id, {
+                  proportionalSizeProperty: event.target.value,
+                })
+              }
+              disabled={vectorStylePropertyOptions.length === 0}
+            >
+              {vectorStylePropertyOptions.length === 0 ? (
+                <option value="">{t("style.labels.noAttributes")}</option>
+              ) : (
+                <>
+                  <option value="">{t("style.symbology.chooseField")}</option>
+                  {vectorStylePropertyOptions.map((property) => (
+                    <option key={property} value={property}>
+                      {property}
+                    </option>
+                  ))}
+                </>
+              )}
+            </Select>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <NumericStyleInput
+              id="proportionalSizeMinValue"
+              label={t("style.symbology.minValue")}
+              min={-1_000_000_000}
+              max={1_000_000_000}
+              step={1}
+              value={proportionalMinValue}
+              onChange={(proportionalSizeMinValue) =>
+                setLayerStyle(layer.id, { proportionalSizeMinValue })
+              }
+            />
+            <NumericStyleInput
+              id="proportionalSizeMaxValue"
+              label={t("style.symbology.maxValue")}
+              min={-1_000_000_000}
+              max={1_000_000_000}
+              step={1}
+              value={proportionalMaxValue}
+              onChange={(proportionalSizeMaxValue) =>
+                setLayerStyle(layer.id, { proportionalSizeMaxValue })
+              }
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <NumericStyleInput
+              id="proportionalSizeMinRadius"
+              label={t("style.symbology.minSize")}
+              min={0}
+              max={100}
+              step={1}
+              value={proportionalMinRadius}
+              onChange={(proportionalSizeMinRadius) =>
+                setLayerStyle(layer.id, { proportionalSizeMinRadius })
+              }
+            />
+            <NumericStyleInput
+              id="proportionalSizeMaxRadius"
+              label={t("style.symbology.maxSize")}
+              min={0}
+              max={100}
+              step={1}
+              value={proportionalMaxRadius}
+              onChange={(proportionalSizeMaxRadius) =>
+                setLayerStyle(layer.id, { proportionalSizeMaxRadius })
+              }
+            />
+          </div>
+          {proportionalLegend.length > 0 && proportionalProperty ? (
+            <div className="space-y-1">
+              <Label>{t("style.symbology.sizeLegend")}</Label>
+              <div className="flex items-end justify-between gap-2 rounded-md border border-input p-3">
+                {proportionalLegend.map((entry, index) => (
+                  <div
+                    key={index}
+                    className="flex flex-col items-center gap-1"
+                  >
+                    <span
+                      aria-hidden="true"
+                      className="rounded-full bg-primary/70"
+                      style={{
+                        width: entry.radius * 2,
+                        height: entry.radius * 2,
+                      }}
+                    />
+                    <span className="text-[10px] text-muted-foreground">
+                      {entry.value.toLocaleString(undefined, {
+                        maximumFractionDigits: 1,
+                      })}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </>
+      )}
+    </div>
+  );
+  const fillPatternControls = (
+    <div className="space-y-3">
+      <div className="space-y-2">
+        <Label htmlFor="fillPattern">{t("style.symbology.fillPattern")}</Label>
+        <Select
+          id="fillPattern"
+          value={fillPattern}
+          onChange={(event) =>
+            setLayerStyle(layer.id, {
+              fillPattern: event.target.value as FillPattern,
+            })
+          }
+        >
+          {FILL_PATTERN_OPTIONS.map((option) => (
+            <option key={option.value} value={option.value}>
+              {t(option.labelKey)}
+            </option>
+          ))}
+        </Select>
+      </div>
+      {fillPattern !== "none" && fillPattern !== "svg" ? (
+        <div className="space-y-2">
+          <Label htmlFor="fillPatternColor">
+            {t("style.symbology.patternColor")}
+          </Label>
+          <ColorField
+            id="fillPatternColor"
+            value={styleValue(style, "fillPatternColor")}
+            onChange={(fillPatternColor) =>
+              setLayerStyle(layer.id, { fillPatternColor })
+            }
+          />
+        </div>
+      ) : null}
+      {fillPattern === "svg" ? (
+        <div className="space-y-2">
+          <Label htmlFor="fillPatternSvg">
+            {t("style.symbology.patternSvg")}
+          </Label>
+          <textarea
+            id="fillPatternSvg"
+            className="min-h-20 w-full rounded-md border border-input bg-background px-2 py-1.5 font-mono text-xs placeholder:text-muted-foreground focus-visible:border-2 focus-visible:border-ring focus-visible:outline-none focus-visible:ring-0"
+            placeholder={t("style.symbology.svgPlaceholder")}
+            value={styleValue(style, "fillPatternSvg")}
+            onChange={(event) =>
+              setLayerStyle(layer.id, { fillPatternSvg: event.target.value })
+            }
+          />
+        </div>
+      ) : null}
+    </div>
+  );
+  const markerControls = (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor="markerEnabled">{t("style.symbology.marker")}</Label>
+        <label className="flex items-center gap-2 text-xs text-muted-foreground">
+          <input
+            id="markerEnabled"
+            type="checkbox"
+            checked={markerEnabled}
+            onChange={(event) =>
+              setLayerStyle(layer.id, { markerEnabled: event.target.checked })
+            }
+          />
+          {t("style.symbology.useMarkerIcon")}
+        </label>
+      </div>
+      {markerEnabled && (
+        <>
+          <div className="space-y-2">
+            <Label>{t("style.symbology.markerShape")}</Label>
+            <div className="grid grid-cols-4 gap-2">
+              {MARKER_SHAPE_OPTIONS.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  title={t(option.labelKey)}
+                  aria-label={t(option.labelKey)}
+                  aria-pressed={markerShape === option.value}
+                  onClick={() =>
+                    setLayerStyle(layer.id, { markerShape: option.value })
+                  }
+                  className={`flex h-12 flex-col items-center justify-center gap-0.5 rounded-md border text-[9px] ${
+                    markerShape === option.value
+                      ? "border-primary ring-1 ring-primary"
+                      : "border-input hover:border-primary/50"
+                  }`}
+                >
+                  <span
+                    aria-hidden="true"
+                    className="text-base leading-none"
+                    style={{
+                      color:
+                        option.value === "custom"
+                          ? undefined
+                          : styleValue(style, "markerColor"),
+                    }}
+                  >
+                    {MARKER_GLYPHS[option.value]}
+                  </span>
+                  <span className="truncate">{t(option.labelKey)}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+          {markerShape !== "custom" ? (
+            <div className="space-y-2">
+              <Label htmlFor="markerColor">
+                {t("style.symbology.markerColor")}
+              </Label>
+              <ColorField
+                id="markerColor"
+                value={styleValue(style, "markerColor")}
+                onChange={(markerColor) =>
+                  setLayerStyle(layer.id, { markerColor })
+                }
+              />
+            </div>
+          ) : null}
+          <NumericStyleInput
+            id="markerSize"
+            label={t("style.symbology.markerSize")}
+            min={6}
+            max={96}
+            step={1}
+            value={styleValue(style, "markerSize")}
+            onChange={(markerSize) =>
+              setLayerStyle(layer.id, { markerSize })
+            }
+          />
+          {markerShape === "custom" ? (
+            <div className="space-y-2">
+              <Label htmlFor="markerSvg">
+                {t("style.symbology.markerSvg")}
+              </Label>
+              <textarea
+                id="markerSvg"
+                className="min-h-20 w-full rounded-md border border-input bg-background px-2 py-1.5 font-mono text-xs placeholder:text-muted-foreground focus-visible:border-2 focus-visible:border-ring focus-visible:outline-none focus-visible:ring-0"
+                placeholder={t("style.symbology.svgPlaceholder")}
+                value={styleValue(style, "markerSvg")}
+                onChange={(event) =>
+                  setLayerStyle(layer.id, { markerSvg: event.target.value })
+                }
+              />
+            </div>
+          ) : null}
+        </>
+      )}
+    </div>
+  );
+  const labelControls = (
+    <div className="space-y-3">
+      <label
+        htmlFor="labelsEnabled"
+        className="flex items-center gap-2 text-sm font-medium"
+      >
+        <input
+          id="labelsEnabled"
+          type="checkbox"
+          checked={labels.enabled}
+          onChange={(event) => updateLabels({ enabled: event.target.checked })}
+        />
+        {t("style.labels.show")}
+      </label>
+      {labels.enabled ? (
+        <>
+          <div className="space-y-2">
+            <Label htmlFor="labelField">{t("style.labels.field")}</Label>
+            <Select
+              id="labelField"
+              value={labels.field}
+              disabled={vectorStylePropertyOptions.length === 0}
+              onChange={(event) => updateLabels({ field: event.target.value })}
+            >
+              {vectorStylePropertyOptions.length === 0 ? (
+                <option value="">{t("style.labels.noAttributes")}</option>
+              ) : (
+                <>
+                  <option value="">{t("style.labels.selectField")}</option>
+                  {vectorStylePropertyOptions.map((property) => (
+                    <option key={property} value={property}>
+                      {property}
+                    </option>
+                  ))}
+                </>
+              )}
+            </Select>
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="labelPlacement">
+              {t("style.labels.placement")}
+            </Label>
+            <Select
+              id="labelPlacement"
+              value={labels.placement}
+              onChange={(event) =>
+                updateLabels({
+                  placement: event.target.value as "point" | "line",
+                })
+              }
+            >
+              <option value="point">{t("style.labels.placementPoint")}</option>
+              <option value="line">{t("style.labels.placementLine")}</option>
+            </Select>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <NumericStyleInput
+              id="labelSize"
+              label={t("style.labels.textSize")}
+              min={6}
+              max={48}
+              step={1}
+              value={labels.size}
+              onChange={(size) => updateLabels({ size })}
+            />
+            <NumericStyleInput
+              id="labelHaloWidth"
+              label={t("style.labels.haloWidth")}
+              min={0}
+              max={8}
+              step={0.5}
+              value={labels.haloWidth}
+              onChange={(haloWidth) => updateLabels({ haloWidth })}
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-2">
+              <Label htmlFor="labelColor">
+                {t("style.labels.textColor")}
+              </Label>
+              <ColorField
+                id="labelColor"
+                value={labels.color}
+                onChange={(color) => updateLabels({ color })}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="labelHaloColor">
+                {t("style.labels.haloColor")}
+              </Label>
+              <ColorField
+                id="labelHaloColor"
+                value={labels.haloColor}
+                onChange={(haloColor) => updateLabels({ haloColor })}
+              />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <NumericStyleInput
+              id="labelMinZoom"
+              label={t("style.labels.minZoom")}
+              min={0}
+              max={labels.maxZoom}
+              step={1}
+              value={labels.minZoom}
+              onChange={(minZoom) =>
+                updateLabels({ minZoom: Math.min(minZoom, labels.maxZoom) })
+              }
+            />
+            <NumericStyleInput
+              id="labelMaxZoom"
+              label={t("style.labels.maxZoom")}
+              min={labels.minZoom}
+              max={24}
+              step={1}
+              value={labels.maxZoom}
+              onChange={(maxZoom) =>
+                updateLabels({ maxZoom: Math.max(maxZoom, labels.minZoom) })
+              }
+            />
+          </div>
+          <label
+            htmlFor="labelAllowOverlap"
+            className="flex items-center gap-2 text-sm font-medium"
+          >
+            <input
+              id="labelAllowOverlap"
+              type="checkbox"
+              checked={labels.allowOverlap}
+              onChange={(event) =>
+                updateLabels({ allowOverlap: event.target.checked })
+              }
+            />
+            {t("style.labels.allowOverlap")}
+          </label>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-2">
+              <Label htmlFor="labelAnchor">{t("style.labels.anchor")}</Label>
+              <Select
+                id="labelAnchor"
+                value={labels.anchor}
+                onChange={(event) =>
+                  updateLabels({
+                    anchor: event.target.value as LabelStyle["anchor"],
+                  })
+                }
+              >
+                <option value="center">{t("style.labels.anchorCenter")}</option>
+                <option value="left">{t("style.labels.anchorLeft")}</option>
+                <option value="right">{t("style.labels.anchorRight")}</option>
+                <option value="top">{t("style.labels.anchorTop")}</option>
+                <option value="bottom">{t("style.labels.anchorBottom")}</option>
+                <option value="top-left">
+                  {t("style.labels.anchorTopLeft")}
+                </option>
+                <option value="top-right">
+                  {t("style.labels.anchorTopRight")}
+                </option>
+                <option value="bottom-left">
+                  {t("style.labels.anchorBottomLeft")}
+                </option>
+                <option value="bottom-right">
+                  {t("style.labels.anchorBottomRight")}
+                </option>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="labelTransform">
+                {t("style.labels.transform")}
+              </Label>
+              <Select
+                id="labelTransform"
+                value={labels.transform}
+                onChange={(event) =>
+                  updateLabels({
+                    transform: event.target.value as LabelStyle["transform"],
+                  })
+                }
+              >
+                <option value="none">{t("style.labels.transformNone")}</option>
+                <option value="uppercase">
+                  {t("style.labels.transformUppercase")}
+                </option>
+                <option value="lowercase">
+                  {t("style.labels.transformLowercase")}
+                </option>
+              </Select>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <NumericStyleInput
+              id="labelOffsetX"
+              label={t("style.labels.offsetX")}
+              min={-10}
+              max={10}
+              step={0.25}
+              value={labels.offsetX}
+              onChange={(offsetX) => updateLabels({ offsetX })}
+            />
+            <NumericStyleInput
+              id="labelOffsetY"
+              label={t("style.labels.offsetY")}
+              min={-10}
+              max={10}
+              step={0.25}
+              value={labels.offsetY}
+              onChange={(offsetY) => updateLabels({ offsetY })}
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <NumericStyleInput
+              id="labelRotation"
+              label={t("style.labels.rotation")}
+              min={-180}
+              max={180}
+              step={5}
+              value={labels.rotation}
+              onChange={(rotation) => updateLabels({ rotation })}
+            />
+            <NumericStyleInput
+              id="labelMaxWidth"
+              label={t("style.labels.maxWidth")}
+              min={1}
+              max={40}
+              step={1}
+              value={labels.maxWidth}
+              onChange={(maxWidth) => updateLabels({ maxWidth })}
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="labelDedupe">{t("style.labels.dedupe")}</Label>
+            <Select
+              id="labelDedupe"
+              value={labels.dedupe}
+              onChange={(event) =>
+                updateLabels({
+                  dedupe: event.target.value as LabelStyle["dedupe"],
+                })
+              }
+            >
+              <option value="off">{t("style.labels.dedupeOff")}</option>
+              <option value="unique">{t("style.labels.dedupeUnique")}</option>
+              <option value="concatenate">
+                {t("style.labels.dedupeConcatenate")}
+              </option>
+            </Select>
+            {labels.dedupe !== "off" ? (
+              <p className="text-xs text-muted-foreground">
+                {t("style.labels.dedupeHint")}
+              </p>
+            ) : null}
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="labelExpression">
+              {t("style.labels.expression")}
+            </Label>
+            <textarea
+              id="labelExpression"
+              aria-invalid={labelExpressionInvalid}
+              className={[
+                "min-h-16 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs placeholder:text-muted-foreground focus-visible:border-2 focus-visible:border-ring focus-visible:outline-none focus-visible:ring-0",
+                labelExpressionInvalid ? "border-destructive" : "border-input",
+              ].join(" ")}
+              placeholder={'["concat", ["get", "name"], " (", ["get", "pop"], ")"]'}
+              value={labels.expression}
+              onChange={(event) =>
+                updateLabels({ expression: event.target.value })
+              }
+            />
+            <p
+              className={[
+                "text-xs",
+                labelExpressionInvalid
+                  ? "text-destructive"
+                  : "text-muted-foreground",
+              ].join(" ")}
+            >
+              {labelExpressionInvalid
+                ? t("style.labels.expressionInvalid")
+                : t("style.labels.expressionHint")}
+            </p>
+          </div>
+        </>
+      ) : null}
     </div>
   );
   const twoDimensionalControls = (
@@ -1683,36 +2752,63 @@ export function StylePanel({
       {draftVectorStyleMode === "single" ? (
         <div className="space-y-2">
           <Label htmlFor="fillColor">Fill color</Label>
-          <Input
+          <ColorField
             id="fillColor"
-            type="color"
             value={style.fillColor}
-            onChange={(e) =>
-              setLayerStyle(layer.id, { fillColor: e.target.value })
-            }
+            onChange={(fillColor) => setLayerStyle(layer.id, { fillColor })}
+            allowTransparent
+            fallbackColor={DEFAULT_LAYER_STYLE.fillColor}
+            transparentLabel={t("style.symbology.transparent")}
+            transparentSwatchLabel={t("style.symbology.transparentSwatch")}
           />
         </div>
       ) : null}
       <div className="space-y-2">
         <Label htmlFor="strokeColor">Outline color</Label>
-        <Input
+        <ColorField
           id="strokeColor"
-          type="color"
           value={style.strokeColor}
-          onChange={(e) =>
-            setLayerStyle(layer.id, { strokeColor: e.target.value })
-          }
+          onChange={(strokeColor) => setLayerStyle(layer.id, { strokeColor })}
+          allowTransparent
+          fallbackColor={DEFAULT_LAYER_STYLE.strokeColor}
+          transparentLabel={t("style.symbology.transparent")}
+          transparentSwatchLabel={t("style.symbology.transparentSwatch")}
         />
       </div>
       <NumericStyleInput
         id="strokeWidth"
-        label="Stroke width"
+        label={strokeWidthInMeters ? "Stroke width (meters)" : "Stroke width"}
         min={0}
-        max={20}
-        step={0.5}
+        max={strokeWidthInMeters ? 100000 : 20}
+        step={strokeWidthInMeters ? 1 : 0.5}
         value={style.strokeWidth}
         onChange={(strokeWidth) => setLayerStyle(layer.id, { strokeWidth })}
       />
+      {supportsPointRenderer ? null : (
+        <div className="space-y-2">
+          <Label htmlFor="strokeWidthUnit">Stroke width unit</Label>
+          <Select
+            id="strokeWidthUnit"
+            value={strokeWidthUnit}
+            onChange={(event) => {
+              const nextUnit = event.target.value as StrokeWidthUnit;
+              // Meters and pixels are not freely convertible (pixel size
+              // depends on zoom), so a large meters width would render as a
+              // map-filling pixel width when switched back. Reset to the pixel
+              // default when leaving meters with an out-of-range value.
+              setLayerStyle(layer.id, {
+                strokeWidthUnit: nextUnit,
+                ...(nextUnit === "pixels" && style.strokeWidth > 20
+                  ? { strokeWidth: DEFAULT_LAYER_STYLE.strokeWidth }
+                  : {}),
+              });
+            }}
+          >
+            <option value="pixels">Pixels (constant on screen)</option>
+            <option value="meters">Meters (scales with map)</option>
+          </Select>
+        </div>
+      )}
       <NumericStyleInput
         id="fillOpacity"
         label="Fill opacity"
@@ -1722,26 +2818,27 @@ export function StylePanel({
         value={style.fillOpacity}
         onChange={(fillOpacity) => setLayerStyle(layer.id, { fillOpacity })}
       />
-      <NumericStyleInput
-        id="circleRadius"
-        label="Circle radius"
-        min={1}
-        max={50}
-        step={1}
-        value={style.circleRadius}
-        onChange={(circleRadius) => setLayerStyle(layer.id, { circleRadius })}
-      />
+      {isSketchLayer ? null : (
+        <NumericStyleInput
+          id="circleRadius"
+          label="Circle radius"
+          min={1}
+          max={50}
+          step={1}
+          value={style.circleRadius}
+          onChange={(circleRadius) => setLayerStyle(layer.id, { circleRadius })}
+        />
+      )}
       {hasTextMarkerControls ? (
         <>
           <Separator />
           <div className="space-y-2">
             <Label htmlFor="textColor">Text color</Label>
-            <Input
+            <ColorField
               id="textColor"
-              type="color"
               value={styleValue(style, "textColor")}
-              onChange={(e) =>
-                setLayerStyle(layer.id, { textColor: e.target.value })
+              onChange={(textColor) =>
+                setLayerStyle(layer.id, { textColor })
               }
             />
           </div>
@@ -1756,12 +2853,11 @@ export function StylePanel({
           />
           <div className="space-y-2">
             <Label htmlFor="textHaloColor">Text halo color</Label>
-            <Input
+            <ColorField
               id="textHaloColor"
-              type="color"
               value={styleValue(style, "textHaloColor")}
-              onChange={(e) =>
-                setLayerStyle(layer.id, { textHaloColor: e.target.value })
+              onChange={(textHaloColor) =>
+                setLayerStyle(layer.id, { textHaloColor })
               }
             />
           </div>
@@ -1787,11 +2883,10 @@ export function StylePanel({
       {draftVectorStyleMode === "single" ? (
         <div className="space-y-2">
           <Label htmlFor="extrusionColor">Extrusion color</Label>
-          <Input
+          <ColorField
             id="extrusionColor"
-            type="color"
             value={draftExtrusionColor}
-            onChange={(event) => setDraftExtrusionColor(event.target.value)}
+            onChange={(color) => setDraftExtrusionColor(color)}
           />
         </div>
       ) : null}
@@ -1909,8 +3004,10 @@ export function StylePanel({
             <PanelRightClose className="h-4 w-4" />
           </Button>
         </div>
-        <ScrollArea className="flex-1 p-3">
-          <div className="space-y-4">
+        <ScrollArea className="flex-1">
+          {/* Padding on the inner content with extra right clearance so the
+              overlay scrollbar never covers a control's right edge. */}
+          <div className="space-y-4 p-3 pr-5">
             {beforeIdControl}
             {zoomRangeControls}
             <RasterStyleSlider
@@ -1953,6 +3050,28 @@ export function StylePanel({
                     setLayerStyle(layer.id, { rasterSaturation: value })
                   }
                 />
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={
+                    styleValue(style, "rasterSaturation") <= -1
+                      ? "default"
+                      : "outline"
+                  }
+                  className="w-full"
+                  aria-pressed={styleValue(style, "rasterSaturation") <= -1}
+                  title={t("style.raster.greyscaleHint")}
+                  onClick={() =>
+                    setLayerStyle(layer.id, {
+                      rasterSaturation:
+                        styleValue(style, "rasterSaturation") <= -1
+                          ? DEFAULT_LAYER_STYLE.rasterSaturation
+                          : -1,
+                    })
+                  }
+                >
+                  {t("style.raster.greyscale")}
+                </Button>
                 <RasterStyleSlider
                   label="Contrast"
                   value={styleValue(style, "rasterContrast")}
@@ -1979,6 +3098,30 @@ export function StylePanel({
             {layer.metadata.sourceKind === RASTER_SOURCE_KIND && (
               <RasterSymbologySection layer={layer} />
             )}
+            <Separator />
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="w-full"
+              title={t("style.raster.resetHint")}
+              onClick={() => {
+                setLayerOpacity(layer.id, 1);
+                if (!isDeckRasterLayer) {
+                  setLayerStyle(layer.id, {
+                    rasterBrightnessMin:
+                      DEFAULT_LAYER_STYLE.rasterBrightnessMin,
+                    rasterBrightnessMax:
+                      DEFAULT_LAYER_STYLE.rasterBrightnessMax,
+                    rasterSaturation: DEFAULT_LAYER_STYLE.rasterSaturation,
+                    rasterContrast: DEFAULT_LAYER_STYLE.rasterContrast,
+                    rasterHueRotate: DEFAULT_LAYER_STYLE.rasterHueRotate,
+                  });
+                }
+              }}
+            >
+              {t("style.raster.reset")}
+            </Button>
           </div>
         </ScrollArea>
         <Separator />
@@ -2040,8 +3183,11 @@ export function StylePanel({
           <PanelRightClose className="h-4 w-4" />
         </Button>
       </div>
-      <ScrollArea className="flex-1 p-3">
-        <div className="space-y-4">
+      <ScrollArea className="flex-1">
+        {/* Padding lives on the inner content (not the ScrollArea root) with
+            extra right clearance so the overlay scrollbar never covers the
+            right edge of a control (e.g. the "Transparent" label). */}
+        <div className="space-y-4 p-3 pr-5">
           {beforeIdControl}
           {zoomRangeControls}
           {hasExtrusionControls && (
@@ -2082,6 +3228,39 @@ export function StylePanel({
           ) : (
             extrusionControls
           )}
+          {(!hasExtrusionControls || !extrusionEnabled) && (
+            <>
+              {showProportionalControls && (
+                <>
+                  <Separator />
+                  {proportionalSizeControls}
+                </>
+              )}
+              {showFillPatternControls && (
+                <>
+                  <Separator />
+                  {fillPatternControls}
+                </>
+              )}
+              {showMarkerControls && (
+                <>
+                  <Separator />
+                  {markerControls}
+                </>
+              )}
+            </>
+          )}
+          {/* Attribute labels apply to vector features, not the heatmap density
+              surface or the 3D extrusion render. */}
+          {!extrusionEnabled && pointRenderer !== "heatmap" ? (
+            <>
+              <Separator />
+              <p className="text-sm font-semibold">
+                {t("style.labels.heading")}
+              </p>
+              {labelControls}
+            </>
+          ) : null}
         </div>
       </ScrollArea>
       <Separator />

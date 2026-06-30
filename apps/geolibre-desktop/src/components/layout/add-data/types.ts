@@ -8,16 +8,22 @@ export type AddDataKind =
   | "wfs"
   | "wmts"
   | "gpx"
+  | "georss"
   | "delimited-text"
+  | "cad"
+  | "photos"
   | "mbtiles"
   | "arcgis"
   | "postgres"
   | "deckgl-viz"
   | "video";
 
-export type GpxMode = "url" | "file";
+/** A data source loadable either from a remote URL or a local file. */
+export type FeedMode = "url" | "file";
+export type GpxMode = FeedMode;
 export type GpxLayerKind = "waypoints" | "tracks" | "routes";
-export type DelimitedTextMode = "url" | "file";
+export type GeoRssMode = FeedMode;
+export type DelimitedTextMode = FeedMode;
 export type DelimitedTextDelimiter =
   | "comma"
   | "tab"

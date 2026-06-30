@@ -20,26 +20,24 @@
       "map": "マップ",
       "layout": "レイアウト",
       "environment": "環境",
-      "project": "プロジェクト",
       "account": "アカウント"
     },
     "menu": {
       "mapPreferences": "マップ設定",
       "layoutSettings": "レイアウト設定",
       "environmentVariables": "環境変数",
-      "projectSettings": "プロジェクト設定",
       "managePlugins": "プラグイン管理",
       "urlOverrideNote": "URL のレイアウトパラメーターは保存済みの設定より優先されます。"
     },
     "map": {
       "constraintsTitle": "マップ制約",
-      "constraintsDescription": "制限はプロジェクトが開いている間のみ適用されます。",
       "restrictBounds": "マップ範囲を制限する",
       "west": "西",
       "south": "南",
       "east": "東",
       "north": "北",
       "useCurrentView": "現在のビューを使用",
+      "useCurrentViewGlobeHint": "これを使用する前にメルカトル図法に切り替えてください。地球儀表示では、地図が取得した範囲をわずかに超えて移動する場合があります。",
       "minZoom": "最小ズーム",
       "maxZoom": "最大ズーム",
       "maxPitch": "最大ピッチ",
@@ -79,14 +77,6 @@
       "removeAria": "{{name}} を削除する",
       "errorNamePattern": "環境変数名は文字またはアンダースコアで始まり、文字・数字・アンダースコアのみを含める必要があります。",
       "errorDuplicate": "環境変数 \"{{name}}\" が重複しています。"
-    },
-    "project": {
-      "title": "プロジェクト",
-      "description": "設定は `.geolibre.json` プロジェクトとともに保存されます。",
-      "name": "名前",
-      "file": "プロジェクトファイル",
-      "notSaved": "未保存",
-      "format": "プロジェクト形式"
     }
   },
   "toolbar": {
@@ -286,7 +276,7 @@
       "webServices": "ウェブサービス",
       "commandPalette": "コマンドパレット",
       "openProjectFromUrl": "URL からプロジェクトを開く",
-      "openProjectFromUrlDesc": "公開されている `.geolibre.json` プロジェクトを読み込み、最近のプロジェクトに追加します。",
+      "openProjectFromUrlDesc": "`.geolibre.json` プロジェクトを読み込み、最近のプロジェクトに追加します。",
       "projectUrl": "プロジェクト URL",
       "opening": "開いています...",
       "open": "開く",

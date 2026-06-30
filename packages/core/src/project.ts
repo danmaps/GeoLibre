@@ -3,16 +3,26 @@ import {
   DEFAULT_LAYER_STYLE,
   DEFAULT_LEGEND_CONFIG,
   DEFAULT_PROJECT_PREFERENCES,
+  DEFAULT_DASHBOARD_COLUMNS,
+  DEFAULT_MAP_GRID_LAYOUT,
   DEFAULT_STORY_MAP,
+  MAX_DASHBOARD_COLUMNS,
+  MAX_MAP_GRID_DIM,
+  MIN_DASHBOARD_COLUMNS,
   PROJECT_VERSION,
+  type DashboardWidget,
+  type DashboardWidgetAggregation,
+  type DashboardWidgetType,
   type GeoLibreLayer,
   type GeoLibreProject,
   type LayerGroup,
   type LayerStyle,
   type LegendConfig,
   type LegendItemOverride,
+  type MapGridLayout,
   type MapViewState,
   type ProcessingModel,
+  type SecondaryMapView,
   type ProcessingModelStep,
   type ProjectPluginControlPosition,
   type ProjectPluginState,
@@ -24,6 +34,7 @@ import {
   type StoryInsetPosition,
   type StoryLayerOpacityChange,
   type StoryMap,
+  type StorySlideMode,
 } from "./types";
 import {
   DEFAULT_LAYER_GROUP_OPACITY,
@@ -85,13 +96,21 @@ export function parseProject(json: string): GeoLibreProject {
         ? { ...layer, groupId: undefined }
         : layer,
     );
+  const basemapStyleUrl = data.basemapStyleUrl ?? DEFAULT_BASEMAP;
+  const basemapVisible = data.basemapVisible ?? true;
+  const basemapOpacity = data.basemapOpacity ?? 1;
+  const { mapLayout, secondaryMapViews } = resolveMapGrid(
+    normalizeMapLayout(data.mapLayout),
+    normalizeSecondaryMapViews(data.secondaryMapViews),
+    { mapView: data.mapView },
+  );
   return {
     version: data.version,
     name: data.name,
     mapView: data.mapView,
-    basemapStyleUrl: data.basemapStyleUrl ?? DEFAULT_BASEMAP,
-    basemapVisible: data.basemapVisible ?? true,
-    basemapOpacity: data.basemapOpacity ?? 1,
+    basemapStyleUrl,
+    basemapVisible,
+    basemapOpacity,
     layers,
     ...(layerGroups.length > 0 ? { layerGroups } : {}),
     styles: data.styles ?? {},
@@ -100,6 +119,21 @@ export function parseProject(json: string): GeoLibreProject {
     legend: normalizeLegendConfig(data.legend),
     storymap: normalizeStoryMap(data.storymap) ?? undefined,
     models: normalizeModels(data.models) ?? undefined,
+    widgets: normalizeWidgets(data.widgets) ?? undefined,
+    ...(data.dashboardColumns === undefined
+      ? {}
+      : { dashboardColumns: normalizeDashboardColumns(data.dashboardColumns) }),
+    // Only persist the grid when it is larger than a single pane, so default
+    // single-map projects serialize byte-identically to before this feature.
+    ...(mapLayout.rows * mapLayout.cols > 1
+      ? {
+          mapLayout,
+          secondaryMapViews,
+          ...(normalizeString(data.primaryMapLabel)
+            ? { primaryMapLabel: normalizeString(data.primaryMapLabel) }
+            : {}),
+        }
+      : {}),
     metadata: data.metadata ?? {},
   };
 }
@@ -226,6 +260,13 @@ export function normalizeStoryMap(storymap: unknown): StoryMap | null {
     )
       ? (candidate.insetPosition as StoryInsetPosition)
       : DEFAULT_STORY_MAP.insetPosition,
+    hideChapterNav: normalizeBoolean(candidate.hideChapterNav, false),
+    startSlide: STORY_SLIDE_MODES.has(candidate.startSlide as StorySlideMode)
+      ? (candidate.startSlide as StorySlideMode)
+      : DEFAULT_STORY_MAP.startSlide,
+    endSlide: STORY_SLIDE_MODES.has(candidate.endSlide as StorySlideMode)
+      ? (candidate.endSlide as StorySlideMode)
+      : DEFAULT_STORY_MAP.endSlide,
     chapters,
   };
 
@@ -236,7 +277,7 @@ export function normalizeStoryMap(storymap: unknown): StoryMap | null {
 }
 
 /** Whether a story map carries chapters or any non-default setting. */
-function storyMapHasContent(story: StoryMap): boolean {
+export function storyMapHasContent(story: StoryMap): boolean {
   if (story.chapters.length > 0) return true;
   return (
     story.title.trim() !== "" ||
@@ -247,7 +288,10 @@ function storyMapHasContent(story: StoryMap): boolean {
     story.showMarkers !== DEFAULT_STORY_MAP.showMarkers ||
     story.markerColor !== DEFAULT_STORY_MAP.markerColor ||
     story.inset !== DEFAULT_STORY_MAP.inset ||
-    story.insetPosition !== DEFAULT_STORY_MAP.insetPosition
+    story.insetPosition !== DEFAULT_STORY_MAP.insetPosition ||
+    story.hideChapterNav !== DEFAULT_STORY_MAP.hideChapterNav ||
+    story.startSlide !== DEFAULT_STORY_MAP.startSlide ||
+    story.endSlide !== DEFAULT_STORY_MAP.endSlide
   );
 }
 
@@ -269,6 +313,14 @@ const STORY_INSET_POSITIONS = new Set<StoryInsetPosition>([
   "top-right",
   "bottom-left",
   "bottom-right",
+]);
+
+const STORY_SLIDE_MODES = new Set<StorySlideMode>([
+  "none",
+  "blank",
+  "black",
+  "global",
+  "adjacent",
 ]);
 
 function normalizeStoryChapter(chapter: unknown): StoryChapter | null {
@@ -390,6 +442,246 @@ export function normalizeModels(value: unknown): ProcessingModel[] | null {
     models.push({ id, name: normalizeString(candidate.name), steps });
   }
   return models.length > 0 ? models : null;
+}
+
+/**
+ * Coerce an untrusted (possibly hand-edited) camera object into a valid
+ * {@link MapViewState}, falling back to the default view for missing parts.
+ */
+export function normalizeMapViewState(value: unknown): MapViewState {
+  const fallback = createDefaultMapView();
+  if (!value || typeof value !== "object") return fallback;
+  const candidate = value as Partial<MapViewState>;
+  const center = Array.isArray(candidate.center)
+    ? candidate.center
+    : fallback.center;
+  // Clamp to MapLibre's valid ranges (matching normalizeStoryChapter) so a
+  // hand-edited project file can't store an out-of-range camera that jumpTo
+  // would silently clamp or reject, leaving the saved state inconsistent with
+  // what lands on screen. Bearing wraps into [0, 360).
+  const view: MapViewState = {
+    center: [
+      clampCoordinate(normalizeNumber(center[0], fallback.center[0]), -180, 180),
+      clampCoordinate(normalizeNumber(center[1], fallback.center[1]), -90, 90),
+    ],
+    zoom: clamp(normalizeNumber(candidate.zoom, fallback.zoom), 0, 24),
+    bearing:
+      ((normalizeNumber(candidate.bearing, fallback.bearing) % 360) + 360) % 360,
+    pitch: clamp(normalizeNumber(candidate.pitch, fallback.pitch), 0, 85),
+  };
+  if (
+    Array.isArray(candidate.bbox) &&
+    candidate.bbox.length === 4 &&
+    candidate.bbox.every((n) => Number.isFinite(n))
+  ) {
+    view.bbox = [
+      Number(candidate.bbox[0]),
+      Number(candidate.bbox[1]),
+      Number(candidate.bbox[2]),
+      Number(candidate.bbox[3]),
+    ];
+  }
+  return view;
+}
+
+/**
+ * Coerce an untrusted `mapLayout` into a valid {@link MapGridLayout}. Returns
+ * null when absent or effectively single-pane so default projects stay
+ * byte-identical (the field is only written when the grid is larger than 1x1).
+ */
+export function normalizeMapLayout(value: unknown): MapGridLayout | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<MapGridLayout>;
+  const rows = clamp(
+    Math.floor(normalizeNumber(candidate.rows, 1)),
+    1,
+    MAX_MAP_GRID_DIM,
+  );
+  const cols = clamp(
+    Math.floor(normalizeNumber(candidate.cols, 1)),
+    1,
+    MAX_MAP_GRID_DIM,
+  );
+  if (rows * cols <= 1) return null;
+  return {
+    rows,
+    cols,
+    syncView: normalizeBoolean(candidate.syncView, DEFAULT_MAP_GRID_LAYOUT.syncView),
+  };
+}
+
+/**
+ * Coerce an untrusted `secondaryMapViews` array into valid
+ * {@link SecondaryMapView} records, dropping entries without a usable id and
+ * de-duplicating by id. Returns null when none are valid.
+ */
+export function normalizeSecondaryMapViews(
+  value: unknown,
+): SecondaryMapView[] | null {
+  if (!Array.isArray(value)) return null;
+  const views: SecondaryMapView[] = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object") continue;
+    const candidate = entry as Partial<SecondaryMapView>;
+    const id = normalizeString(candidate.id).trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const label = normalizeString(candidate.label);
+    views.push({
+      id,
+      view: normalizeMapViewState(candidate.view),
+      ...(label ? { label } : {}),
+      layerVisibility: normalizeLayerVisibility(candidate.layerVisibility),
+    });
+  }
+  return views.length > 0 ? views : null;
+}
+
+/** Coerce an untrusted per-layer visibility map into `Record<string, boolean>`. */
+function normalizeLayerVisibility(value: unknown): Record<string, boolean> {
+  if (!value || typeof value !== "object") return {};
+  const result: Record<string, boolean> = {};
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof raw === "boolean") result[key] = raw;
+  }
+  return result;
+}
+
+/**
+ * Reconcile a parsed grid layout with its secondary panes so the store invariant
+ * holds: `secondaryMapViews.length === rows * cols - 1`. Surplus panes are
+ * dropped; missing panes are filled by cloning the primary map. A null/absent
+ * layout (or a 1x1 grid) collapses to the single-map default.
+ */
+export function resolveMapGrid(
+  layout: MapGridLayout | null,
+  secondaryViews: SecondaryMapView[] | null,
+  primary: { mapView: MapViewState },
+): { mapLayout: MapGridLayout; secondaryMapViews: SecondaryMapView[] } {
+  if (!layout) {
+    return { mapLayout: { ...DEFAULT_MAP_GRID_LAYOUT }, secondaryMapViews: [] };
+  }
+  const desired = layout.rows * layout.cols - 1;
+  let views = secondaryViews ?? [];
+  if (views.length > desired) {
+    views = views.slice(0, desired);
+  } else if (views.length < desired) {
+    const seen = new Set(views.map((v) => v.id));
+    const additions: SecondaryMapView[] = [];
+    for (let i = views.length; i < desired; i++) {
+      let id = `secondary-${i}`;
+      // Append a counter (rather than growing the string) so a crafted file
+      // with colliding ids resolves in O(1) per attempt instead of O(n).
+      let suffix = 0;
+      while (seen.has(id)) id = `secondary-${i}-${++suffix}`;
+      seen.add(id);
+      additions.push({
+        id,
+        view: { ...primary.mapView },
+        layerVisibility: {},
+      });
+    }
+    views = [...views, ...additions];
+  }
+  return { mapLayout: layout, secondaryMapViews: views };
+}
+
+/** A 3- or 6-digit hex color, the only widget color format we persist. */
+const HEX_COLOR = /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+
+/** Upper bound for a persisted histogram bin count, mirroring the chart
+ * renderer's clamp (`MAX_HISTOGRAM_BINS` in the desktop app's chart helpers). */
+const MAX_PERSISTED_BINS = 50;
+
+const DASHBOARD_WIDGET_TYPES: readonly DashboardWidgetType[] = [
+  "histogram",
+  "scatter",
+  "bar",
+  "line",
+  "box",
+  "pie",
+];
+const DASHBOARD_WIDGET_AGGREGATIONS: readonly DashboardWidgetAggregation[] = [
+  "count",
+  "sum",
+  "mean",
+];
+
+/**
+ * Coerce an untrusted (possibly hand-edited) `widgets` array into valid
+ * {@link DashboardWidget} records. Drops widgets without a usable id, layer id,
+ * or recognized chart type, de-duplicates by id, and keeps only the optional
+ * keys that are present and well-typed (the Dashboard panel falls back to
+ * sensible defaults for anything missing). Returns `null` when there is nothing
+ * worth persisting, so a widget-less project stays free of the key.
+ *
+ * @param value Raw `widgets` value from the project JSON.
+ * @returns Normalized widgets, or `null` when none survive.
+ */
+export function normalizeWidgets(value: unknown): DashboardWidget[] | null {
+  if (!Array.isArray(value)) return null;
+  const widgets: DashboardWidget[] = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object") continue;
+    const candidate = entry as Partial<DashboardWidget>;
+    const id = normalizeString(candidate.id).trim();
+    const layerId = normalizeString(candidate.layerId).trim();
+    if (!id || !layerId || seen.has(id)) continue;
+    const type = candidate.type;
+    if (!type || !DASHBOARD_WIDGET_TYPES.includes(type)) continue;
+    seen.add(id);
+    const widget: DashboardWidget = { id, layerId, type };
+    const title = normalizeString(candidate.title).trim();
+    if (title) widget.title = title;
+    const color = normalizeString(candidate.color).trim();
+    if (HEX_COLOR.test(color)) widget.color = color;
+    const field = normalizeString(candidate.field).trim();
+    if (field) widget.field = field;
+    const xField = normalizeString(candidate.xField).trim();
+    if (xField) widget.xField = xField;
+    const yField = normalizeString(candidate.yField).trim();
+    if (yField) widget.yField = yField;
+    if (typeof candidate.bins === "number" && Number.isFinite(candidate.bins)) {
+      // Persist only a sane positive bin count; the histogram renderer clamps to
+      // [1, 50], so mirror that here rather than round-tripping 0 or huge values.
+      const bins = Math.trunc(candidate.bins);
+      if (bins >= 1) widget.bins = Math.min(MAX_PERSISTED_BINS, bins);
+    }
+    const category = normalizeString(candidate.category).trim();
+    if (category) widget.category = category;
+    if (
+      candidate.aggregation &&
+      DASHBOARD_WIDGET_AGGREGATIONS.includes(candidate.aggregation) &&
+      // A pie has no "average"; the renderer would silently treat mean as sum,
+      // so drop it here and let the default (count) stand for hand-edited files.
+      !(type === "pie" && candidate.aggregation === "mean")
+    ) {
+      widget.aggregation = candidate.aggregation;
+    }
+    const valueField = normalizeString(candidate.valueField).trim();
+    if (valueField) widget.valueField = valueField;
+    widgets.push(widget);
+  }
+  return widgets.length > 0 ? widgets : null;
+}
+
+/**
+ * Clamp an untrusted dashboard column count into the supported range, falling
+ * back to the default for a missing or non-finite value.
+ *
+ * @param value Raw `dashboardColumns` value from the project JSON.
+ * @returns An integer column count within [MIN, MAX].
+ */
+export function normalizeDashboardColumns(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return DEFAULT_DASHBOARD_COLUMNS;
+  }
+  return Math.max(
+    MIN_DASHBOARD_COLUMNS,
+    Math.min(MAX_DASHBOARD_COLUMNS, Math.trunc(value)),
+  );
 }
 
 function normalizeProjectPreferences(preferences: unknown): ProjectPreferences {
@@ -674,6 +966,11 @@ export function projectFromStore(state: {
   legend?: LegendConfig | null;
   storymap?: StoryMap | null;
   models?: ProcessingModel[] | null;
+  widgets?: DashboardWidget[] | null;
+  dashboardColumns?: number;
+  mapLayout?: MapGridLayout;
+  secondaryMapViews?: SecondaryMapView[];
+  primaryMapLabel?: string;
   metadata: Record<string, unknown>;
 }): GeoLibreProject {
   const styles: Record<string, LayerStyle> = {};
@@ -684,10 +981,26 @@ export function projectFromStore(state: {
   const legend = normalizeLegendConfig(state.legend);
   const storymap = normalizeStoryMap(state.storymap);
   const models = normalizeModels(state.models);
+  const widgets = normalizeWidgets(state.widgets);
+  // Persist a non-default column count only; a default-layout dashboard (or a
+  // widget-less project) stays free of the key for legacy readers.
+  const dashboardColumns =
+    state.dashboardColumns === undefined
+      ? DEFAULT_DASHBOARD_COLUMNS
+      : normalizeDashboardColumns(state.dashboardColumns);
   // Persist every group (including empty folders, which the UI supports). The
   // key is spread only when non-empty so legacy readers that don't recognise it
   // are unaffected; normalizeLayerGroups round-trips them back on load.
   const layerGroups = state.layerGroups ?? [];
+  // Persist the grid only when it is more than a single pane; default single-map
+  // projects stay byte-identical and unaffected by this feature. The reconcile
+  // keeps `secondaryMapViews` exactly `rows * cols - 1` long even if state drifted.
+  const { mapLayout, secondaryMapViews } = resolveMapGrid(
+    normalizeMapLayout(state.mapLayout),
+    normalizeSecondaryMapViews(state.secondaryMapViews),
+    { mapView: state.mapView },
+  );
+  const persistGrid = mapLayout.rows * mapLayout.cols > 1;
   return {
     version: PROJECT_VERSION,
     name: state.projectName,
@@ -703,6 +1016,17 @@ export function projectFromStore(state: {
     ...(legend ? { legend } : {}),
     ...(storymap ? { storymap } : {}),
     ...(models ? { models } : {}),
+    ...(widgets ? { widgets } : {}),
+    ...(dashboardColumns !== DEFAULT_DASHBOARD_COLUMNS ? { dashboardColumns } : {}),
+    ...(persistGrid
+      ? {
+          mapLayout,
+          secondaryMapViews,
+          ...(normalizeString(state.primaryMapLabel)
+            ? { primaryMapLabel: normalizeString(state.primaryMapLabel) }
+            : {}),
+        }
+      : {}),
     metadata: state.metadata,
   };
 }
@@ -723,17 +1047,46 @@ function hasRestorableSourceUrl(layer: GeoLibreLayer): boolean {
 }
 
 function prepareLayerForSave(layer: GeoLibreLayer): GeoLibreLayer {
+  // The live time filter is derived from the Time Slider's current date, so it
+  // is transient: strip it before saving so a reopened project never starts
+  // with a stale time-window filter hiding most of a layer's features. The
+  // binding config in `metadata.timeBinding` persists, and the Time Slider
+  // re-applies the filter the next time it activates.
+  if (layer.timeFilter !== undefined) {
+    const { timeFilter: _timeFilter, ...rest } = layer;
+    layer = rest;
+  }
+
   // External native layers that restore their features from a source URL keep
   // a `geojson` copy on the map only for the attribute table; it is redundant
   // in a saved project and would only bloat it, so strip it. Layers without a
   // restorable URL (local-file or in-memory) keep their `geojson` because it is
   // the sole copy GeoLibre's restore path (`ensureExternalGeoJsonNativeLayer`)
   // re-renders from.
+  //
+  // Add Vector Layer (`maplibre-gl-vector`) layers are the exception: they are
+  // restored by the control, not from `geojson` — from the file path on desktop
+  // or embedded `metadata.embeddedGeoJSON` on the web. Their `geojson` is only
+  // the attribute table's copy, so persisting it would silently embed the whole
+  // dataset (bypassing the web embed prompt) instead of saving the path. Strip
+  // it regardless of a restorable URL.
+  const isVectorControlLayer =
+    layer.metadata.sourceKind === "maplibre-gl-vector";
   if (
     layer.metadata.externalNativeLayer === true &&
     layer.geojson &&
-    hasRestorableSourceUrl(layer)
+    (hasRestorableSourceUrl(layer) || isVectorControlLayer)
   ) {
+    const { geojson: _geojson, ...rest } = layer;
+    layer = rest;
+  }
+
+  // A local-file layer the desktop host can re-read from its absolute path on
+  // reopen (a drag-dropped or Add Data vector file) does not embed its features
+  // either: the path is saved and the data is reloaded from disk. The flag is
+  // only set when a real path was captured (desktop), so a web project — which
+  // cannot re-read a path — never sets it and keeps the embedded copy.
+  if (layer.geojson && layer.metadata.localFileReloadable === true) {
     const { geojson: _geojson, ...rest } = layer;
     layer = rest;
   }
@@ -776,6 +1129,11 @@ export function applyProjectToStore(project: GeoLibreProject): {
   legend: LegendConfig;
   storymap: StoryMap | null;
   models: ProcessingModel[];
+  widgets: DashboardWidget[];
+  dashboardColumns: number;
+  mapLayout: MapGridLayout;
+  secondaryMapViews: SecondaryMapView[];
+  primaryMapLabel: string;
   metadata: Record<string, unknown>;
 } {
   const layers = project.layers.map((layer) => ({
@@ -801,12 +1159,22 @@ export function applyProjectToStore(project: GeoLibreProject): {
         : layer,
     ),
   );
+  const basemapStyleUrl = project.basemapStyleUrl;
+  const basemapVisible = project.basemapVisible ?? true;
+  const basemapOpacity = project.basemapOpacity ?? 1;
+  // Reconcile the (possibly hand-edited or programmatic) grid so the store's
+  // invariant `secondaryMapViews.length === rows * cols - 1` always holds.
+  const { mapLayout, secondaryMapViews } = resolveMapGrid(
+    normalizeMapLayout(project.mapLayout),
+    normalizeSecondaryMapViews(project.secondaryMapViews),
+    { mapView: project.mapView },
+  );
   return {
     projectName: project.name,
     mapView: project.mapView,
-    basemapStyleUrl: project.basemapStyleUrl,
-    basemapVisible: project.basemapVisible ?? true,
-    basemapOpacity: project.basemapOpacity ?? 1,
+    basemapStyleUrl,
+    basemapVisible,
+    basemapOpacity,
     layers: normalizedLayers,
     layerGroups,
     preferences: normalizeProjectPreferences(project.preferences),
@@ -814,6 +1182,11 @@ export function applyProjectToStore(project: GeoLibreProject): {
     legend: normalizeLegendConfig(project.legend) ?? { ...DEFAULT_LEGEND_CONFIG },
     storymap: normalizeStoryMap(project.storymap),
     models: normalizeModels(project.models) ?? [],
+    widgets: normalizeWidgets(project.widgets) ?? [],
+    dashboardColumns: normalizeDashboardColumns(project.dashboardColumns),
+    mapLayout,
+    secondaryMapViews,
+    primaryMapLabel: normalizeString(project.primaryMapLabel),
     metadata: project.metadata,
   };
 }

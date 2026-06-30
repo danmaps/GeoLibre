@@ -3,9 +3,9 @@ import {
   GEOCODING_PROVIDERS,
   getGeocodingProvider,
   normalizeGeocodingProviderId,
-  PROJECT_VERSION,
   useAppStore,
   type MapPreferences,
+  type MapProjection,
   type ProjectPreferences,
   type RuntimeEnvironmentVariable,
 } from "@geolibre/core";
@@ -31,11 +31,16 @@ import {
   Input,
   Label,
   Select,
+  cn,
 } from "@geolibre/ui";
 import type { MapController } from "@geolibre/map";
 import {
+  Bot,
   Braces,
+  Check,
   Crosshair,
+  DownloadCloud,
+  ExternalLink,
   Eye,
   EyeOff,
   FolderCog,
@@ -45,35 +50,110 @@ import {
   LogOut,
   MapPinned,
   LayoutPanelTop,
+  Moon,
+  Palette,
   PanelLeft,
   PanelRight,
   Plus,
   RotateCcw,
   Settings,
+  SlidersHorizontal,
+  Sun,
   Type,
   Trash2,
   TriangleAlert,
   Puzzle,
   User,
 } from "lucide-react";
-import { useEffect, useMemo, useState, type RefObject } from "react";
+import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { Trans, useTranslation } from "react-i18next";
 import {
   DEFAULT_DESKTOP_LAYOUT_SETTINGS,
+  DEFAULT_UI_PROFILE_SETTINGS,
+  DEFAULT_UPDATE_SETTINGS,
+  EXPERIENCE_LEVELS,
+  UPDATE_NOTIFICATION_LEVELS,
   useDesktopSettingsStore,
   type DesktopSettings,
   type DesktopLayoutSettings,
+  type ExperienceLevel,
+  type UiProfileSettings,
+  type UpdateSettings,
 } from "../../hooks/useDesktopSettings";
-import { useArcGISOAuth } from "../../hooks/useArcGISOAuth";
 import { useLanguage } from "../../hooks/useLanguage";
+import { useArcGISOAuth } from "../../hooks/useArcGISOAuth";
+import type { ThemeMode } from "../../hooks/useThemeMode";
+import { isTauri } from "../../lib/is-tauri";
+import {
+  THEME_SCHEMES,
+  normalizeHexColor,
+  type ThemeScheme,
+} from "../../lib/theme-schemes";
+import type { UpdateNotificationLevel } from "../../lib/updates";
+import {
+  DATA_SOURCE_CATALOG,
+  DATA_SOURCE_SECTION_LABEL_KEYS,
+  DATA_SOURCE_SECTION_ORDER,
+  INTERFACE_PROFILES,
+  MENU_ITEM_CATALOG,
+  MENU_ITEM_GROUPS,
+  TOP_LEVEL_MENUS,
+  activeInterfaceProfile,
+  isMenuItemVisible,
+  presetHiddenSets,
+  showsAdvancedNotices,
+} from "../../lib/ui-profile";
+import {
+  ASSISTANT_PROVIDER_IDS,
+  PROVIDER_LABELS,
+  availableProviders,
+  type AssistantProviderId,
+} from "../../lib/assistant/provider";
+import {
+  PROVIDER_DOCS_URL,
+  PROVIDER_FIELDS,
+  type ProviderField,
+} from "../../lib/assistant/provider-fields";
 
-type SettingsSection =
+export type SettingsSection =
   | "map"
   | "layout"
+  | "appearance"
+  | "interface"
   | "geocoding"
+  | "ai"
   | "environment"
-  | "project"
+  | "updates"
   | "account";
+
+/** A field a deep-link can ask Settings to focus once the section renders. */
+export type SettingsFocusTarget = "shareToken" | "accentColor";
+
+/** Window event letting any panel open Settings at a given section (no prop-drilling). */
+export const OPEN_SETTINGS_EVENT = "geolibre:open-settings";
+
+/**
+ * Open the Settings dialog at `section` from anywhere in the app, optionally
+ * focusing a specific field once that section renders (e.g. the Share dialog
+ * deep-links into Environment Variables and focuses the share token input).
+ */
+export function openSettingsSection(
+  section: SettingsSection,
+  options?: { focus?: SettingsFocusTarget },
+): void {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(
+    new CustomEvent(OPEN_SETTINGS_EVENT, {
+      detail: { section, focus: options?.focus },
+    }),
+  );
+}
+
+/** A plugin offered as a visibility toggle in the Interface section. */
+export interface ProfilePlugin {
+  id: string;
+  name: string;
+}
 
 interface SettingsDialogProps {
   buttonClassName?: string;
@@ -82,6 +162,12 @@ interface SettingsDialogProps {
   mapControllerRef: RefObject<MapController | null>;
   showLabels?: boolean;
   onOpenManagePlugins: () => void;
+  /** Toggleable plugins for the Interface (UI profile) section (issue #500). */
+  profilePlugins: ProfilePlugin[];
+  /** Current light/dark mode, surfaced as toggles in Appearance (issue #716). */
+  themeMode: ThemeMode;
+  /** Flip the light/dark mode; the Appearance cards drive the same toggle. */
+  onToggleThemeMode: () => void;
 }
 
 const SECTION_ITEMS: Array<{
@@ -91,15 +177,39 @@ const SECTION_ITEMS: Array<{
 }> = [
   { id: "map", labelKey: "settings.section.map", icon: MapPinned },
   { id: "layout", labelKey: "settings.section.layout", icon: LayoutPanelTop },
+  {
+    id: "appearance",
+    labelKey: "settings.section.appearance",
+    icon: Palette,
+  },
+  {
+    id: "interface",
+    labelKey: "settings.section.interface",
+    icon: SlidersHorizontal,
+  },
   { id: "geocoding", labelKey: "settings.section.geocoding", icon: Locate },
+  { id: "ai", labelKey: "settings.section.ai", icon: Bot },
   {
     id: "environment",
     labelKey: "settings.section.environment",
     icon: Braces,
   },
-  { id: "project", labelKey: "settings.section.project", icon: FolderCog },
+  {
+    id: "updates",
+    labelKey: "settings.section.updates",
+    icon: DownloadCloud,
+  },
   { id: "account", labelKey: "settings.section.account", icon: User },
 ];
+
+// The menu-item id that gates each Settings section, mirroring the dropdown.
+// Sections without an entry (Layout, Interface) always show so the profile UI
+// stays reachable.
+const SECTION_GATE: Partial<Record<SettingsSection, string>> = {
+  map: "settings.mapPreferences",
+  geocoding: "settings.geocoding",
+  environment: "settings.environment",
+};
 
 const VARIABLE_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -119,6 +229,8 @@ interface DraftPreferences {
 interface DraftDesktopSettings {
   layout: DesktopLayoutSettings;
   shareToken: string;
+  uiProfile: UiProfileSettings;
+  updates: UpdateSettings;
 }
 
 function createDraftId(): string {
@@ -145,6 +257,14 @@ function cloneDesktopSettings(settings: DesktopSettings): DraftDesktopSettings {
   return {
     layout: { ...settings.layout },
     shareToken: settings.shareToken,
+    uiProfile: {
+      ...settings.uiProfile,
+      hiddenDataSources: [...settings.uiProfile.hiddenDataSources],
+      hiddenPlugins: [...settings.uiProfile.hiddenPlugins],
+      hiddenMenus: [...settings.uiProfile.hiddenMenus],
+      hiddenMenuItems: [...settings.uiProfile.hiddenMenuItems],
+    },
+    updates: { ...settings.updates },
   };
 }
 
@@ -246,6 +366,9 @@ export function SettingsDialog({
   mapControllerRef,
   showLabels = true,
   onOpenManagePlugins,
+  profilePlugins,
+  themeMode,
+  onToggleThemeMode,
 }: SettingsDialogProps) {
   const { t } = useTranslation();
   const {
@@ -259,19 +382,60 @@ export function SettingsDialog({
   const setDesktopSettings = useDesktopSettingsStore(
     (s) => s.setDesktopSettings,
   );
-  const projectName = useAppStore((s) => s.projectName);
-  const projectPath = useAppStore((s) => s.projectPath);
-  const setProjectName = useAppStore((s) => s.setProjectName);
   const arcGISOAuth = useArcGISOAuth();
+  // Visibility of the Settings dropdown items under the active UI profile. The
+  // Language/Layout/Interface entries are always shown so the profile UI stays
+  // reachable.
+  const showSettingsItem = (id: string) =>
+    isMenuItemVisible(desktopSettings.uiProfile, id);
   const [open, setOpen] = useState(false);
   const [section, setSection] = useState<SettingsSection>("map");
+  // A field a deep-link asked us to focus once its section renders; cleared
+  // after the focus lands so a later open without a focus request stays put.
+  const [pendingFocus, setPendingFocus] = useState<SettingsFocusTarget | null>(
+    null,
+  );
+  const shareTokenInputRef = useRef<HTMLInputElement>(null);
+  // The native color input in the Appearance pane. The accent-color dropdown's
+  // "Custom" entry deep-links here so picking a custom color is reachable
+  // without a third-level menu (#718).
+  const customColorInputRef = useRef<HTMLInputElement>(null);
+  // The nav button for the active section. Focus follows the active section so
+  // the focus ring never strands on a different item than the visible pane
+  // (Safari keeps focus on the previously focused button after a mouse click,
+  // so the ring would otherwise stay on the first item, see #713).
+  const activeSectionButtonRef = useRef<HTMLButtonElement>(null);
+  // After the deep-link effect focuses its target field and clears
+  // `pendingFocus`, the nav-focus effect re-runs (pendingFocus is in its deps)
+  // and would steal focus back. This guards exactly that one re-run so the
+  // deep-linked field keeps focus (#720 review).
+  const skipNextNavFocusRef = useRef(false);
+  // A gated section is dropped from the nav, but `section` can still point at one
+  // (its initial value is "map"), so render the first visible section instead to
+  // never expose gated content to a restricted profile.
+  const isSectionVisible = (id: SettingsSection) => {
+    // Automated update checks run in the desktop build only, so the section is
+    // hidden on the web where its controls would be inert.
+    if (id === "updates" && !isTauri()) return false;
+    const gate = SECTION_GATE[id];
+    return gate ? showSettingsItem(gate) : true;
+  };
+  const effectiveSection: SettingsSection = isSectionVisible(section)
+    ? section
+    : // "interface" has no gate, so it is always a valid, visible fallback.
+      (SECTION_ITEMS.find((item) => isSectionVisible(item.id))?.id ?? "interface");
   const [draftPreferences, setDraftPreferences] = useState<DraftPreferences>(
     () => clonePreferences(preferences),
   );
   const [draftDesktopSettings, setDraftDesktopSettings] =
     useState<DraftDesktopSettings>(() => cloneDesktopSettings(desktopSettings));
-  const [draftProjectName, setDraftProjectName] = useState(projectName);
   const [error, setError] = useState<string | null>(null);
+  // Live map projection, captured when the dialog opens. The Globe projection
+  // lets the map drift slightly past restricted bounds, so we warn users to
+  // switch to Mercator before capturing the current view (see #505).
+  const [liveProjection, setLiveProjection] = useState<MapProjection | null>(
+    null,
+  );
   // Ids of variables whose value is temporarily revealed; values are masked
   // by default so secrets are not shown on screen.
   const [revealedValueIds, setRevealedValueIds] = useState<Set<string>>(
@@ -284,20 +448,161 @@ export function SettingsDialog({
       ).length,
     [draftPreferences.environmentVariables],
   );
+  // The AI provider whose credential template is shown in the AI section. Seeded
+  // to the first already-configured provider when the dialog opens (below), so a
+  // returning user lands on the provider they set up.
+  const [aiProvider, setAiProvider] = useState<AssistantProviderId>("google");
+  // The draft env vars as a plain name→value map (enabled, named only), matching
+  // what the live runtime env will hold after Save. Drives the per-provider
+  // "configured" status without re-implementing provider.ts resolution.
+  const draftEnv = useMemo(() => {
+    const env: Record<string, string> = {};
+    for (const variable of draftPreferences.environmentVariables) {
+      const key = variable.key.trim();
+      if (variable.enabled && key) env[key] = variable.value;
+    }
+    return env;
+  }, [draftPreferences.environmentVariables]);
+  const configuredProviders = useMemo(
+    () => new Set(availableProviders(draftEnv)),
+    [draftEnv],
+  );
 
   // Seed the draft from the store only when the dialog opens. Depending on
-  // preferences/projectName would reset in-progress edits if the store changed
-  // while the dialog is open (e.g. a slow ?url= project finishes loading).
+  // preferences would reset in-progress edits if the store changed while the
+  // dialog is open (e.g. a slow ?url= project finishes loading).
   useEffect(() => {
-    if (!open) return;
-    setDraftPreferences(clonePreferences(useAppStore.getState().preferences));
+    if (!open) {
+      // Clear so the stale projection can't flash the Globe hint for a frame
+      // on the next open before this effect re-reads it.
+      setLiveProjection(null);
+      // Drop any pending focus request too: if the dialog closes before the
+      // focus RAF fires, a leftover target would otherwise fire on a later
+      // open that never asked for it.
+      setPendingFocus(null);
+      // Discard any uncommitted hex text so a half-typed/invalid value never
+      // resurfaces on the next open (the swatch already shows the saved color),
+      // and clear the Escape skip flag so a leftover true can't swallow the
+      // first edit of the next session.
+      skipCustomColorCommitRef.current = false;
+      setCustomColorDraft(null);
+      return;
+    }
+    const seededPreferences = clonePreferences(
+      useAppStore.getState().preferences,
+    );
+    setDraftPreferences(seededPreferences);
     setDraftDesktopSettings(
       cloneDesktopSettings(useDesktopSettingsStore.getState().desktopSettings),
     );
-    setDraftProjectName(useAppStore.getState().projectName);
+    // Land the AI section on a provider the user already configured, so editing
+    // existing credentials needs no extra click.
+    const seededEnv: Record<string, string> = {};
+    for (const variable of seededPreferences.environmentVariables) {
+      const key = variable.key.trim();
+      if (variable.enabled && key) seededEnv[key] = variable.value;
+    }
+    setAiProvider(availableProviders(seededEnv)[0] ?? "google");
     setRevealedValueIds(new Set());
     setError(null);
-  }, [open]);
+    setLiveProjection(mapControllerRef.current?.readProjection() ?? null);
+  }, [open, mapControllerRef]);
+
+  // Let other panels deep-link into a specific Settings section (e.g. the AI
+  // Assistant onboarding card opens the AI Providers section to add credentials).
+  useEffect(() => {
+    const onOpenSettings = (event: Event) => {
+      const detail = (
+        event as CustomEvent<{
+          section?: SettingsSection;
+          focus?: SettingsFocusTarget;
+        }>
+      ).detail;
+      // setSection before setOpen so the section is already in state when React
+      // renders the open dialog (effectiveSection derives from it at render
+      // time). Only honor the request when the active UI profile actually shows
+      // that section; otherwise effectiveSection would silently fall back to
+      // another tab. The profile is read fresh (not via the effect's closure) so
+      // a profile change after mount is respected.
+      const requested = detail?.section;
+      // Stays false unless a requested section is actually navigated to, so a
+      // focus request without a (shown) section can't strand on whatever tab
+      // happens to be active.
+      let sectionShown = false;
+      if (requested) {
+        const gate = SECTION_GATE[requested];
+        const profile =
+          useDesktopSettingsStore.getState().desktopSettings.uiProfile;
+        sectionShown = !gate || isMenuItemVisible(profile, gate);
+        if (sectionShown) setSection(requested);
+      }
+      // Only queue the focus when its target section is actually shown, so the
+      // request can't strand on a tab the profile hid.
+      setPendingFocus(detail?.focus && sectionShown ? detail.focus : null);
+      setOpen(true);
+    };
+    window.addEventListener(OPEN_SETTINGS_EVENT, onOpenSettings);
+    return () => window.removeEventListener(OPEN_SETTINGS_EVENT, onOpenSettings);
+  }, []);
+
+  // Focus a deep-linked field once its section has rendered. The token input
+  // only mounts when the Environment section is active, so this waits for the
+  // section to settle rather than focusing on open.
+  useEffect(() => {
+    if (!open || pendingFocus !== "shareToken") return;
+    if (effectiveSection !== "environment") return;
+    const id = window.requestAnimationFrame(() => {
+      shareTokenInputRef.current?.focus();
+      shareTokenInputRef.current?.select();
+      // Set the guard BEFORE clearing pendingFocus: the clear re-runs the
+      // nav-focus effect, and because this write is synchronous and lexically
+      // first, the ref is already true when that run reads it, so it skips and
+      // leaves focus on the field we just focused.
+      skipNextNavFocusRef.current = true;
+      setPendingFocus(null);
+    });
+    return () => window.cancelAnimationFrame(id);
+  }, [open, pendingFocus, effectiveSection]);
+
+  // Focus (and try to open) the custom-color picker when the accent-color
+  // dropdown deep-links into the Appearance pane. The input only mounts while
+  // the custom scheme is active, so wait for the section to settle first (#718).
+  useEffect(() => {
+    if (!open || pendingFocus !== "accentColor") return;
+    if (effectiveSection !== "appearance") return;
+    const id = window.requestAnimationFrame(() => {
+      const input = customColorInputRef.current;
+      input?.focus();
+      // Pop the native picker straight away when the browser allows it; if the
+      // user gesture has lapsed it throws, leaving the focused input as the
+      // fallback rather than a dead end.
+      try {
+        input?.showPicker();
+      } catch {
+        // No transient user activation; the focused input is enough.
+      }
+      skipNextNavFocusRef.current = true;
+      setPendingFocus(null);
+    });
+    return () => window.cancelAnimationFrame(id);
+  }, [open, pendingFocus, effectiveSection]);
+
+  // Keep the focus ring on the active section's nav button. Without this the
+  // ring strands on whichever button was focused when the dialog opened (the
+  // first one, or where a click left it on Safari) while the highlight and pane
+  // move to the selected section (#713). Skipped while a deep-link focus is
+  // pending so it does not steal focus from the field that request targets.
+  useEffect(() => {
+    if (!open || pendingFocus) return;
+    if (skipNextNavFocusRef.current) {
+      skipNextNavFocusRef.current = false;
+      return;
+    }
+    const id = window.requestAnimationFrame(() => {
+      activeSectionButtonRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(id);
+  }, [open, pendingFocus, effectiveSection]);
 
   const toggleValueVisibility = (id: string) => {
     setRevealedValueIds((current) => {
@@ -309,6 +614,63 @@ export function SettingsDialog({
       }
       return next;
     });
+  };
+
+  // Every env var name a field is backed by: its canonical key plus any aliases
+  // provider.ts also accepts (e.g. GOOGLE_API_KEY for the Gemini field).
+  const fieldEnvKeys = (field: ProviderField): readonly string[] => [
+    field.envKey,
+    ...(field.aliases ?? []),
+  ];
+
+  // The value of an env-var-backed AI provider field, or "" when unset. Only an
+  // enabled row counts: a var disabled in the Environment section must read as
+  // empty so the field matches the (also enabled-only) status banner. An aliased
+  // value (e.g. an existing GOOGLE_API_KEY) is surfaced rather than hidden.
+  const getProviderField = (field: ProviderField): string => {
+    for (const key of fieldEnvKeys(field)) {
+      const row = draftPreferences.environmentVariables.find(
+        (variable) => variable.key === key && variable.enabled,
+      );
+      if (row) return row.value;
+    }
+    return "";
+  };
+
+  // Write an AI provider field through to its backing env var. Edits the enabled
+  // row the user already has (canonical or alias) so re-entering a credential
+  // never creates a duplicate key; otherwise drops any same-named disabled rows
+  // (so a deliberately disabled var is not silently re-enabled with its old
+  // value) and appends a fresh enabled row under the canonical name. Clearing
+  // removes the row so the Environment list never accrues empty entries.
+  const setProviderField = (field: ProviderField, value: string) => {
+    const keys = fieldEnvKeys(field);
+    setDraftPreferences((current) => {
+      const enabledIndex = current.environmentVariables.findIndex(
+        (variable) => keys.includes(variable.key) && variable.enabled,
+      );
+      if (enabledIndex !== -1) {
+        const next = current.environmentVariables.slice();
+        if (value === "") {
+          next.splice(enabledIndex, 1);
+        } else {
+          next[enabledIndex] = { ...next[enabledIndex], value };
+        }
+        return { ...current, environmentVariables: next };
+      }
+      if (value === "") return current;
+      const kept = current.environmentVariables.filter(
+        (variable) => !keys.includes(variable.key),
+      );
+      return {
+        ...current,
+        environmentVariables: [
+          ...kept,
+          { id: createDraftId(), key: field.envKey, value, enabled: true },
+        ],
+      };
+    });
+    setError(null);
   };
 
   const updateMapPreferences = (patch: Partial<MapPreferences>) => {
@@ -433,11 +795,203 @@ export function SettingsDialog({
     updateDraftLayoutSettings(DEFAULT_DESKTOP_LAYOUT_SETTINGS);
   };
 
+  // The accent scheme applies live (instant preview) rather than waiting for
+  // Save, mirroring the Interface profile toggles. Reads the latest state so a
+  // rapid click after another live change does not clobber it with a stale
+  // render-closure snapshot.
+  const updateSavedThemeScheme = (scheme: ThemeScheme) => {
+    const current = useDesktopSettingsStore.getState().desktopSettings;
+    setDesktopSettings({ ...current, theme: { ...current.theme, scheme } });
+  };
+
+  // Picking a custom color both stores the color and activates the custom scheme,
+  // so editing the swatch immediately previews it.
+  const updateSavedThemeCustomColor = (customColor: string) => {
+    const current = useDesktopSettingsStore.getState().desktopSettings;
+    setDesktopSettings({
+      ...current,
+      theme: { ...current.theme, scheme: "custom", customColor },
+    });
+  };
+
+  // In-progress text for the inline hex field next to the swatch. While the user
+  // is typing or pasting a code it holds the raw string; `null` means the field
+  // mirrors the saved color. On commit a valid 3- or 6-digit hex applies and an
+  // invalid one is discarded, so the field reverts to the last valid color (#911).
+  const [customColorDraft, setCustomColorDraft] = useState<string | null>(null);
+  // Set just before the Escape-triggered blur so the imminent blur discards the
+  // draft instead of committing it: the dialog still closes (its own Escape
+  // handler), but the typed value is cancelled rather than applied on the way out.
+  const skipCustomColorCommitRef = useRef(false);
+
+  const commitCustomColorDraft = () => {
+    if (skipCustomColorCommitRef.current) {
+      skipCustomColorCommitRef.current = false;
+      setCustomColorDraft(null);
+      return;
+    }
+    if (customColorDraft === null) return;
+    const normalized = normalizeHexColor(customColorDraft);
+    if (normalized) updateSavedThemeCustomColor(normalized);
+    setCustomColorDraft(null);
+  };
+
+  const updateDraftUpdateSettings = (patch: Partial<UpdateSettings>) => {
+    setDraftDesktopSettings((current) => ({
+      ...current,
+      updates: { ...current.updates, ...patch },
+    }));
+    setError(null);
+  };
+
+  const resetUpdateSettings = () => {
+    updateDraftUpdateSettings(DEFAULT_UPDATE_SETTINGS);
+  };
+
+  // Live updates from the Settings dropdown's Interface submenu (not the draft,
+  // which only the dialog commits on Save). Reads the latest state so rapid
+  // toggles do not clobber each other.
+  const updateSavedUiProfile = (patch: Partial<UiProfileSettings>) => {
+    const current = useDesktopSettingsStore.getState().desktopSettings;
+    setDesktopSettings({
+      ...current,
+      uiProfile: { ...current.uiProfile, ...patch },
+    });
+  };
+
+  const applySavedExperiencePreset = (level: ExperienceLevel) => {
+    const sets = presetHiddenSets(
+      level,
+      profilePlugins.map((plugin) => plugin.id),
+    );
+    updateSavedUiProfile({ enabled: true, level, ...sets });
+  };
+
+  // "Custom" counterpart for the Settings dropdown: opt into custom mode while
+  // preserving the existing hidden lists (issue #592).
+  const applySavedCustomProfile = () => {
+    updateSavedUiProfile({ enabled: true, level: null });
+  };
+
   const updateShareToken = (value: string) => {
     // Kept in the draft and only committed on Save, so editing the token and
     // then closing the dialog without saving discards the change (a secret
     // field should not persist on every keystroke).
     setDraftDesktopSettings((current) => ({ ...current, shareToken: value }));
+  };
+
+  const updateUiProfile = (patch: Partial<UiProfileSettings>) => {
+    setDraftDesktopSettings((current) => ({
+      ...current,
+      uiProfile: { ...current.uiProfile, ...patch },
+    }));
+    setError(null);
+  };
+
+  // Applying an experience-level preset overwrites the hidden lists from tiers
+  // and turns the profile on. Plugin tiers consider the toggleable plugin ids.
+  const applyExperiencePreset = (level: ExperienceLevel) => {
+    const sets = presetHiddenSets(
+      level,
+      profilePlugins.map((plugin) => plugin.id),
+    );
+    updateUiProfile({ enabled: true, level, ...sets });
+  };
+
+  // Selecting "Custom" enables filtering and clears the preset level without
+  // touching the hidden lists, so the current checkbox configuration is carried
+  // through verbatim (issue #592). From the legacy "show everything" state this
+  // simply opts into custom mode with everything still visible.
+  const applyCustomProfile = () => {
+    updateUiProfile({ enabled: true, level: null });
+  };
+
+  // Toggling a single item switches the profile to "custom" (level = null) and
+  // enables filtering so the edit takes effect even when starting from the
+  // legacy "show everything" state.
+  const toggleDataSourceHidden = (id: string, visible: boolean) => {
+    setDraftDesktopSettings((current) => {
+      const hidden = new Set(current.uiProfile.hiddenDataSources);
+      if (visible) hidden.delete(id);
+      else hidden.add(id);
+      return {
+        ...current,
+        uiProfile: {
+          ...current.uiProfile,
+          enabled: true,
+          level: null,
+          hiddenDataSources: [...hidden],
+        },
+      };
+    });
+    setError(null);
+  };
+
+  const togglePluginHidden = (id: string, visible: boolean) => {
+    setDraftDesktopSettings((current) => {
+      const hidden = new Set(current.uiProfile.hiddenPlugins);
+      if (visible) hidden.delete(id);
+      else hidden.add(id);
+      return {
+        ...current,
+        uiProfile: {
+          ...current.uiProfile,
+          enabled: true,
+          level: null,
+          hiddenPlugins: [...hidden],
+        },
+      };
+    });
+    setError(null);
+  };
+
+  const toggleMenuHidden = (id: string, visible: boolean) => {
+    setDraftDesktopSettings((current) => {
+      const hidden = new Set(current.uiProfile.hiddenMenus);
+      if (visible) hidden.delete(id);
+      else hidden.add(id);
+      return {
+        ...current,
+        uiProfile: {
+          ...current.uiProfile,
+          enabled: true,
+          level: null,
+          hiddenMenus: [...hidden],
+        },
+      };
+    });
+    setError(null);
+  };
+
+  const toggleMenuItemHidden = (id: string, visible: boolean) => {
+    setDraftDesktopSettings((current) => {
+      const hidden = new Set(current.uiProfile.hiddenMenuItems);
+      if (visible) hidden.delete(id);
+      else hidden.add(id);
+      return {
+        ...current,
+        uiProfile: {
+          ...current.uiProfile,
+          enabled: true,
+          level: null,
+          hiddenMenuItems: [...hidden],
+        },
+      };
+    });
+    setError(null);
+  };
+
+  // Reset clears the profile to "show everything" but preserves the admin lock
+  // and the onboarding flag.
+  const resetUiProfile = () => {
+    updateUiProfile({
+      enabled: DEFAULT_UI_PROFILE_SETTINGS.enabled,
+      level: DEFAULT_UI_PROFILE_SETTINGS.level,
+      hiddenDataSources: [],
+      hiddenPlugins: [],
+      hiddenMenus: [],
+      hiddenMenuItems: [],
+    });
   };
 
   const saveSettings = () => {
@@ -455,15 +1009,31 @@ export function SettingsDialog({
       return;
     }
 
-    const nextProjectName = draftProjectName.trim() || "Untitled Project";
-    if (nextProjectName !== projectName) setProjectName(nextProjectName);
     setPreferences(normalized);
+    // When a level preset is still active, recompute its hidden lists from the
+    // current plugin registry at save time. The draft was snapshotted when the
+    // dialog opened, so this picks up any external plugins that loaded since
+    // (and keeps the result identical to applying the preset). A custom profile
+    // (level === null) carries the user's explicit toggles through unchanged.
+    const draftProfile = draftDesktopSettings.uiProfile;
+    const committedUiProfile =
+      draftProfile.level !== null
+        ? {
+            ...draftProfile,
+            ...presetHiddenSets(
+              draftProfile.level,
+              profilePlugins.map((plugin) => plugin.id),
+            ),
+          }
+        : draftProfile;
     // Plugin sources are managed live in the Manage Plugins dialog; preserve the
     // current store values and only update the layout from this dialog.
     setDesktopSettings({
       ...useDesktopSettingsStore.getState().desktopSettings,
       layout: draftDesktopSettings.layout,
       shareToken: draftDesktopSettings.shareToken,
+      uiProfile: committedUiProfile,
+      updates: draftDesktopSettings.updates,
     });
     setOpen(false);
   };
@@ -473,10 +1043,11 @@ export function SettingsDialog({
     return (
       <Button
         key={item.id}
+        ref={effectiveSection === item.id ? activeSectionButtonRef : undefined}
         className="justify-start"
         size="sm"
         type="button"
-        variant={section === item.id ? "secondary" : "ghost"}
+        variant={effectiveSection === item.id ? "secondary" : "ghost"}
         onClick={() => {
           setSection(item.id);
           setError(null);
@@ -531,18 +1102,20 @@ export function SettingsDialog({
             </DropdownMenuSubContent>
           </DropdownMenuSub>
           <DropdownMenuSeparator />
-          <DropdownMenuItem
-            onSelect={() => {
-              setSection("map");
-              setOpen(true);
-            }}
-          >
-            <MapPinned className="mr-2 h-3.5 w-3.5" />
-            {t("settings.menu.mapPreferences")}
-          </DropdownMenuItem>
+          {showSettingsItem("settings.mapPreferences") && (
+            <DropdownMenuItem
+              onSelect={() => {
+                setSection("map");
+                setOpen(true);
+              }}
+            >
+              <MapPinned className="mr-2 h-3.5 w-3.5" />
+              {t("settings.menu.mapPreferences")}
+            </DropdownMenuItem>
+          )}
           <DropdownMenuSub>
             <DropdownMenuSubTrigger>
-              <LayoutPanelTop className="mr-2 h-3.5 w-3.5" />
+              <LayoutPanelTop className="h-3.5 w-3.5" />
               {t("settings.section.layout")}
             </DropdownMenuSubTrigger>
             <DropdownMenuSubContent className="geolibre-layout-submenu w-40 sm:w-72">
@@ -604,37 +1177,165 @@ export function SettingsDialog({
               </DropdownMenuLabel>
             </DropdownMenuSubContent>
           </DropdownMenuSub>
-          <DropdownMenuItem
-            onSelect={() => {
-              setSection("geocoding");
-              setOpen(true);
-            }}
-          >
-            <Locate className="mr-2 h-3.5 w-3.5" />
-            {t("settings.menu.geocoding")}
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            onSelect={() => {
-              setSection("environment");
-              setOpen(true);
-            }}
-          >
-            <Braces className="mr-2 h-3.5 w-3.5" />
-            {t("settings.menu.environmentVariables")}
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            onSelect={() => {
-              setSection("project");
-              setOpen(true);
-            }}
-          >
-            <FolderCog className="mr-2 h-3.5 w-3.5" />
-            {t("settings.menu.projectSettings")}
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => onOpenManagePlugins()}>
-            <Puzzle className="mr-2 h-3.5 w-3.5" />
-            {t("settings.menu.managePlugins")}
-          </DropdownMenuItem>
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>
+              <Palette className="h-3.5 w-3.5" />
+              {t("settings.section.appearance")}
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent className="w-56">
+              <DropdownMenuLabel className="px-2 py-1 text-xs font-normal text-muted-foreground">
+                {t("settings.appearance.accentColor")}
+              </DropdownMenuLabel>
+              <DropdownMenuRadioGroup
+                value={desktopSettings.theme.scheme}
+                onValueChange={(value: string) =>
+                  updateSavedThemeScheme(value as ThemeScheme)
+                }
+              >
+                {THEME_SCHEMES.map((scheme) => (
+                  <DropdownMenuRadioItem
+                    key={scheme.id}
+                    value={scheme.id}
+                    onSelect={(event: Event) => event.preventDefault()}
+                  >
+                    <span
+                      aria-hidden
+                      className="mr-2 h-3.5 w-3.5 shrink-0 rounded-full border"
+                      style={{ backgroundColor: scheme.swatch }}
+                    />
+                    {t(scheme.labelKey)}
+                  </DropdownMenuRadioItem>
+                ))}
+                <DropdownMenuRadioItem
+                  value="custom"
+                  onSelect={() => {
+                    // Selecting "Custom" from the menu would otherwise be a dead
+                    // end, so open the Appearance pane and jump to its color
+                    // picker instead of nesting a third-level menu (#718).
+                    updateSavedThemeScheme("custom");
+                    setSection("appearance");
+                    setOpen(true);
+                    setPendingFocus("accentColor");
+                  }}
+                >
+                  <span
+                    aria-hidden
+                    className="mr-2 h-3.5 w-3.5 shrink-0 rounded-full border"
+                    style={{ backgroundColor: desktopSettings.theme.customColor }}
+                  />
+                  {t("settings.appearance.custom")}
+                </DropdownMenuRadioItem>
+              </DropdownMenuRadioGroup>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onSelect={() => {
+                  setSection("appearance");
+                  setOpen(true);
+                }}
+              >
+                {t("settings.menu.appearanceSettings")}
+              </DropdownMenuItem>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>
+              <SlidersHorizontal className="h-3.5 w-3.5" />
+              {t("settings.section.interface")}
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent className="w-56">
+              <DropdownMenuLabel className="px-2 py-1 text-xs font-normal text-muted-foreground">
+                {t("settings.interface.presets")}
+              </DropdownMenuLabel>
+              <DropdownMenuRadioGroup
+                value={activeInterfaceProfile(desktopSettings.uiProfile)}
+                onValueChange={(value: string) => {
+                  // The three presets recompute hidden lists; "custom" opts into
+                  // custom mode while keeping the current lists. EXPERIENCE_LEVELS
+                  // excludes "custom", so this guard keeps any stray value from
+                  // reaching presetHiddenSets. Keep EXPERIENCE_LEVELS in sync with
+                  // the selectable preset entries of INTERFACE_PROFILES.
+                  if ((EXPERIENCE_LEVELS as readonly string[]).includes(value)) {
+                    applySavedExperiencePreset(value as ExperienceLevel);
+                  } else if (value === "custom") {
+                    applySavedCustomProfile();
+                  }
+                }}
+              >
+                {INTERFACE_PROFILES.map((option) => (
+                  <DropdownMenuRadioItem
+                    key={option}
+                    value={option}
+                    // "custom" lights up automatically when the user hand-edits
+                    // an item, and is also directly selectable to keep the current
+                    // configuration while switching into custom mode.
+                    disabled={desktopSettings.uiProfile.locked}
+                    onSelect={(event: Event) => event.preventDefault()}
+                  >
+                    {t(`settings.interface.level.${option}`)}
+                  </DropdownMenuRadioItem>
+                ))}
+              </DropdownMenuRadioGroup>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onSelect={() => {
+                  setSection("interface");
+                  setOpen(true);
+                }}
+              >
+                {t("settings.menu.interfaceSettings")}
+              </DropdownMenuItem>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+          {showSettingsItem("settings.geocoding") && (
+            <DropdownMenuItem
+              onSelect={() => {
+                setSection("geocoding");
+                setOpen(true);
+              }}
+            >
+              <Locate className="mr-2 h-3.5 w-3.5" />
+              {t("settings.menu.geocoding")}
+            </DropdownMenuItem>
+          )}
+          {showSettingsItem("settings.ai") && (
+            <DropdownMenuItem
+              onSelect={() => {
+                setSection("ai");
+                setOpen(true);
+              }}
+            >
+              <Bot className="mr-2 h-3.5 w-3.5" />
+              {t("settings.menu.ai")}
+            </DropdownMenuItem>
+          )}
+          {showSettingsItem("settings.environment") && (
+            <DropdownMenuItem
+              onSelect={() => {
+                setSection("environment");
+                setOpen(true);
+              }}
+            >
+              <Braces className="mr-2 h-3.5 w-3.5" />
+              {t("settings.menu.environmentVariables")}
+            </DropdownMenuItem>
+          )}
+          {isTauri() && (
+            <DropdownMenuItem
+              onSelect={() => {
+                setSection("updates");
+                setOpen(true);
+              }}
+            >
+              <DownloadCloud className="mr-2 h-3.5 w-3.5" />
+              {t("settings.menu.updates")}
+            </DropdownMenuItem>
+          )}
+          {showSettingsItem("settings.managePlugins") && (
+            <DropdownMenuItem onSelect={() => onOpenManagePlugins()}>
+              <Puzzle className="mr-2 h-3.5 w-3.5" />
+              {t("settings.menu.managePlugins")}
+            </DropdownMenuItem>
+          )}
           {arcGISOAuth.clientId ? (
             <>
               <DropdownMenuSeparator />
@@ -664,19 +1365,18 @@ export function SettingsDialog({
           </DialogHeader>
           <div className="grid min-h-0 grid-cols-1 md:grid-cols-[12rem_1fr]">
             <nav className="flex gap-1 border-b p-3 md:flex-col md:border-b-0 md:border-r">
-              {SECTION_ITEMS.map(renderSectionButton)}
+              {SECTION_ITEMS.filter((item) => isSectionVisible(item.id)).map(
+                renderSectionButton,
+              )}
             </nav>
             <div className="min-h-0 overflow-y-auto p-6">
-              {section === "map" ? (
+              {effectiveSection === "map" ? (
                 <div className="space-y-5">
                   <div className="flex items-center justify-between gap-3">
                     <div>
                       <h3 className="text-sm font-semibold">
                         {t("settings.map.constraintsTitle")}
                       </h3>
-                      <p className="text-xs text-muted-foreground">
-                        {t("settings.map.constraintsDescription")}
-                      </p>
                     </div>
                     <Button
                       type="button"
@@ -688,19 +1388,31 @@ export function SettingsDialog({
                       {t("common.reset")}
                     </Button>
                   </div>
-                  <label className="flex items-center gap-2 text-sm">
-                    <input
-                      className="h-4 w-4"
-                      type="checkbox"
-                      checked={draftPreferences.map.restrictBounds}
-                      onChange={(event) =>
-                        updateMapPreferences({
-                          restrictBounds: event.target.checked,
-                        })
-                      }
-                    />
-                    {t("settings.map.restrictBounds")}
-                  </label>
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        className="h-4 w-4"
+                        type="checkbox"
+                        checked={draftPreferences.map.restrictBounds}
+                        onChange={(event) =>
+                          updateMapPreferences({
+                            restrictBounds: event.target.checked,
+                          })
+                        }
+                      />
+                      {t("settings.map.restrictBounds")}
+                    </label>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      title={t("settings.map.useCurrentViewHint")}
+                      onClick={applyCurrentViewBounds}
+                    >
+                      <Crosshair className="h-3.5 w-3.5" />
+                      {t("settings.map.useCurrentView")}
+                    </Button>
+                  </div>
                   <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
                     {(
                       [
@@ -711,7 +1423,14 @@ export function SettingsDialog({
                       ] as const
                     ).map(([labelKey, index, min, max]) => (
                       <div key={labelKey} className="space-y-1.5">
-                        <Label htmlFor={`settings-bounds-${index}`}>
+                        <Label
+                          htmlFor={`settings-bounds-${index}`}
+                          className={
+                            draftPreferences.map.restrictBounds
+                              ? undefined
+                              : "cursor-not-allowed opacity-50"
+                          }
+                        >
                           {t(labelKey)}
                         </Label>
                         <Input
@@ -720,6 +1439,7 @@ export function SettingsDialog({
                           min={min}
                           max={max}
                           step="0.000001"
+                          disabled={!draftPreferences.map.restrictBounds}
                           value={draftPreferences.map.bounds[index as number]}
                           onChange={(event) =>
                             updateBoundsValue(
@@ -731,15 +1451,12 @@ export function SettingsDialog({
                       </div>
                     ))}
                   </div>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    onClick={applyCurrentViewBounds}
-                  >
-                    <Crosshair className="h-3.5 w-3.5" />
-                    {t("settings.map.useCurrentView")}
-                  </Button>
+                  {liveProjection === "globe" ? (
+                    <p className="flex items-start gap-1.5 text-xs text-muted-foreground">
+                      <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+                      <span>{t("settings.map.useCurrentViewGlobeHint")}</span>
+                    </p>
+                  ) : null}
                   <div className="grid gap-3 sm:grid-cols-3">
                     <div className="space-y-1.5">
                       <Label htmlFor="settings-min-zoom">
@@ -811,7 +1528,7 @@ export function SettingsDialog({
                   </label>
                 </div>
               ) : null}
-              {section === "layout" ? (
+              {effectiveSection === "layout" ? (
                 <div className="space-y-5">
                   <div className="flex items-center justify-between gap-3">
                     <div>
@@ -898,12 +1615,400 @@ export function SettingsDialog({
                       <span>{t("settings.layout.showStylePanel")}</span>
                     </label>
                   </div>
-                  <div className="rounded-md border bg-muted/40 p-3 text-xs text-muted-foreground">
-                    {t("settings.layout.urlParamsNote")}
+                  {showsAdvancedNotices(desktopSettings.uiProfile) ? (
+                    <div className="rounded-md border bg-muted/40 p-3 text-xs text-muted-foreground">
+                      {t("settings.layout.urlParamsNote")}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+              {effectiveSection === "appearance" ? (
+                <div className="space-y-5">
+                  <div>
+                    <h3 className="text-sm font-semibold">
+                      {t("settings.appearance.title")}
+                    </h3>
+                    <p className="text-xs text-muted-foreground">
+                      {t("settings.appearance.description")}
+                    </p>
+                  </div>
+                  <div className="space-y-3">
+                    <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      {t("settings.appearance.themeMode")}
+                    </h4>
+                    {/* Light/dark cards so the mode lives beside the accent
+                        color instead of only on the toolbar (#716). The mode is
+                        a two-state toggle, so a non-active card just flips it. */}
+                    <div className="grid grid-cols-2 gap-3">
+                      {(["light", "dark"] as const).map((mode) => {
+                        const active = themeMode === mode;
+                        const ModeIcon = mode === "light" ? Sun : Moon;
+                        return (
+                          <button
+                            key={mode}
+                            type="button"
+                            aria-pressed={active}
+                            onClick={() => {
+                              if (!active) onToggleThemeMode();
+                            }}
+                            className={cn(
+                              "flex items-center gap-2.5 rounded-md border p-3 text-sm transition-colors",
+                              active
+                                ? "border-primary ring-2 ring-ring"
+                                : "hover:bg-accent",
+                            )}
+                          >
+                            <ModeIcon className="h-5 w-5 shrink-0" />
+                            <span>{t(`settings.appearance.mode.${mode}`)}</span>
+                            {active ? (
+                              <Check className="ml-auto h-4 w-4 text-primary" />
+                            ) : null}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <div className="space-y-3">
+                    <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      {t("settings.appearance.accentColor")}
+                    </h4>
+                    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+                      {THEME_SCHEMES.map((scheme) => {
+                        const active =
+                          desktopSettings.theme.scheme === scheme.id;
+                        return (
+                          <button
+                            key={scheme.id}
+                            type="button"
+                            aria-pressed={active}
+                            onClick={() => updateSavedThemeScheme(scheme.id)}
+                            className={cn(
+                              "flex items-center gap-2.5 rounded-md border p-3 text-sm transition-colors",
+                              active
+                                ? "border-primary ring-2 ring-ring"
+                                : "hover:bg-accent",
+                            )}
+                          >
+                            <span
+                              aria-hidden
+                              className="h-5 w-5 shrink-0 rounded-full border"
+                              style={{ backgroundColor: scheme.swatch }}
+                            />
+                            <span>{t(scheme.labelKey)}</span>
+                            {active ? (
+                              <Check className="ml-auto h-4 w-4 text-primary" />
+                            ) : null}
+                          </button>
+                        );
+                      })}
+                      <button
+                        type="button"
+                        aria-pressed={
+                          desktopSettings.theme.scheme === "custom"
+                        }
+                        onClick={() => updateSavedThemeScheme("custom")}
+                        className={cn(
+                          "flex items-center gap-2.5 rounded-md border p-3 text-sm transition-colors",
+                          desktopSettings.theme.scheme === "custom"
+                            ? "border-primary ring-2 ring-ring"
+                            : "hover:bg-accent",
+                        )}
+                      >
+                        <span
+                          aria-hidden
+                          className="h-5 w-5 shrink-0 rounded-full border"
+                          style={{
+                            backgroundColor: desktopSettings.theme.customColor,
+                          }}
+                        />
+                        <span>{t("settings.appearance.custom")}</span>
+                        {desktopSettings.theme.scheme === "custom" ? (
+                          <Check className="ml-auto h-4 w-4 text-primary" />
+                        ) : null}
+                      </button>
+                    </div>
+                    {desktopSettings.theme.scheme === "custom" ? (
+                      <label className="flex items-center gap-3 rounded-md border p-3 text-sm">
+                        <input
+                          ref={customColorInputRef}
+                          type="color"
+                          className="h-8 w-12 shrink-0 cursor-pointer rounded border bg-transparent p-0.5"
+                          value={desktopSettings.theme.customColor}
+                          onChange={(event) =>
+                            updateSavedThemeCustomColor(event.target.value)
+                          }
+                          aria-label={t("settings.appearance.customColor")}
+                        />
+                        <span>{t("settings.appearance.customColor")}</span>
+                        {/* Inline hex entry so power users can type or paste an
+                            exact code instead of only dragging the native picker.
+                            The text input is interactive content, so a click lands
+                            here and focuses it rather than reopening the picker the
+                            wrapping label drives (#911). */}
+                        <input
+                          type="text"
+                          spellCheck={false}
+                          autoComplete="off"
+                          className="ml-auto w-24 rounded border bg-transparent px-2 py-1 text-right font-mono text-xs uppercase text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring aria-[invalid=true]:border-destructive aria-[invalid=true]:text-destructive"
+                          value={
+                            customColorDraft ??
+                            desktopSettings.theme.customColor
+                          }
+                          // The field already holds a full `#rrggbb`, so select
+                          // all on focus to let the user type a replacement.
+                          onFocus={(event) => event.target.select()}
+                          // Drop whitespace and cap to the longest valid form
+                          // (`#rrggbb`) as the draft is stored, so a padded or
+                          // oversized paste is sanitized in place instead of
+                          // sitting clobbered; this also bounds a runaway paste
+                          // without a brittle maxLength that has to guess how
+                          // much surrounding whitespace to allow.
+                          onChange={(event) =>
+                            setCustomColorDraft(
+                              event.target.value.replace(/\s/g, "").slice(0, 7),
+                            )
+                          }
+                          onBlur={commitCustomColorDraft}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              // Blur is the single commit path; the resulting
+                              // onBlur applies/reverts the draft, so don't also
+                              // commit here and double-write the same value.
+                              event.preventDefault();
+                              event.currentTarget.blur();
+                            } else if (event.key === "Escape") {
+                              // Cancel the edit: flag the commit to skip, then
+                              // blur so the value is dropped, not applied. The
+                              // dialog's own Escape handling still closes it.
+                              skipCustomColorCommitRef.current = true;
+                              event.currentTarget.blur();
+                            }
+                          }}
+                          aria-label={t("settings.appearance.customColorHex")}
+                          // `|| undefined` omits the attribute entirely when
+                          // valid; a literal aria-invalid="false" makes some
+                          // screen readers announce "invalid: false" on focus.
+                          aria-invalid={
+                            (customColorDraft !== null &&
+                              customColorDraft.trim() !== "" &&
+                              normalizeHexColor(customColorDraft) === null) ||
+                            undefined
+                          }
+                        />
+                      </label>
+                    ) : null}
                   </div>
                 </div>
               ) : null}
-              {section === "geocoding" ? (
+              {effectiveSection === "interface" ? (
+                <div className="space-y-5">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-semibold">
+                        {t("settings.interface.title")}
+                      </h3>
+                      <p className="text-xs text-muted-foreground">
+                        {t("settings.interface.description")}
+                      </p>
+                    </div>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={draftDesktopSettings.uiProfile.locked}
+                      onClick={resetUiProfile}
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" />
+                      {t("common.reset")}
+                    </Button>
+                  </div>
+                  {draftDesktopSettings.uiProfile.locked ? (
+                    <div className="rounded-md border bg-muted/40 p-3 text-xs text-muted-foreground">
+                      {t("settings.interface.lockedNote")}
+                    </div>
+                  ) : null}
+                  <div className="space-y-2">
+                    <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      {t("settings.interface.presets")}
+                    </h4>
+                    <div className="flex flex-wrap gap-2">
+                      {INTERFACE_PROFILES.map((option) => {
+                        const active =
+                          activeInterfaceProfile(
+                            draftDesktopSettings.uiProfile,
+                          ) === option;
+                        return (
+                          <Button
+                            key={option}
+                            type="button"
+                            size="sm"
+                            // The active profile gets the solid primary fill so it
+                            // reads clearly as the running state, including
+                            // "custom" (issue #592). Inactive choices stay
+                            // outlined.
+                            variant={active ? "default" : "outline"}
+                            // "custom" activates automatically when an item is
+                            // toggled below, but it is also directly clickable so
+                            // the user can opt into custom mode while keeping the
+                            // current configuration intact.
+                            disabled={draftDesktopSettings.uiProfile.locked}
+                            aria-current={active ? true : undefined}
+                            onClick={
+                              option === "custom"
+                                ? applyCustomProfile
+                                : () => applyExperiencePreset(option)
+                            }
+                          >
+                            {t(`settings.interface.level.${option}`)}
+                          </Button>
+                        );
+                      })}
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      {t("settings.interface.presetsHint")}
+                    </p>
+                  </div>
+                  <div className="space-y-3">
+                    <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      {t("settings.interface.dataSources")}
+                    </h4>
+                    {DATA_SOURCE_SECTION_ORDER.map((sectionId) => (
+                      <div key={sectionId} className="space-y-1.5">
+                        <h5 className="text-xs font-medium text-muted-foreground">
+                          {t(DATA_SOURCE_SECTION_LABEL_KEYS[sectionId])}
+                        </h5>
+                        <div className="grid gap-1.5 sm:grid-cols-2">
+                          {DATA_SOURCE_CATALOG.filter(
+                            (entry) => entry.section === sectionId,
+                          ).map((entry) => (
+                            <label
+                              key={entry.id}
+                              className="flex items-center gap-2 rounded-md border px-3 py-2 text-sm"
+                            >
+                              <input
+                                className="h-4 w-4"
+                                type="checkbox"
+                                checked={
+                                  !draftDesktopSettings.uiProfile.hiddenDataSources.includes(
+                                    entry.id,
+                                  )
+                                }
+                                disabled={
+                                  draftDesktopSettings.uiProfile.locked
+                                }
+                                onChange={(event) =>
+                                  toggleDataSourceHidden(
+                                    entry.id,
+                                    event.target.checked,
+                                  )
+                                }
+                              />
+                              <span>{t(entry.labelKey)}</span>
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  {profilePlugins.length > 0 ? (
+                    <div className="space-y-1.5">
+                      <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                        {t("settings.interface.plugins")}
+                      </h4>
+                      <div className="grid gap-1.5 sm:grid-cols-2">
+                        {profilePlugins.map((plugin) => (
+                          <label
+                            key={plugin.id}
+                            className="flex items-center gap-2 rounded-md border px-3 py-2 text-sm"
+                          >
+                            <input
+                              className="h-4 w-4"
+                              type="checkbox"
+                              checked={
+                                !draftDesktopSettings.uiProfile.hiddenPlugins.includes(
+                                  plugin.id,
+                                )
+                              }
+                              disabled={
+                                draftDesktopSettings.uiProfile.locked
+                              }
+                              onChange={(event) =>
+                                togglePluginHidden(plugin.id, event.target.checked)
+                              }
+                            />
+                            <span>{plugin.name}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                  <div className="space-y-3">
+                    <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      {t("settings.interface.menus")}
+                    </h4>
+                    <div className="grid gap-1.5 sm:grid-cols-2">
+                      {TOP_LEVEL_MENUS.map((menu) => (
+                        <label
+                          key={menu.id}
+                          className="flex items-center gap-2 rounded-md border px-3 py-2 text-sm"
+                        >
+                          <input
+                            className="h-4 w-4"
+                            type="checkbox"
+                            checked={
+                              !draftDesktopSettings.uiProfile.hiddenMenus.includes(
+                                menu.id,
+                              )
+                            }
+                            disabled={
+                              draftDesktopSettings.uiProfile.locked
+                            }
+                            onChange={(event) =>
+                              toggleMenuHidden(menu.id, event.target.checked)
+                            }
+                          />
+                          <span>{t(menu.labelKey)}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                  {MENU_ITEM_GROUPS.map((group) => (
+                    <div key={group.menuId} className="space-y-1.5">
+                      <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                        {t(group.labelKey)}
+                      </h4>
+                      <div className="grid gap-1.5 sm:grid-cols-2">
+                        {MENU_ITEM_CATALOG.filter(
+                          (entry) => entry.menuId === group.menuId,
+                        ).map((entry) => (
+                          <label
+                            key={entry.id}
+                            className="flex items-center gap-2 rounded-md border px-3 py-2 text-sm"
+                          >
+                            <input
+                              className="h-4 w-4"
+                              type="checkbox"
+                              checked={
+                                !draftDesktopSettings.uiProfile.hiddenMenuItems.includes(
+                                  entry.id,
+                                )
+                              }
+                              disabled={
+                                draftDesktopSettings.uiProfile.locked
+                              }
+                              onChange={(event) =>
+                                toggleMenuItemHidden(entry.id, event.target.checked)
+                              }
+                            />
+                            <span>{t(entry.labelKey)}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {effectiveSection === "geocoding" ? (
                 <div className="space-y-5">
                   <div className="space-y-1">
                     <h3 className="text-sm font-semibold">
@@ -1065,7 +2170,142 @@ export function SettingsDialog({
                   })()}
                 </div>
               ) : null}
-              {section === "environment" ? (
+              {effectiveSection === "ai" ? (
+                <div className="space-y-5">
+                  <div className="space-y-1">
+                    <h3 className="text-sm font-semibold">
+                      {t("settings.ai.title")}
+                    </h3>
+                    <p className="text-xs text-muted-foreground">
+                      {t("settings.ai.description")}
+                    </p>
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-xs" htmlFor="settings-ai-provider">
+                      {t("settings.ai.providerLabel")}
+                    </Label>
+                    <Select
+                      id="settings-ai-provider"
+                      value={aiProvider}
+                      onChange={(event) =>
+                        setAiProvider(
+                          event.target.value as AssistantProviderId,
+                        )
+                      }
+                    >
+                      {ASSISTANT_PROVIDER_IDS.map((id) => (
+                        <option key={id} value={id}>
+                          {configuredProviders.has(id)
+                            ? `${PROVIDER_LABELS[id]} ${t("settings.ai.configuredMark")}`
+                            : PROVIDER_LABELS[id]}
+                        </option>
+                      ))}
+                    </Select>
+                    <p className="text-xs text-muted-foreground">
+                      {t("settings.ai.providerHint")}
+                    </p>
+                  </div>
+                  {configuredProviders.has(aiProvider) ? (
+                    <div className="flex items-center gap-1.5 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">
+                      <Check className="h-3.5 w-3.5 shrink-0" />
+                      <span>
+                        {t("settings.ai.statusReady", {
+                          provider: PROVIDER_LABELS[aiProvider],
+                        })}
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">
+                      {t("settings.ai.statusIncomplete", {
+                        provider: PROVIDER_LABELS[aiProvider],
+                      })}
+                    </div>
+                  )}
+                  <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">
+                    <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>{t("settings.env.secretsWarning")}</span>
+                  </div>
+                  <div className="space-y-4">
+                    {PROVIDER_FIELDS[aiProvider].map((field) => {
+                      const revealed = revealedValueIds.has(field.envKey);
+                      return (
+                        <div key={field.envKey} className="space-y-1.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <Label
+                              className="text-xs"
+                              htmlFor={`settings-ai-${field.envKey}`}
+                            >
+                              {t(field.labelKey)}
+                              {field.required ? null : (
+                                <span className="ml-1 font-normal text-muted-foreground">
+                                  {t("settings.ai.optionalMark")}
+                                </span>
+                              )}
+                            </Label>
+                            <code className="font-mono text-[11px] text-muted-foreground">
+                              {field.envKey}
+                            </code>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <Input
+                              id={`settings-ai-${field.envKey}`}
+                              type={
+                                field.secret && !revealed ? "password" : "text"
+                              }
+                              autoComplete="off"
+                              spellCheck={false}
+                              value={getProviderField(field)}
+                              onChange={(event) =>
+                                setProviderField(field, event.target.value)
+                              }
+                              placeholder={t(field.placeholderKey)}
+                            />
+                            {field.secret ? (
+                              <Button
+                                type="button"
+                                size="icon"
+                                variant="ghost"
+                                onClick={() =>
+                                  toggleValueVisibility(field.envKey)
+                                }
+                                aria-label={
+                                  revealed
+                                    ? t("settings.ai.hideValue", {
+                                        name: t(field.labelKey),
+                                      })
+                                    : t("settings.ai.showValue", {
+                                        name: t(field.labelKey),
+                                      })
+                                }
+                              >
+                                {revealed ? (
+                                  <EyeOff className="h-3.5 w-3.5" />
+                                ) : (
+                                  <Eye className="h-3.5 w-3.5" />
+                                )}
+                              </Button>
+                            ) : null}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {PROVIDER_DOCS_URL[aiProvider] ? (
+                    <a
+                      className="inline-flex items-center gap-1 text-xs text-primary underline"
+                      href={PROVIDER_DOCS_URL[aiProvider]}
+                      target="_blank"
+                      rel="noreferrer noopener"
+                    >
+                      <ExternalLink className="h-3 w-3" />
+                      {t("settings.ai.getCredentials", {
+                        provider: PROVIDER_LABELS[aiProvider],
+                      })}
+                    </a>
+                  ) : null}
+                </div>
+              ) : null}
+              {effectiveSection === "environment" ? (
                 <div className="space-y-5">
                   <div className="space-y-2">
                     <h3 className="text-sm font-semibold">
@@ -1087,6 +2327,7 @@ export function SettingsDialog({
                       />
                     </p>
                     <Input
+                      ref={shareTokenInputRef}
                       aria-label={t("settings.env.tokenTitle")}
                       type="password"
                       autoComplete="new-password"
@@ -1220,57 +2461,101 @@ export function SettingsDialog({
                   )}
                 </div>
               ) : null}
-              {section === "project" ? (
+              {effectiveSection === "updates" ? (
+                <div className="space-y-5">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-semibold">
+                        {t("settings.updates.title")}
+                      </h3>
+                      <p className="text-xs text-muted-foreground">
+                        {t("settings.updates.description")}
+                      </p>
+                    </div>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={resetUpdateSettings}
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" />
+                      {t("common.reset")}
+                    </Button>
+                  </div>
+                  <label className="flex items-start gap-3 rounded-md border p-3 text-sm">
+                    <input
+                      className="mt-0.5 h-4 w-4"
+                      type="checkbox"
+                      checked={draftDesktopSettings.updates.checkOnStartup}
+                      onChange={(event) =>
+                        updateDraftUpdateSettings({
+                          checkOnStartup: event.target.checked,
+                        })
+                      }
+                    />
+                    <span className="space-y-1">
+                      <span className="block">
+                        {t("settings.updates.checkOnStartup")}
+                      </span>
+                      <span className="block text-xs text-muted-foreground">
+                        {t("settings.updates.checkOnStartupHint")}
+                      </span>
+                    </span>
+                  </label>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="settings-update-level">
+                      {t("settings.updates.notificationLevel")}
+                    </Label>
+                    <Select
+                      id="settings-update-level"
+                      value={draftDesktopSettings.updates.notificationLevel}
+                      disabled={
+                        !draftDesktopSettings.updates.checkOnStartup
+                      }
+                      onChange={(event) =>
+                        updateDraftUpdateSettings({
+                          // The options are generated from
+                          // UPDATE_NOTIFICATION_LEVELS, but guard the cast so an
+                          // unexpected value can't slip through if they drift.
+                          notificationLevel: UPDATE_NOTIFICATION_LEVELS.includes(
+                            event.target.value as UpdateNotificationLevel,
+                          )
+                            ? (event.target.value as UpdateNotificationLevel)
+                            : DEFAULT_UPDATE_SETTINGS.notificationLevel,
+                        })
+                      }
+                    >
+                      {UPDATE_NOTIFICATION_LEVELS.map((level) => (
+                        <option key={level} value={level}>
+                          {t(`settings.updates.level.${level}`)}
+                        </option>
+                      ))}
+                    </Select>
+                    <p className="text-xs text-muted-foreground">
+                      {t("settings.updates.notificationLevelHint")}
+                    </p>
+                  </div>
+                </div>
+              ) : null}
+              {effectiveSection === "account" ? (
                 <div className="space-y-5">
                   <div>
                     <h3 className="text-sm font-semibold">
-                      {t("settings.project.title")}
+                      ArcGIS Online Account
                     </h3>
-                    <p className="text-xs text-muted-foreground">
-                      {t("settings.project.description")}
-                    </p>
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label htmlFor="settings-project-name">
-                      {t("settings.project.name")}
-                    </Label>
-                    <Input
-                      id="settings-project-name"
-                      value={draftProjectName}
-                      onChange={(event) =>
-                        setDraftProjectName(event.target.value)
-                      }
-                    />
-                  </div>
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    <div className="space-y-1.5">
-                      <Label>{t("settings.project.file")}</Label>
-                      <div className="min-h-9 truncate rounded-md border bg-muted px-3 py-2 text-sm text-muted-foreground">
-                        {projectPath ?? t("settings.project.notSaved")}
-                      </div>
-                    </div>
-                    <div className="space-y-1.5">
-                      <Label>{t("settings.project.format")}</Label>
-                      <div className="min-h-9 rounded-md border bg-muted px-3 py-2 text-sm text-muted-foreground">
-                        {PROJECT_VERSION}
-                      </div>
-                    </div>
-                </div>
-                </div>
-              ) : null}
-              {section === "account" ? (
-                <div className="space-y-5">
-                  <div>
-                    <h3 className="text-sm font-semibold">ArcGIS Online Account</h3>
                   </div>
                   {arcGISOAuth.clientId ? (
                     arcGISOAuth.token ? (
                       <div className="space-y-3">
                         <div className="rounded-md border bg-muted px-3 py-2 text-sm">
-                          <div className="font-medium">{arcGISOAuth.token.username}</div>
+                          <div className="font-medium">
+                            {arcGISOAuth.token.username}
+                          </div>
                           <div className="text-xs text-muted-foreground">
                             Session expires{" "}
-                            {new Date(arcGISOAuth.token.expiresAt).toLocaleTimeString()}
+                            {new Date(
+                              arcGISOAuth.token.expiresAt,
+                            ).toLocaleTimeString()}
                           </div>
                         </div>
                         <Button

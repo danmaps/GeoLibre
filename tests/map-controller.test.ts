@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import maplibregl from "maplibre-gl";
 import {
   DEFAULT_LAYER_STYLE,
   type GeoLibreLayer,
@@ -641,5 +642,265 @@ describe("MapController built-in control positions", () => {
     // MapLibre throws if a control was already removed; the controller must
     // not propagate that.
     assert.doesNotThrow(() => controller.removeControl({} as never));
+  });
+});
+
+// Internal surface used to drive the geolocate error handler in plain Node.
+interface GeolocateInternals {
+  map: unknown;
+  geolocateControl: { handlers: Record<string, (e: unknown) => void> } | null;
+  controlVisibility: Record<string, boolean>;
+  addGeolocateControl(): boolean;
+}
+
+/** Minimal stand-in for maplibregl.GeolocateControl that records listeners. */
+class FakeGeolocateControl {
+  handlers: Record<string, (e: unknown) => void> = {};
+  on(event: string, fn: (e: unknown) => void): void {
+    this.handlers[event] = fn;
+  }
+  off(event: string, fn: (e: unknown) => void): void {
+    if (this.handlers[event] === fn) delete this.handlers[event];
+  }
+}
+
+/**
+ * Replace the global `navigator` for a test; returns a restore function.
+ * Pass `permissionState` of `null` to omit the Permissions API entirely, or a
+ * `queryOverride` to control how `permissions.query()` resolves/throws.
+ */
+function stubNavigator(
+  permissionState: string | null,
+  queryOverride?: () => Promise<unknown>,
+): () => void {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  let value: unknown;
+  if (queryOverride) value = { permissions: { query: queryOverride } };
+  else if (permissionState === null) value = {};
+  else value = { permissions: { query: async () => ({ state: permissionState }) } };
+  Object.defineProperty(globalThis, "navigator", { value, configurable: true });
+  return () => {
+    if (original) Object.defineProperty(globalThis, "navigator", original);
+    else delete (globalThis as { navigator?: unknown }).navigator;
+  };
+}
+
+/** Mount a fresh geolocate control on a controller backed by a fake map. */
+function controllerWithGeolocate(): {
+  controller: MapController;
+  internal: GeolocateInternals;
+  firstControl: { handlers: Record<string, (e: unknown) => void> };
+} {
+  const controller = createMapController();
+  const internal = controller as unknown as GeolocateInternals;
+  internal.map = { addControl() {}, removeControl() {} };
+  internal.controlVisibility.geolocate = true;
+  internal.addGeolocateControl();
+  return { controller, internal, firstControl: internal.geolocateControl! };
+}
+
+/** Flush pending microtasks (the async permission query and its `.then`). */
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+describe("MapController geolocate permission-denied recovery", () => {
+  const originalControl = maplibregl.GeolocateControl;
+
+  function withStubbedControl(run: () => Promise<void>): Promise<void> {
+    (maplibregl as { GeolocateControl: unknown }).GeolocateControl =
+      FakeGeolocateControl;
+    return run().finally(() => {
+      (maplibregl as { GeolocateControl: unknown }).GeolocateControl =
+        originalControl;
+    });
+  }
+
+  it("re-creates the control when the prompt was dismissed (state 'prompt')", () =>
+    withStubbedControl(async () => {
+      const restore = stubNavigator("prompt");
+      try {
+        const { internal, firstControl } = controllerWithGeolocate();
+        // A dismissed prompt surfaces as a PERMISSION_DENIED (code 1) error.
+        firstControl.handlers.error({ code: 1 });
+        await flush();
+        assert.notEqual(internal.geolocateControl, firstControl);
+        assert.ok(internal.geolocateControl instanceof FakeGeolocateControl);
+      } finally {
+        restore();
+      }
+    }));
+
+  it("leaves the control disabled on a genuine denial (state 'denied')", () =>
+    withStubbedControl(async () => {
+      const restore = stubNavigator("denied");
+      try {
+        const { internal, firstControl } = controllerWithGeolocate();
+        firstControl.handlers.error({ code: 1 });
+        await flush();
+        assert.equal(internal.geolocateControl, firstControl);
+      } finally {
+        restore();
+      }
+    }));
+
+  it("does not reset on a contradictory granted denial (state 'granted')", () =>
+    withStubbedControl(async () => {
+      const restore = stubNavigator("granted");
+      try {
+        const { internal, firstControl } = controllerWithGeolocate();
+        firstControl.handlers.error({ code: 1 });
+        await flush();
+        assert.equal(internal.geolocateControl, firstControl);
+      } finally {
+        restore();
+      }
+    }));
+
+  it("re-creates when the Permissions API is unavailable", () =>
+    withStubbedControl(async () => {
+      const restore = stubNavigator(null);
+      try {
+        const { internal, firstControl } = controllerWithGeolocate();
+        firstControl.handlers.error({ code: 1 });
+        await flush();
+        assert.notEqual(internal.geolocateControl, firstControl);
+      } finally {
+        restore();
+      }
+    }));
+
+  it("re-creates when the permission query rejects", () =>
+    withStubbedControl(async () => {
+      const restore = stubNavigator(null, () =>
+        Promise.reject(new Error("not supported")),
+      );
+      try {
+        const { internal, firstControl } = controllerWithGeolocate();
+        firstControl.handlers.error({ code: 1 });
+        await flush();
+        assert.notEqual(internal.geolocateControl, firstControl);
+      } finally {
+        restore();
+      }
+    }));
+
+  it("re-creates when the permission query throws synchronously", () =>
+    withStubbedControl(async () => {
+      const restore = stubNavigator(null, () => {
+        throw new Error("permissions blocked");
+      });
+      try {
+        const { internal, firstControl } = controllerWithGeolocate();
+        firstControl.handlers.error({ code: 1 });
+        await flush();
+        assert.notEqual(internal.geolocateControl, firstControl);
+      } finally {
+        restore();
+      }
+    }));
+
+  it("ignores non-permission errors (e.g. timeout, code 3)", () =>
+    withStubbedControl(async () => {
+      const restore = stubNavigator("prompt");
+      try {
+        const { internal, firstControl } = controllerWithGeolocate();
+        firstControl.handlers.error({ code: 3 });
+        await flush();
+        assert.equal(internal.geolocateControl, firstControl);
+      } finally {
+        restore();
+      }
+    }));
+
+  it("does not disturb a control that was replaced before the check resolved", () =>
+    withStubbedControl(async () => {
+      const restore = stubNavigator("prompt");
+      try {
+        const { internal, firstControl } = controllerWithGeolocate();
+        firstControl.handlers.error({ code: 1 });
+        // The control is swapped out (e.g. toggled off/on) before the async
+        // permission query resolves; the stale handler must not touch it.
+        const replacement = new FakeGeolocateControl();
+        internal.geolocateControl = replacement;
+        await flush();
+        assert.equal(internal.geolocateControl, replacement);
+      } finally {
+        restore();
+      }
+    }));
+
+  it("is a no-op when the map is destroyed before the check resolves", () =>
+    withStubbedControl(async () => {
+      const restore = stubNavigator("prompt");
+      try {
+        const { internal, firstControl } = controllerWithGeolocate();
+        firstControl.handlers.error({ code: 1 });
+        internal.map = null;
+        await flush();
+        assert.equal(internal.geolocateControl, firstControl);
+      } finally {
+        restore();
+      }
+    }));
+});
+
+interface LayerLabelWindow {
+  __GEOLIBRE_LAYER_LABELS__?: Record<string, string>;
+  dispatchEvent: (event: unknown) => boolean;
+}
+
+// publishLayerDisplayNames is guarded on `window`, which `node --test` lacks,
+// so stub a minimal one for the duration of a test. Dispatched event types are
+// recorded so a test can assert the swipe panel's change event actually fires.
+function withStubbedLabelWindow(
+  run: (win: LayerLabelWindow, dispatched: string[]) => void,
+): void {
+  const globals = globalThis as { window?: LayerLabelWindow };
+  const original = globals.window;
+  const dispatched: string[] = [];
+  const stub: LayerLabelWindow = {
+    dispatchEvent: (event: unknown) => {
+      dispatched.push((event as { type: string }).type);
+      return true;
+    },
+  };
+  globals.window = stub;
+  try {
+    run(stub, dispatched);
+  } finally {
+    if (original === undefined) delete globals.window;
+    else globals.window = original;
+  }
+}
+
+describe("MapController base-layer label", () => {
+  it("publishes the grouped basemap label so the swipe panel can localize it", () => {
+    withStubbedLabelWindow((win, dispatched) => {
+      const controller = createMapController();
+
+      // An explicit English push publishes under the "__basemap__" key the
+      // swipe panel reads, and fires the change event the panel listens for.
+      controller.setBackgroundLabel("Background");
+      assert.equal(win.__GEOLIBRE_LAYER_LABELS__?.__basemap__, "Background");
+      assert.deepEqual(dispatched, ["geolibre-layer-labels-change"]);
+
+      // A language change re-publishes the translated label under the same key
+      // and fires the event again so the panel re-syncs.
+      controller.setBackgroundLabel("Hintergrund");
+      assert.equal(win.__GEOLIBRE_LAYER_LABELS__?.__basemap__, "Hintergrund");
+      assert.equal(dispatched.length, 2);
+    });
+  });
+
+  it("clears published labels on destroy", () => {
+    withStubbedLabelWindow((win) => {
+      const controller = createMapController();
+      controller.setBackgroundLabel("Background");
+      assert.equal(win.__GEOLIBRE_LAYER_LABELS__?.__basemap__, "Background");
+
+      // Teardown clears the bridge entirely (including the basemap entry),
+      // rather than leaving the last label behind.
+      controller.destroy();
+      assert.deepEqual(win.__GEOLIBRE_LAYER_LABELS__, {});
+    });
   });
 });

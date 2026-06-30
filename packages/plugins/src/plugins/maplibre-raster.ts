@@ -2,6 +2,7 @@ import { useAppStore } from "@geolibre/core";
 import type {
   RasterControl,
   RasterControlEventHandler,
+  RasterSampleDataset,
 } from "maplibre-gl-raster";
 import type { GeoLibreAppAPI, GeoLibreMapControlPosition } from "../types";
 import { ensureMercatorProjection } from "./map-projection-utils";
@@ -22,16 +23,30 @@ import {
 
 const rasterControlPosition: GeoLibreMapControlPosition = "top-left";
 const RASTER_PANEL_CLASS = "geolibre-raster-panel";
-const DEFAULT_RASTER_URL =
-  "https://data.source.coop/giswqs/opengeos/nlcd_2021_land_cover_30m.tif";
 
-// These types mirror undocumented private members of RasterControl from
-// maplibre-gl-raster (verified against v0.2.0). All access is optional (?.)
+// One-click sample COGs shown in the panel's "Load sample data" dropdown.
+// Edit this list to offer different (or more) demonstration rasters; loading
+// is opt-in, so an empty list simply hides the dropdown. URLs must be
+// CORS-enabled and range-request capable (source.coop is both). Labels are
+// rendered by the upstream control, which exposes no i18n callback, so they
+// stay plain strings (same gap as the vector plugin's sample list).
+const SAMPLE_RASTER_DATASETS: RasterSampleDataset[] = [
+  {
+    label: "Land cover",
+    url: "https://data.source.coop/giswqs/opengeos/nlcd_2021_land_cover_30m.tif",
+  },
+  {
+    label: "Elevation (DEM)",
+    url: "https://data.source.coop/giswqs/opengeos/dem.tif",
+  },
+];
+
+// This type mirrors undocumented private members of RasterControl from
+// maplibre-gl-raster (re-verified against v0.6.3). All access is optional (?.)
 // so a rename in a future release degrades to a no-op rather than a crash --
 // re-verify these names AND the .mlr-control-close selector in
 // wireRasterCloseButton when bumping the dependency.
 type RasterControlInternals = {
-  _clickOutsideHandler?: ((event: MouseEvent) => void) | null;
   _layerManager?: RasterLayerManagerInternals;
   _panel?: HTMLElement;
 };
@@ -51,6 +66,8 @@ type MapboxOverlayConstructor = new (
   props: Record<string, unknown>,
 ) => OverlayLike;
 type RasterLayerManagerInternals = {
+  /** The currently selected raster id (read to restore it after inspect). */
+  selectedId?: string | null;
   _deps?: {
     createOverlay?: (
       map: MapControlHost,
@@ -85,6 +102,72 @@ let restorePanelExpandTimeout: number | null = null;
 let rasterControlInterleaved = true;
 
 /**
+ * Details of a raster that the panel could not render because it is a striped
+ * (non-tiled) GeoTIFF rather than a tiled COG. Covers both a local file and a
+ * remote URL. Passed to a host handler registered via
+ * {@link setNonTiledRasterHandler}, which can offer to convert it to a COG (the
+ * conversion + UI live in the app layer, which has i18n and the client-side
+ * converter; this framework-agnostic package only detects the case).
+ */
+export interface NonTiledRasterRequest {
+  /** The failed layer's id. */
+  layerId: string;
+  /** The failed layer's display name (used for the converted layer too). */
+  name: string;
+  /** Whether {@link readBytes} streams a full file over the network (a remote
+   * URL source) rather than resolving instantly from a local blob URL. The host
+   * uses this to confirm with the user *before* a potentially large download
+   * starts, instead of after. */
+  bytesAreRemote: boolean;
+  /** Reads the original bytes (a local file from its blob URL, or a remote URL
+   * fetched whole). Must be awaited before {@link dismiss}, which revokes a
+   * local file's blob URL. */
+  readBytes: () => Promise<Uint8Array>;
+  /** Removes the failed layer from the map and the store. */
+  dismiss: () => void;
+}
+
+type NonTiledRasterHandler = (
+  request: NonTiledRasterRequest,
+) => void | Promise<void>;
+
+let nonTiledRasterHandler: NonTiledRasterHandler | null = null;
+// Layer ids currently being handled, so a repeated 'error' event for the same
+// failed layer does not prompt twice.
+const nonTiledInFlight = new Set<string>();
+// Cap the whole-file fetch of a remote striped GeoTIFF so a slow or stalled
+// server surfaces a clear conversion failure instead of hanging the handler
+// until the browser's (often minutes-long) global network timeout. A local
+// file's blob URL resolves instantly, so the bound only ever bites remote URLs.
+// Tuning knob: generous for the small striped GeoTIFFs this targets, but a very
+// large file on a slow link could hit it (the host then shows a download error);
+// raise it if that becomes common.
+const NON_TILED_FETCH_TIMEOUT_MS = 60_000;
+
+/**
+ * Register (or clear, with `null`) a handler invoked when a GeoTIFF (local file
+ * or remote URL) fails to load because it is striped rather than tiled. The app
+ * uses this to offer an in-browser convert-to-COG flow. Only one handler is
+ * active at a time.
+ *
+ * @param handler - The handler, or `null` to unregister.
+ */
+export function setNonTiledRasterHandler(
+  handler: NonTiledRasterHandler | null,
+): void {
+  nonTiledRasterHandler = handler;
+}
+
+/** Whether a raster load error is the upstream "striped, not tiled" failure.
+ * maplibre-gl-raster (v0.6.3) rejects non-tiled GeoTIFFs with a message
+ * containing "not tiled"; this is the only signal it exposes, so the match is
+ * coupled to that wording. Re-verify it (and broaden if needed) when bumping the
+ * dependency -- a reworded message degrades to the plain error, not a crash. */
+function isNonTiledRasterError(error: Error | null | undefined): boolean {
+  return error != null && /not tiled/i.test(error.message);
+}
+
+/**
  * Opens the maplibre-gl-raster panel, mounting the control on first use.
  * Replaces the former Add Raster Layer dialog: the panel loads COGs and
  * GeoTIFFs from URLs or local files and edits bands, rescale, colormaps,
@@ -107,11 +190,9 @@ export function openRasterLayerPanel(app: GeoLibreAppAPI): void {
         control.expand();
         // Idempotent (guarded by a dataset flag / null checks): retried on
         // every open so the panel chrome stays wired even if a future
-        // upstream release builds the panel DOM (or registers the
-        // click-outside handler) lazily on first expand.
+        // upstream release builds the panel DOM lazily on first expand.
         wireRasterCloseButton(control);
         applyRasterPanelClass(control);
-        disableRasterClickOutsideCollapse(control);
       } catch (error) {
         console.error(
           "[GeoLibre] Failed to open the raster layer panel",
@@ -144,7 +225,33 @@ export async function addRasterToMap(
   if (!control) {
     throw new Error("The raster control could not be initialized.");
   }
-  await control.addRaster(source, { name: options.name, zoomTo: true });
+  // For File-backed rasters the control retains the original bytes behind a
+  // blob URL (source.objectUrl), which the store sync surfaces as
+  // metadata.localBytesUrl so in-browser tools (the WASM Whitebox runner) can
+  // read the data back. No extra bookkeeping is needed here.
+  await control.addRaster(source, {
+    name: options.name,
+    zoomTo: true,
+  });
+}
+
+/**
+ * Pushes a layer's interleave position into the raster control: draw the raster
+ * (a deck.gl COG) beneath `beforeId`, or on top when `beforeId` is undefined.
+ *
+ * `@geolibre/map`'s layer-sync computes the beforeId from the store order but
+ * cannot move the deck layer itself (it has no real MapLibre style layer), so
+ * the desktop shell wires this as its deck-layer order handler. A no-op for any
+ * id the raster control does not own.
+ *
+ * @param layerId - The store/raster layer id.
+ * @param beforeId - The MapLibre style layer id to draw beneath, or undefined.
+ */
+export function applyRasterLayerOrder(
+  layerId: string,
+  beforeId: string | undefined,
+): void {
+  rasterControl?.setRasterBeforeId(layerId, beforeId ?? null);
 }
 
 export function closeRasterLayerPanel(app: GeoLibreAppAPI): void {
@@ -162,6 +269,40 @@ export function closeRasterLayerPanel(app: GeoLibreAppAPI): void {
   resetRasterStoreSyncSuspension();
   rasterControl = null;
   rasterControlMounted = false;
+}
+
+// The panel selection in effect before inspect stole focus, so it can be
+// restored when inspect stops (see setRasterPixelInspect).
+let rasterInspectPriorSelection: string | null = null;
+
+/**
+ * Drives the raster control's pixel-inspect mode for a raster/COG layer so the
+ * Layers-panel Identify action can read source band values on map click — the
+ * same behavior as the raster panel's Inspect button. Selects the target raster
+ * before enabling so the inspector reads the right layer, then restores the
+ * panel's prior selection when inspect stops so it doesn't silently steal focus
+ * from a raster the user had selected for editing. No-ops when the control
+ * isn't mounted (no raster layer exists yet).
+ *
+ * @param layerId - The raster/COG layer id to inspect.
+ * @param enabled - True to start inspecting, false to stop.
+ */
+export function setRasterPixelInspect(layerId: string, enabled: boolean): void {
+  if (!rasterControl) return;
+  const manager = (rasterControl as unknown as RasterControlInternals)
+    ._layerManager;
+  if (enabled) {
+    rasterInspectPriorSelection = manager?.selectedId ?? null;
+    rasterControl.selectRaster(layerId);
+    rasterControl.setInspect(true);
+  } else {
+    rasterControl.setInspect(false);
+    // Restore the prior selection only if inspect actually changed it.
+    if (rasterInspectPriorSelection !== layerId) {
+      rasterControl.selectRaster(rasterInspectPriorSelection);
+    }
+    rasterInspectPriorSelection = null;
+  }
 }
 
 /**
@@ -306,7 +447,6 @@ async function ensureRasterControl(
     // not its constructor.
     activateRasterClassification(rasterControl);
     hideRasterControl(rasterControl);
-    disableRasterClickOutsideCollapse(rasterControl);
     wireRasterCloseButton(rasterControl);
     applyRasterPanelClass(rasterControl);
   }
@@ -344,7 +484,13 @@ function createRasterControl(
   const control = new RasterControlClass({
     className: "geolibre-raster-control",
     collapsed: true,
-    defaultUrl: DEFAULT_RASTER_URL,
+    // No prefilled URL: the input stays empty (the upstream control supplies
+    // a generic COG-URL placeholder), and the sample COGs below are the
+    // explicit, opt-in way to load a demonstration raster.
+    sampleData: SAMPLE_RASTER_DATASETS,
+    // The panel doubles as the Add Raster Layer dialog, so it stays open
+    // until the user closes it; clicking the map must not collapse it.
+    closeOnOutsideClick: false,
     interleaved: rasterControlInterleaved,
     panelWidth: 380,
     title: "Add Raster Layer",
@@ -358,12 +504,86 @@ function createRasterControl(
     control.on(event, () => syncRasterLayersToStoreForRuntime(control));
   }
   // Free the per-layer classification GPU texture when its raster is dropped.
+  // The control owns the File-backed bytes blob (source.objectUrl) and revokes
+  // it on removeRaster, so there is nothing to clean up here for that.
   control.on("rasterremove", (event) => {
-    if (event.layerId) disposeRasterClassification(event.layerId);
+    if (!event.layerId) return;
+    disposeRasterClassification(event.layerId);
+  });
+  // A striped (non-tiled) GeoTIFF cannot be streamed as tiles, so the upstream
+  // fails the layer with a "not tiled" error. Offer the registered host handler
+  // a chance to convert it to a COG instead of leaving the user with a blank,
+  // errored layer. See opengeos/GeoLibre#789.
+  control.on("error", (event) => {
+    if (!event.layerId || !nonTiledRasterHandler) return;
+    const layerId = event.layerId;
+    if (nonTiledInFlight.has(layerId)) return;
+    const info = control.getRaster(layerId);
+    if (!info || !isNonTiledRasterError(info.error)) return;
+    // Re-read the original bytes so the host can convert them to a COG: a local
+    // file from its blob URL, a remote URL by fetching it whole. In the browser
+    // the remote fetch needs the server to allow CORS, which it normally has
+    // already (the panel range-fetched the header to detect "not tiled"); the
+    // Tauri build can patch the header read to go through Tauri commands, so a
+    // non-CORS URL can still reach here and the fetch below then fails -- it
+    // degrades safely to the host's download-failed message, not a crash. See
+    // opengeos/GeoLibre#916. The explicit per-kind check (rather than a file/else
+    // ternary) means a future source kind without a fetchable URL bails here
+    // instead of silently passing fetch(undefined), which would request the
+    // current page.
+    const bytesUrl =
+      info.source.kind === "file"
+        ? info.source.objectUrl
+        : info.source.kind === "url"
+          ? info.source.url
+          : undefined;
+    if (!bytesUrl) return;
+    // A remote URL streams the whole file over the network when read; a local
+    // file's blob URL resolves instantly. The host confirms before the download.
+    const bytesAreRemote = info.source.kind === "url";
+    const handler = nonTiledRasterHandler;
+    nonTiledInFlight.add(layerId);
+    // Invoke inside the promise chain so even a synchronous throw from the
+    // handler still clears the in-flight guard via finally. Clears once handling
+    // settles (converted, cancelled, or failed) so a later retry can prompt
+    // again.
+    void Promise.resolve()
+      .then(() =>
+        handler({
+          layerId,
+          name: info.name,
+          bytesAreRemote,
+          readBytes: async () => {
+            // Only bound the remote download; a local blob URL resolves from
+            // memory in microseconds, so a timeout timer there is pure overhead.
+            const response = await fetch(
+              bytesUrl,
+              bytesAreRemote
+                ? { signal: AbortSignal.timeout(NON_TILED_FETCH_TIMEOUT_MS) }
+                : undefined,
+            );
+            if (!response.ok) {
+              throw new Error(
+                `Failed to read raster bytes: ${response.status}`,
+              );
+            }
+            return new Uint8Array(await response.arrayBuffer());
+          },
+          dismiss: () => {
+            // removeRaster emits 'rasterremove', which syncs the removal into
+            // the store and revokes any retained blob URL.
+            control.removeRaster(layerId);
+          },
+        }),
+      )
+      .catch((error: unknown) =>
+        console.error("[GeoLibre] Non-tiled raster handler failed", error),
+      )
+      .finally(() => nonTiledInFlight.delete(layerId));
   });
   // syncRasterLayersToStore re-reads getState().collapsed when these fire.
   // Safe: expand()/collapse() delegate to toggle(), which flips
-  // _state.collapsed BEFORE emitting the event (verified against v0.2.0) --
+  // _state.collapsed BEFORE emitting the event (verified against v0.6.3) --
   // re-verify that ordering when bumping the dependency.
   const panelStateSyncHandler: RasterControlEventHandler = () =>
     syncRasterLayersToStoreForRuntime(control);
@@ -547,7 +767,6 @@ function applyRestoredRasterPanelState(
       control.expand();
       wireRasterCloseButton(control);
       applyRasterPanelClass(control);
-      disableRasterClickOutsideCollapse(control);
     } catch (error) {
       console.error("[GeoLibre] Failed to restore raster panel state", error);
     }
@@ -565,18 +784,6 @@ function rasterPanelCollapsedFromLayers(
   // Older projects did not persist this UI state. Keep them collapsed so
   // loading a raster project does not unexpectedly open the Add Data panel.
   return typeof panelCollapsed === "boolean" ? panelCollapsed : true;
-}
-
-// The control collapses its panel when the user clicks anywhere else on the
-// page, which fights the panel's role as the Add Raster Layer dialog (e.g.
-// panning the map to inspect a loaded COG would close it). Removing the
-// handler keeps the panel open until the user closes it explicitly.
-function disableRasterClickOutsideCollapse(control: RasterControl): void {
-  const internals = control as unknown as RasterControlInternals;
-  const handler = internals._clickOutsideHandler;
-  if (!handler) return;
-  document.removeEventListener("click", handler);
-  internals._clickOutsideHandler = null;
 }
 
 // The upstream stylesheet themes the panel from prefers-color-scheme (the

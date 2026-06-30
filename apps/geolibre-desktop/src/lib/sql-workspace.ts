@@ -13,6 +13,7 @@ import {
   quoteSqlString,
   rowsFromResult,
 } from "./duckdb-vector-loader";
+import { GDAL_AUTO_FID_COLUMN, stripAutoFidColumn } from "./duckdb-geometry";
 
 // Hidden column appended to the user's query so geometry can be returned as
 // GeoJSON for the "Add as layer" / export paths without disturbing the columns
@@ -222,6 +223,68 @@ export function previewLayerTables(
   }));
 }
 
+/** A loaded layer's queryable table name and the columns its table exposes. */
+export interface SqlWorkspaceTableColumns {
+  /** SQL identifier the user references in queries. */
+  tableName: string;
+  /** Column names available on the table (attributes plus the `geom` geometry). */
+  columns: string[];
+}
+
+// The geometry column the DuckDB and PGlite engines materialise for a registered
+// GeoJSON layer. The Sedona engine names it `geometry` instead, so the caller
+// passes the engine-appropriate name (see previewLayerColumns).
+const DEFAULT_LAYER_GEOMETRY_COLUMN = "geom";
+// Cap how many features are scanned for property keys so a huge layer cannot
+// make the (synchronous) autocomplete walk the whole collection.
+const COLUMN_SCAN_FEATURE_LIMIT = 50;
+
+/**
+ * Compute, without touching DuckDB, the columns each layer table will expose so
+ * the editor can autocomplete column names. Attribute columns come from the
+ * union of feature property keys (scanning a bounded number of features); the
+ * registered geometry column is appended.
+ *
+ * The result is a heuristic, not an exhaustive schema: only the first
+ * {@link COLUMN_SCAN_FEATURE_LIMIT} features are scanned, so a property that
+ * appears only in later features of a sparse layer may be omitted from the
+ * completions (the query itself still works).
+ *
+ * @param layers Current app layers; those without `geojson` are skipped.
+ * @param geometryColumn The geometry column name the active engine registers
+ *   (`geom` for DuckDB/PGlite, `geometry` for Sedona). Defaults to `geom`.
+ * @returns Table name and its column names, in the same naming as registration.
+ */
+export function previewLayerColumns(
+  layers: GeoLibreLayer[],
+  geometryColumn: string = DEFAULT_LAYER_GEOMETRY_COLUMN,
+): SqlWorkspaceTableColumns[] {
+  return assignTableNames(layers).map(({ layer, tableName }) => {
+    const seen = new Set<string>();
+    // Lowercased keys so the geometry column is not offered twice when a
+    // property already provides it under different casing (e.g. "GEOM").
+    const seenLower = new Set<string>();
+    const columns: string[] = [];
+    const features = layer.geojson?.features ?? [];
+    for (const feature of features.slice(0, COLUMN_SCAN_FEATURE_LIMIT)) {
+      const properties = feature.properties;
+      if (!properties) continue;
+      for (const key of Object.keys(properties)) {
+        // Skip GDAL's synthetic FID: it is dropped from registered layers, so
+        // offering it as a completion would only mislead.
+        if (key === GDAL_AUTO_FID_COLUMN || seen.has(key)) continue;
+        seen.add(key);
+        seenLower.add(key.toLowerCase());
+        columns.push(key);
+      }
+    }
+    if (!seenLower.has(geometryColumn.toLowerCase())) {
+      columns.push(geometryColumn);
+    }
+    return { tableName, columns };
+  });
+}
+
 /**
  * Register every loaded layer that carries an in-memory GeoJSON FeatureCollection
  * as a DuckDB table, so user SQL can query the current map data by layer name.
@@ -253,8 +316,15 @@ export async function registerLayerTables(
   const registered: SqlWorkspaceTable[] = [];
 
   for (const { layer, tableName } of assignTableNames(layers)) {
+    // assignTableNames already filters out layers without geojson; this guard
+    // narrows the optional `layer.geojson` to FeatureCollection for the call
+    // below (TypeScript does not carry the filter's narrowing across functions).
+    if (!layer.geojson) continue;
     const fileName = `${filePrefix}__${tableName}.geojson`;
-    await db.registerFileText(fileName, JSON.stringify(layer.geojson));
+    await db.registerFileText(
+      fileName,
+      JSON.stringify(stripAutoFidColumn(layer.geojson)),
+    );
     // Track immediately after registration so a failure in the CREATE TABLE
     // below still leaves this file in the cleanup list.
     registeredFiles?.push(fileName);
@@ -588,6 +658,13 @@ export function rowsToFeatureCollection(
     const properties: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(row)) {
       if (key === GEOMETRY_JSON_COLUMN || key === geometryColumn) continue;
+      // Drop GDAL's synthetic FID so a SQL-result layer never carries the
+      // OGC_FID artefact into its attributes/exports — and so re-reading it
+      // can't trigger the duplicate-column Binder Error (issue #499).
+      // stripAutoFidColumn remains the belt-and-braces guard at registration
+      // time for layers that arrive via other paths (drag-drop, project
+      // restore, plugins) and already carry OGC_FID.
+      if (key === GDAL_AUTO_FID_COLUMN) continue;
       if (value instanceof Uint8Array) continue;
       properties[key] = normalizeValue(value);
     }

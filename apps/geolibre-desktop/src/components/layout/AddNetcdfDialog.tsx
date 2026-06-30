@@ -1,4 +1,5 @@
 import { useRef, useState, type FormEvent } from "react";
+import { useTranslation } from "react-i18next";
 import {
   addCloudNetcdfLayer,
   listKerchunkVariables,
@@ -19,6 +20,7 @@ import {
   Select,
 } from "@geolibre/ui";
 import { Boxes } from "lucide-react";
+import { SampleDataSelect } from "./add-data/shared";
 
 // A real sample: NOAA NCEP/NCAR Reanalysis surface air temperature, stored as a
 // Cloud-Optimized NetCDF and served from Source Cooperative (CORS-enabled,
@@ -44,7 +46,8 @@ export function AddNetcdfDialog({
   appApi,
   onOpenChange,
 }: AddNetcdfDialogProps) {
-  const [url, setUrl] = useState(SAMPLE_URL);
+  const { t } = useTranslation();
+  const [url, setUrl] = useState("");
   const [variables, setVariables] = useState<KerchunkVariable[]>([]);
   const [variable, setVariable] = useState("");
   // The normalized reference from the last successful load, reused on submit so
@@ -69,7 +72,7 @@ export function AddNetcdfDialog({
 
   const reset = () => {
     opGen.current += 1;
-    setUrl(SAMPLE_URL);
+    setUrl("");
     setVariables([]);
     setVariable("");
     setLoadedRefs(null);
@@ -78,6 +81,25 @@ export function AddNetcdfDialog({
     setClimMax("");
     setError(null);
     setStatus(null);
+    setLoadingVars(false);
+    setAdding(false);
+  };
+
+  // Invalidate everything tied to the previously loaded manifest when the URL
+  // changes (sample pick or manual edit), and bump opGen so an in-flight
+  // variable load for the old URL cannot write back into state. Bumping opGen
+  // makes that load's finally skip its own setLoadingVars(false), so the flags
+  // are cleared here too (otherwise Load variables stays disabled).
+  const invalidateLoadedManifest = () => {
+    opGen.current += 1;
+    setVariables([]);
+    setVariable("");
+    setLoadedRefs(null);
+    setDimIndex({});
+    setClimMin("");
+    setClimMax("");
+    setStatus(null);
+    setError(null);
     setLoadingVars(false);
     setAdding(false);
   };
@@ -178,6 +200,13 @@ export function AddNetcdfDialog({
         </DialogHeader>
 
         <form className="space-y-4" onSubmit={handleSubmit}>
+          <SampleDataSelect
+            samples={[{ label: t("addData.netcdf.sampleLabel"), value: SAMPLE_URL }]}
+            onSelect={(sampleUrl) => {
+              invalidateLoadedManifest();
+              setUrl(sampleUrl);
+            }}
+          />
           <div className="space-y-1.5">
             <Label htmlFor="netcdf-url">Kerchunk reference URL</Label>
             <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
@@ -186,13 +215,8 @@ export function AddNetcdfDialog({
                 placeholder="https://example.com/data.kerchunk.json"
                 value={url}
                 onChange={(event) => {
+                  invalidateLoadedManifest();
                   setUrl(event.target.value);
-                  // Invalidate variables loaded from a different URL.
-                  setVariables([]);
-                  setVariable("");
-                  setLoadedRefs(null);
-                  setStatus(null);
-                  setError(null);
                 }}
               />
               <Button
@@ -204,9 +228,12 @@ export function AddNetcdfDialog({
                 {loadingVars ? "Loading..." : "Load variables"}
               </Button>
             </div>
+            {/* This dialog's prose is intentionally left in English for now:
+                it predates the Add Data i18n catalog and is out of scope for
+                this PR (only the new sample label is routed through t()). */}
             <p className="text-xs text-muted-foreground">
-              Pre-filled with a sample NOAA air-temperature dataset. Click Load
-              variables to try it, or paste your own kerchunk reference URL.
+              Choose a sample dataset above, or paste your own kerchunk
+              reference URL, then click Load variables.
             </p>
           </div>
 

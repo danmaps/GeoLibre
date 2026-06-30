@@ -11,15 +11,26 @@ import {
   useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
 import { isDuckDBQueryLayer, useAppStore } from "@geolibre/core";
 import type { GeoLibreLayer, LayerGroup } from "@geolibre/core";
+import type { FeatureCollection } from "geojson";
 import {
+  buildTimeBinding,
   canEditLayerGeometry,
+  detectTimeProperties,
+  getLayerTimeBinding,
+  RASTER_SOURCE_KIND,
   reloadVectorControlLayer,
+  TIME_SLIDER_PLUGIN_ID,
+  type TimePropertyCandidate,
 } from "@geolibre/plugins";
 import type { MapController } from "@geolibre/map";
 import { isPlaceholderLayer, placeholderMessage } from "@geolibre/map";
 import { getIsMobileViewport } from "../../hooks/useIsMobileViewport";
+import { createAppAPI, usePluginRegistry } from "../../hooks/usePlugins";
+import { useDesktopSettingsStore } from "../../hooks/useDesktopSettings";
+import { activeInterfaceProfile } from "../../lib/ui-profile";
 import {
   Button,
   Dialog,
@@ -43,6 +54,7 @@ import {
   Slider,
 } from "@geolibre/ui";
 import {
+  CalendarClock,
   ChevronDown,
   ChevronRight,
   ChevronUp,
@@ -58,6 +70,7 @@ import {
   Layers,
   MoreHorizontal,
   MousePointerClick,
+  Palette,
   PanelLeftClose,
   PanelLeftOpen,
   Pencil,
@@ -69,6 +82,7 @@ import {
   Trash2,
   ZoomIn,
 } from "lucide-react";
+import { clamp } from "../../lib/clamp";
 import {
   getLayerRefreshConfig,
   isRefreshableLayer,
@@ -78,6 +92,10 @@ import {
   setLayerRefreshConfig,
 } from "../../lib/layer-refresh";
 import {
+  canExportRasterLayer,
+  exportRasterLayer,
+} from "../../lib/raster-export";
+import {
   exportVectorLayer,
   geojsonVectorSourceId,
   resolveLayerGeojson,
@@ -85,6 +103,8 @@ import {
   shapefileFieldWarnings,
   type VectorExportFormat,
 } from "../../lib/vector-export";
+import { BasemapPickerDialog } from "./BasemapPickerDialog";
+import { LayerPanelPlaceSearch } from "./LayerPanelPlaceSearch";
 
 interface LayerPanelProps {
   mapControllerRef: RefObject<MapController | null>;
@@ -97,6 +117,30 @@ interface LayerPanelProps {
   onCancelGeometryEdit: () => void;
   /** Materialize a DuckDB query layer into an editable GeoJSON layer. */
   onMaterializeDuckDBLayer: (layer: GeoLibreLayer) => void;
+  /** Open the floating Add Raster Layer panel for advanced raster styling. */
+  onOpenRasterStylePanel: () => void;
+  /**
+   * When this flips to `true` the panel collapses to its thin rail (it is not
+   * unmounted). Used to clear room for a story map presentation; the user can
+   * still expand it again, and the prior state is restored when it flips off.
+   */
+  autoCollapse?: boolean;
+  /**
+   * Controlled collapse state for the shared left-sidebar (`replace-layers`)
+   * mode. When defined, the panel's own collapse state is ignored and the parent
+   * fully owns expand/collapse (the buttons call {@link onCollapsedChange} and
+   * `autoCollapse` no longer applies). Mirrors StylePanel. Leave undefined for
+   * the standalone panel.
+   */
+  collapsed?: boolean;
+  /** Notify the parent of a collapse/expand request in controlled mode. */
+  onCollapsedChange?: (collapsed: boolean) => void;
+  /**
+   * In the shared left-sidebar mode, suppress the panel's own collapsed rail:
+   * when collapsed the panel renders nothing because a single shared rail (owned
+   * by the host) lists the Layers entry instead of two adjacent rails.
+   */
+  hideOwnRail?: boolean;
 }
 
 const BACKGROUND_SELECTION_ID = "__geolibre-background__";
@@ -122,11 +166,162 @@ type LayerRefreshTimer = {
   timer: number;
 };
 
-function layerTypeLabel(layer: GeoLibreLayer): string {
+function layerTypeLabel(
+  layer: GeoLibreLayer,
+  t: TFunction,
+): string {
+  if (layer.metadata?.sourceKind === "maplibre-basemap-control") {
+    return t("layers.typeBasemap");
+  }
   if (layer.type === "geojson" || layer.type === "vector-tiles") {
     return "vector";
   }
   return layer.type;
+}
+
+function sourceUrlsFromLayer(layer: GeoLibreLayer): string[] {
+  if (layer.type !== "video" || !Array.isArray(layer.source.urls)) {
+    return [];
+  }
+  return layer.source.urls.filter(
+    (value): value is string =>
+      typeof value === "string" && value.trim().length > 0,
+  );
+}
+
+function layerMetadataPayload(layer: GeoLibreLayer): Record<string, unknown> {
+  const videoSourceUrls = sourceUrlsFromLayer(layer);
+  return {
+    ...layer.metadata,
+    layerName: layer.name,
+    layerType: layer.type,
+    ...(videoSourceUrls.length > 0
+      ? {
+          sourceUrl: videoSourceUrls[0],
+          ...(videoSourceUrls[1]
+            ? { fallbackSourceUrl: videoSourceUrls[1] }
+            : {}),
+        }
+      : {}),
+    sourcePath: layer.sourcePath,
+  };
+}
+
+interface LayerOpacitySliderProps {
+  label: string;
+  ariaLabel: string;
+  value: number;
+  onChange: (value: number) => void;
+}
+
+// Opacity control for the layer panel cards: a compact slider paired with a
+// value readout that, on double-click, swaps to an inline numeric input so the
+// user can type an exact value instead of dragging to it. This mirrors the
+// Style panel's RasterStyleSlider (#832) to keep interaction parity between the
+// two panels (#838). Enter/blur commits the clamped value, Escape cancels.
+function LayerOpacitySlider({
+  label,
+  ariaLabel,
+  value,
+  onChange,
+}: LayerOpacitySliderProps) {
+  const { t } = useTranslation();
+  const min = 0;
+  const max = 1;
+  const step = 0.05;
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  // Guard so each edit session commits (or cancels) at most once: Enter and
+  // Escape both tear down the input, and React still fires onBlur on the
+  // unmounting element. Without this, blur would re-commit after Enter or
+  // commit a cancelled draft after Escape.
+  const handledRef = useRef(false);
+
+  const commit = (raw: string) => {
+    if (handledRef.current) return;
+    handledRef.current = true;
+    const parsed = Number(raw);
+    // Treat an empty/whitespace entry like Escape: cancel rather than commit 0
+    // (Number("") === 0 would otherwise silently reset the slider to its min).
+    if (raw.trim() !== "" && Number.isFinite(parsed)) {
+      onChange(Number(clamp(parsed, min, max).toFixed(2)));
+    }
+    setEditing(false);
+  };
+
+  const cancel = () => {
+    handledRef.current = true;
+    setEditing(false);
+  };
+
+  const startEditing = () => {
+    // The slider stays mounted while editing, so a second double-click on its
+    // track must not re-enter and clobber the in-progress draft (the value
+    // button is unmounted while editing, so it cannot re-trigger this).
+    if (editing) return;
+    handledRef.current = false;
+    setDraft(value.toFixed(2));
+    setEditing(true);
+  };
+
+  return (
+    <div className="mt-2 flex items-center gap-1">
+      <span className="text-[10px] text-muted-foreground">{label}</span>
+      <Slider
+        aria-label={ariaLabel}
+        className="flex-1"
+        min={min}
+        max={max}
+        step={step}
+        value={[value]}
+        onValueChange={([v]: number[]) => onChange(v ?? value)}
+        onClick={(e: ReactMouseEvent) => e.stopPropagation()}
+        onDoubleClick={(e: ReactMouseEvent) => {
+          e.stopPropagation();
+          startEditing();
+        }}
+      />
+      {editing ? (
+        <Input
+          type="number"
+          min={min}
+          max={max}
+          step={step}
+          autoFocus
+          aria-label={t("layers.opacityValueInputAria", { label: ariaLabel })}
+          className="h-6 w-12 px-1 py-0 text-right font-mono text-[10px] [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onClick={(e: ReactMouseEvent) => e.stopPropagation()}
+          onBlur={(e) => commit(e.target.value)}
+          onKeyDown={(e) => {
+            e.stopPropagation();
+            if (e.key === "Enter") {
+              e.preventDefault();
+              commit((e.target as HTMLInputElement).value);
+            } else if (e.key === "Escape") {
+              e.preventDefault();
+              cancel();
+            }
+          }}
+        />
+      ) : (
+        <button
+          type="button"
+          className="w-9 shrink-0 cursor-text text-right font-mono text-[10px] tabular-nums text-muted-foreground hover:text-foreground"
+          title={t("layers.opacityExactHint")}
+          aria-label={t("layers.opacityValueEditAria", { label: ariaLabel })}
+          onClick={(e: ReactMouseEvent) => e.stopPropagation()}
+          onDoubleClick={(e: ReactMouseEvent) => {
+            e.stopPropagation();
+            startEditing();
+          }}
+        >
+          {value.toFixed(2)}
+        </button>
+      )}
+    </div>
+  );
 }
 
 function refreshIntervalOptionValue(intervalMs: number): string {
@@ -165,8 +360,16 @@ export function LayerPanel({
   onToggleGeometryEdit,
   onCancelGeometryEdit,
   onMaterializeDuckDBLayer,
+  onOpenRasterStylePanel,
+  autoCollapse = false,
+  collapsed: controlledCollapsed,
+  onCollapsedChange,
+  hideOwnRail = false,
 }: LayerPanelProps) {
   const { t } = useTranslation();
+  const isBeginnerProfile = useDesktopSettingsStore(
+    (s) => activeInterfaceProfile(s.desktopSettings.uiProfile) === "beginner",
+  );
   const layers = useAppStore((s) => s.layers);
   const layerGroups = useAppStore((s) => s.layerGroups);
   const addLayerGroup = useAppStore((s) => s.addLayerGroup);
@@ -196,6 +399,13 @@ export function LayerPanel({
   const setAttributeTableOpen = useAppStore((s) => s.setAttributeTableOpen);
   const [editingLayerId, setEditingLayerId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
+  const [basemapPickerOpen, setBasemapPickerOpen] = useState(false);
+  // Transient note shown when the user double-clicks the Background name (the
+  // rename gesture on every other layer). The background name is fixed, so
+  // instead of staying silent we surface a short-lived message explaining why
+  // (#838). The timer ref clears it after the standard status duration.
+  const [backgroundNameNotice, setBackgroundNameNotice] = useState(false);
+  const backgroundNoticeTimerRef = useRef<number | null>(null);
   const [metadataLayer, setMetadataLayer] = useState<GeoLibreLayer | null>(
     null,
   );
@@ -209,7 +419,67 @@ export function LayerPanel({
   >({});
   const [refreshIntervalChoice, setRefreshIntervalChoice] = useState("0");
   const [customRefreshSeconds, setCustomRefreshSeconds] = useState("");
-  const [isCollapsed, setIsCollapsed] = useState(getIsMobileViewport);
+  // Time Slider binding dialog: the target layer, the detected timestamp
+  // columns, the chosen property, and the window width. `candidates` is null
+  // while the layer's features are still being inspected.
+  const [bindTimeSliderLayerId, setBindTimeSliderLayerId] = useState<
+    string | null
+  >(null);
+  const [bindCandidates, setBindCandidates] = useState<
+    TimePropertyCandidate[] | null
+  >(null);
+  const [bindProperty, setBindProperty] = useState("");
+  const [bindWindowMode, setBindWindowMode] = useState<
+    "step" | "wide" | "wider"
+  >("step");
+  // Feature collection resolved when the bind dialog opens, reused on confirm so
+  // a large layer is scanned only once.
+  const [bindLayerGeojson, setBindLayerGeojson] =
+    useState<FeatureCollection | null>(null);
+  // Shown in the dialog when binding fails (e.g. the chosen property has no
+  // parseable timestamps) instead of closing the dialog with no feedback.
+  const [bindError, setBindError] = useState<string | null>(null);
+  // Monotonic token for the active bind request. Each open/close bumps it, so a
+  // stale async scan or confirm (even for the same layer reopened) is dropped
+  // when it no longer matches the latest token.
+  const bindRequestRef = useRef(0);
+  const { isActive: isPluginActive, toggle: togglePlugin } =
+    usePluginRegistry();
+  const [internalCollapsed, setInternalCollapsed] = useState(getIsMobileViewport);
+  // In the shared left-sidebar mode the parent owns collapse (controlled);
+  // otherwise the panel manages it locally. `setIsCollapsed` routes to whichever
+  // owner applies so every existing call site keeps working.
+  const isControlled = controlledCollapsed !== undefined;
+  const isCollapsed = isControlled ? controlledCollapsed : internalCollapsed;
+  const setIsCollapsed = useCallback(
+    (value: boolean) => {
+      if (isControlled) onCollapsedChange?.(value);
+      else setInternalCollapsed(value);
+    },
+    [isControlled, onCollapsedChange],
+  );
+  // Collapse to the rail when `autoCollapse` flips on (a story map starts
+  // presenting), and restore the prior expand/collapse state when it flips back
+  // off. Both act only on the transition so the user can still toggle the panel
+  // manually while `autoCollapse` stays on. `internalCollapsed` is in the deps
+  // only to keep the captured value fresh; the guards make pure collapse changes
+  // a no-op while `autoCollapse` is stable. Mirrors StylePanel's behavior. The
+  // ref starts as null (not `autoCollapse`) so a mount with `autoCollapse`
+  // already true reads as a null→true transition and still collapses. Skipped in
+  // controlled mode, where the parent (shared rail) owns collapse.
+  const prevAutoCollapse = useRef<boolean | null>(null);
+  const collapsedBeforeAuto = useRef(internalCollapsed);
+  useEffect(() => {
+    if (isControlled) return;
+    const wasAuto = prevAutoCollapse.current;
+    prevAutoCollapse.current = autoCollapse;
+    if (autoCollapse && !wasAuto) {
+      collapsedBeforeAuto.current = internalCollapsed;
+      setInternalCollapsed(true);
+    } else if (!autoCollapse && wasAuto) {
+      setInternalCollapsed(collapsedBeforeAuto.current);
+    }
+  }, [autoCollapse, internalCollapsed, isControlled]);
   const [draggedLayerId, setDraggedLayerId] = useState<string | null>(null);
   const [dropTargetLayerId, setDropTargetLayerId] = useState<string | null>(
     null,
@@ -258,6 +528,9 @@ export function LayerPanel({
   );
   const refreshSettingsLayer = refreshSettingsLayerId
     ? (layers.find((layer) => layer.id === refreshSettingsLayerId) ?? null)
+    : null;
+  const bindTimeSliderLayer = bindTimeSliderLayerId
+    ? (layers.find((layer) => layer.id === bindTimeSliderLayerId) ?? null)
     : null;
   const refreshSettingsConfig = refreshSettingsLayer
     ? getLayerRefreshConfig(refreshSettingsLayer)
@@ -360,6 +633,26 @@ export function LayerPanel({
     setEditingLayerId(null);
     setEditingName("");
   };
+
+  const showBackgroundNameNotice = useCallback(() => {
+    if (backgroundNoticeTimerRef.current !== null) {
+      window.clearTimeout(backgroundNoticeTimerRef.current);
+    }
+    setBackgroundNameNotice(true);
+    backgroundNoticeTimerRef.current = window.setTimeout(() => {
+      backgroundNoticeTimerRef.current = null;
+      setBackgroundNameNotice(false);
+    }, REFRESH_STATUS_DURATION_MS);
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (backgroundNoticeTimerRef.current !== null) {
+        window.clearTimeout(backgroundNoticeTimerRef.current);
+      }
+    },
+    [],
+  );
 
   const clearRefreshStatusTimer = useCallback((layerId: string) => {
     const timer = refreshStatusTimersRef.current.get(layerId);
@@ -548,6 +841,143 @@ export function LayerPanel({
     [clearRefreshStatusTimer, mapControllerRef, scheduleStatusClear],
   );
 
+  // Close the bind dialog and invalidate any in-flight scan/confirm so a late
+  // async result cannot reopen it, write stale candidates, or bind after cancel.
+  const closeBindTimeSliderDialog = useCallback(() => {
+    bindRequestRef.current += 1;
+    setBindTimeSliderLayerId(null);
+  }, []);
+
+  // Open the bind dialog: inspect the layer's features for timestamp columns and
+  // preselect the best-covered one. `candidates` stays null until detection
+  // finishes so the dialog can show a "scanning" state for large layers.
+  const openBindTimeSliderDialog = useCallback(
+    async (layer: GeoLibreLayer) => {
+      // Tag this request with a fresh token so a stale async scan (open ->
+      // close/reopen, even for the same layer) cannot populate this dialog.
+      const token = (bindRequestRef.current += 1);
+      setBindTimeSliderLayerId(layer.id);
+      setBindCandidates(null);
+      setBindProperty("");
+      setBindWindowMode("step");
+      setBindLayerGeojson(null);
+      setBindError(null);
+      try {
+        const geojson = await resolveLayerGeojson(
+          layer,
+          mapControllerRef.current?.getMap() ?? undefined,
+        );
+        if (bindRequestRef.current !== token) return;
+        const candidates = detectTimeProperties(geojson ?? undefined);
+        setBindLayerGeojson(geojson ?? null);
+        setBindCandidates(candidates);
+        if (candidates.length > 0) setBindProperty(candidates[0].property);
+      } catch {
+        if (bindRequestRef.current !== token) return;
+        setBindCandidates([]);
+      }
+    },
+    [mapControllerRef],
+  );
+
+  // Commit a binding: persist it on the layer metadata and activate the Time
+  // Slider so it adopts the binding and drives the filter. Styling/opacity are
+  // untouched; only the visible feature set narrows as the timeline moves.
+  const confirmBindTimeSlider = useCallback(async () => {
+    const layer = bindTimeSliderLayer;
+    if (!layer || !bindProperty) return;
+    const token = bindRequestRef.current;
+    // Reuse the feature collection resolved when the dialog opened so large
+    // layers are not scanned twice.
+    const geojson =
+      bindLayerGeojson ??
+      (await resolveLayerGeojson(
+        layer,
+        mapControllerRef.current?.getMap() ?? undefined,
+      ));
+    // If the dialog was cancelled (or reopened for another layer) while the
+    // fallback scan was in flight, abandon this commit.
+    if (bindRequestRef.current !== token) return;
+    const binding = buildTimeBinding(geojson ?? undefined, bindProperty);
+    if (!binding) {
+      // Keep the dialog open and explain why, rather than closing silently.
+      setBindError(t("layers.bindNoTimestamps"));
+      return;
+    }
+    const timeWindow =
+      bindWindowMode === "wider"
+        ? { unit: binding.granularity, before: 3, after: 3 }
+        : bindWindowMode === "wide"
+          ? { unit: binding.granularity, before: 1, after: 1 }
+          : { unit: binding.granularity, before: 0, after: 1 };
+    updateLayer(layer.id, {
+      metadata: { ...layer.metadata, timeBinding: { ...binding, window: timeWindow } },
+      timeFilter: undefined,
+    });
+    if (!isPluginActive(TIME_SLIDER_PLUGIN_ID)) {
+      togglePlugin(TIME_SLIDER_PLUGIN_ID, createAppAPI(mapControllerRef));
+    }
+    closeBindTimeSliderDialog();
+  }, [
+    bindTimeSliderLayer,
+    bindLayerGeojson,
+    bindProperty,
+    bindWindowMode,
+    mapControllerRef,
+    updateLayer,
+    isPluginActive,
+    togglePlugin,
+    closeBindTimeSliderDialog,
+    t,
+  ]);
+
+  // Remove a layer's binding and clear its transient time filter so it shows
+  // every feature again. The Time Slider stays active for any other bindings.
+  const handleUnbindTimeSlider = useCallback(
+    (layer: GeoLibreLayer) => {
+      const { timeBinding: _removed, ...metadata } = layer.metadata as Record<
+        string,
+        unknown
+      >;
+      updateLayer(layer.id, { metadata, timeFilter: undefined });
+    },
+    [updateLayer],
+  );
+
+  const handleExportRasterLayer = useCallback(
+    async (layer: GeoLibreLayer) => {
+      clearRefreshStatusTimer(layer.id);
+      try {
+        const savedPath = await exportRasterLayer(
+          layer,
+          sanitizeExportFileName(layer.name),
+        );
+        // A null path means the user cancelled the save dialog, so no note.
+        if (savedPath !== null) {
+          setRefreshStatuses((current) => ({
+            ...current,
+            [layer.id]: {
+              type: "success",
+              message: t("layers.exportRasterSuccess"),
+            },
+          }));
+          scheduleStatusClear(layer.id);
+        }
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : t("layers.exportRasterError");
+        setRefreshStatuses((current) => ({
+          ...current,
+          [layer.id]: { type: "error", message },
+        }));
+        scheduleStatusClear(layer.id);
+      }
+    },
+    [clearRefreshStatusTimer, scheduleStatusClear, t],
+  );
+
   // Read through a ref inside interval callbacks so long-lived timers never
   // capture a stale handleRefreshLayer closure.
   const handleRefreshLayerRef = useRef(handleRefreshLayer);
@@ -561,6 +991,14 @@ export function LayerPanel({
       !layers.some((layer) => layer.id === refreshSettingsLayerId)
     ) {
       setRefreshSettingsLayerId(null);
+    }
+
+    if (
+      bindTimeSliderLayerId &&
+      !layers.some((layer) => layer.id === bindTimeSliderLayerId)
+    ) {
+      bindRequestRef.current += 1;
+      setBindTimeSliderLayerId(null);
     }
 
     if (
@@ -586,7 +1024,13 @@ export function LayerPanel({
       }
       return changed ? next : current;
     });
-  }, [clearRefreshStatusTimer, editingLayerId, layers, refreshSettingsLayerId]);
+  }, [
+    bindTimeSliderLayerId,
+    clearRefreshStatusTimer,
+    editingLayerId,
+    layers,
+    refreshSettingsLayerId,
+  ]);
 
   useEffect(() => {
     if (refreshSettingsIntervalMs === null) {
@@ -874,10 +1318,12 @@ export function LayerPanel({
                 <Pencil className="mr-2 h-3.5 w-3.5" />
                 {t("layers.renameGroup")}
               </DropdownMenuItem>
+              {/* Action items below omit preventDefault so Radix dismisses the
+                  menu on select; only the rename item above keeps it, so the
+                  menu's close does not race its input autofocus. */}
               <DropdownMenuItem
                 disabled={!canReorderGroup}
-                onSelect={(e: Event) => {
-                  e.preventDefault();
+                onSelect={() => {
                   reorderLayerGroup(group.id, "up");
                 }}
               >
@@ -886,8 +1332,7 @@ export function LayerPanel({
               </DropdownMenuItem>
               <DropdownMenuItem
                 disabled={!canReorderGroup}
-                onSelect={(e: Event) => {
-                  e.preventDefault();
+                onSelect={() => {
                   reorderLayerGroup(group.id, "down");
                 }}
               >
@@ -896,8 +1341,7 @@ export function LayerPanel({
               </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem
-                onSelect={(e: Event) => {
-                  e.preventDefault();
+                onSelect={() => {
                   removeLayerGroup(group.id);
                 }}
               >
@@ -906,8 +1350,7 @@ export function LayerPanel({
               </DropdownMenuItem>
               <DropdownMenuItem
                 className="text-destructive"
-                onSelect={(e: Event) => {
-                  e.preventDefault();
+                onSelect={() => {
                   removeLayerGroup(group.id, { removeChildren: true });
                 }}
               >
@@ -918,29 +1361,22 @@ export function LayerPanel({
           </DropdownMenu>
         </div>
         {!group.collapsed && (
-          <div className="mt-2 flex items-center gap-1">
-            <span className="text-[10px] text-muted-foreground">
-              {t("layers.groupOpacity")}
-            </span>
-            <Slider
-              aria-label={t("layers.groupOpacityAria", { name: group.name })}
-              className="flex-1"
-              min={0}
-              max={1}
-              step={0.05}
-              value={[group.opacity]}
-              onValueChange={([v]: number[]) =>
-                setLayerGroupOpacity(group.id, v ?? group.opacity)
-              }
-              onClick={(e: ReactMouseEvent) => e.stopPropagation()}
-            />
-          </div>
+          <LayerOpacitySlider
+            label={t("layers.groupOpacity")}
+            ariaLabel={t("layers.groupOpacityAria", { name: group.name })}
+            value={group.opacity}
+            onChange={(v) => setLayerGroupOpacity(group.id, v)}
+          />
         )}
       </div>
     );
   };
 
   if (isCollapsed) {
+    // In the shared left-sidebar mode the host renders a single rail listing
+    // Layers alongside the plugin panel, so the panel shows nothing of its own
+    // when collapsed (avoids two adjacent rails).
+    if (hideOwnRail) return null;
     return (
       <aside
         aria-label="Layers (collapsed)"
@@ -1023,7 +1459,9 @@ export function LayerPanel({
         <div className="space-y-1 p-2">
           {layers.length === 0 && (
             <p className="px-2 py-4 text-xs text-muted-foreground">
-              No data layers. Add data from the toolbar.
+              {isBeginnerProfile
+                ? t("layers.emptyBeginner")
+                : t("layers.empty")}
             </p>
           )}
           {emptyGroups.map((group) => (
@@ -1037,6 +1475,12 @@ export function LayerPanel({
               ? firstMemberIdByGroup.get(group.id) === layer.id
               : false;
             const groupCollapsed = group?.collapsed ?? false;
+            // When the parent group is hidden, a layer whose own visibility
+            // toggle is still on is not rendered — a surprising state. Grey its
+            // name out as a cue that the group-level setting is what's hiding
+            // it (issue #430). If the layer's own toggle is also off, the
+            // EyeOff icon already explains it, so skip the group cue then.
+            const groupHidden = group ? !group.visible && layer.visible : false;
             const canIdentify =
               layer.type === "geojson" ||
               isDuckDBQueryLayer(layer) ||
@@ -1051,8 +1495,24 @@ export function LayerPanel({
               layer.type === "vector-tiles" ||
               (layer.type === "mbtiles" &&
                 layer.metadata.tileType === "vector") ||
+              // COG layers identify pixel values via the raster control's pixel
+              // inspector (see useRasterIdentify), not the vector feature query.
+              layer.type === "cog" ||
               hasNativeIdentifyLayers(layer);
             const identifyActive = identifyLayerId === layer.id;
+            // COGs inspect raw pixel/band values rather than vector features, so
+            // the icon's tooltip reflects that distinct action.
+            const isPixelIdentify = layer.type === "cog";
+            // Shared by the button's title and aria-label so they can't diverge.
+            const identifyLabel = canIdentify
+              ? identifyActive
+                ? isPixelIdentify
+                  ? t("layers.identifyStopInspectPixels")
+                  : t("layers.identifyDeactivate")
+                : isPixelIdentify
+                  ? t("layers.identifyInspectPixels")
+                  : t("layers.identifyFeatures")
+              : t("layers.identifyUnavailable");
             const canEditGeometry = canEditLayerGeometry(layer);
             const geometryEditActive = geometryEditLayerId === layer.id;
             const geometryEditElsewhere =
@@ -1067,6 +1527,18 @@ export function LayerPanel({
             // Export writes the layer's GeoJSON features to disk; only
             // geojson-backed vector layers carry those features.
             const canExportLayer = layer.type === "geojson";
+            // Vector layers with a date/timestamp property can be driven by the
+            // Time Slider; the binding (if any) lives on the layer metadata.
+            const canBindTimeSlider = layer.type === "geojson";
+            const timeBinding = getLayerTimeBinding(layer);
+            // Raster/COG layers backed by a downloadable file (a retained
+            // local-bytes blob URL or a source URL) export to GeoTIFF.
+            const canExportRaster = canExportRasterLayer(layer);
+            // Rasters added through the floating Add Raster Layer panel are
+            // styled there; offer a shortcut to reopen that panel since it is
+            // dismissed (and its on-map icon removed) when closed.
+            const canEditRasterStyle =
+              layer.metadata.sourceKind === RASTER_SOURCE_KIND;
             const canRefresh = isRefreshableLayer(layer);
             const refreshConfig = getLayerRefreshConfig(layer);
             const refreshStatus = refreshStatuses[layer.id];
@@ -1158,8 +1630,14 @@ export function LayerPanel({
                     />
                   ) : (
                     <span
-                      className="flex-1 truncate text-sm font-medium"
-                      title="Double-click to rename"
+                      className={`flex-1 truncate text-sm font-medium ${
+                        groupHidden ? "text-muted-foreground" : ""
+                      }`}
+                      title={
+                        groupHidden
+                          ? `${t("layers.hiddenByGroup")} — ${t("layers.doubleClickToRename")}`
+                          : t("layers.doubleClickToRename")
+                      }
                       onDoubleClick={(e: ReactMouseEvent) => {
                         e.stopPropagation();
                         beginRename(layer);
@@ -1169,7 +1647,7 @@ export function LayerPanel({
                     </span>
                   )}
                   <span className="text-[10px] uppercase text-muted-foreground">
-                    {layerTypeLabel(layer)}
+                    {layerTypeLabel(layer, t)}
                   </span>
                 </div>
                 {isPlaceholderLayer(layer) && (
@@ -1224,23 +1702,12 @@ export function LayerPanel({
                     </Button>
                   </div>
                 )}
-                <div className="mt-2 flex items-center gap-1">
-                  <span className="text-[10px] text-muted-foreground">
-                    Opacity
-                  </span>
-                  <Slider
-                    aria-label={`Opacity for ${layer.name}`}
-                    className="flex-1"
-                    min={0}
-                    max={1}
-                    step={0.05}
-                    value={[layer.opacity]}
-                    onValueChange={([v]: number[]) =>
-                      setLayerOpacity(layer.id, v ?? layer.opacity)
-                    }
-                    onClick={(e: ReactMouseEvent) => e.stopPropagation()}
-                  />
-                </div>
+                <LayerOpacitySlider
+                  label={t("layers.opacity")}
+                  ariaLabel={t("layers.opacityFor", { name: layer.name })}
+                  value={layer.opacity}
+                  onChange={(v) => setLayerOpacity(layer.id, v)}
+                />
                 <div className="mt-2 flex gap-1">
                   <Button
                     variant="ghost"
@@ -1289,20 +1756,8 @@ export function LayerPanel({
                         ? "border border-primary bg-primary text-primary-foreground shadow-xs hover:bg-primary/90 hover:text-primary-foreground"
                         : ""
                     }`}
-                    title={
-                      canIdentify
-                        ? identifyActive
-                          ? "Deactivate identify"
-                          : "Identify features"
-                        : "Identify is only available for vector and WMS layers"
-                    }
-                    aria-label={
-                      canIdentify
-                        ? identifyActive
-                          ? "Deactivate identify"
-                          : "Identify features"
-                        : "Identify is only available for vector and WMS layers"
-                    }
+                    title={identifyLabel}
+                    aria-label={identifyLabel}
                     disabled={!canIdentify || geometryEditActive}
                     onClick={(e) => {
                       e.stopPropagation();
@@ -1348,9 +1803,13 @@ export function LayerPanel({
                         Rename
                       </DropdownMenuItem>
                       <DropdownMenuSeparator />
+                      {/* The Rename item above keeps preventDefault so the
+                          menu's close does not race its input autofocus. Every
+                          action item below has no such focus target, so each
+                          lets Radix dismiss the menu on select rather than
+                          leaving it pinned open. */}
                       <DropdownMenuItem
-                        onSelect={(e: Event) => {
-                          e.preventDefault();
+                        onSelect={() => {
                           addLayerGroup(undefined, [layer.id]);
                         }}
                       >
@@ -1368,8 +1827,7 @@ export function LayerPanel({
                               <DropdownMenuItem
                                 key={g.id}
                                 disabled={layer.groupId === g.id}
-                                onSelect={(e: Event) => {
-                                  e.preventDefault();
+                                onSelect={() => {
                                   moveLayerToGroup(layer.id, g.id);
                                 }}
                               >
@@ -1381,8 +1839,7 @@ export function LayerPanel({
                       )}
                       {layer.groupId && (
                         <DropdownMenuItem
-                          onSelect={(e: Event) => {
-                            e.preventDefault();
+                          onSelect={() => {
                             moveLayerToGroup(layer.id, null);
                           }}
                         >
@@ -1394,8 +1851,7 @@ export function LayerPanel({
                       {canMaterializeDuckDB && (
                         <>
                           <DropdownMenuItem
-                            onSelect={(e: Event) => {
-                              e.preventDefault();
+                            onSelect={() => {
                               onMaterializeDuckDBLayer(layer);
                             }}
                           >
@@ -1408,8 +1864,7 @@ export function LayerPanel({
                       {(canEditGeometry || geometryEditActive) && (
                         <DropdownMenuItem
                           disabled={geometryEditElsewhere}
-                          onSelect={(e: Event) => {
-                            e.preventDefault();
+                          onSelect={() => {
                             selectLayer(layer.id);
                             if (identifyActive) setIdentifyLayer(null);
                             onToggleGeometryEdit(layer.id);
@@ -1423,14 +1878,29 @@ export function LayerPanel({
                       )}
                       {canOpenAttributeTable && (
                         <DropdownMenuItem
-                          onSelect={(e: Event) => {
-                            e.preventDefault();
+                          onSelect={() => {
                             selectLayer(layer.id);
                             setAttributeTableOpen(true);
                           }}
                         >
                           <TableProperties className="mr-2 h-3.5 w-3.5" />
                           Open attribute table
+                        </DropdownMenuItem>
+                      )}
+                      {canBindTimeSlider && (
+                        <DropdownMenuItem
+                          onSelect={() => {
+                            if (timeBinding) {
+                              handleUnbindTimeSlider(layer);
+                            } else {
+                              void openBindTimeSliderDialog(layer);
+                            }
+                          }}
+                        >
+                          <CalendarClock className="mr-2 h-3.5 w-3.5" />
+                          {timeBinding
+                            ? t("layers.unbindFromTimeSlider")
+                            : t("layers.bindToTimeSlider")}
                         </DropdownMenuItem>
                       )}
                       {canExportLayer && (
@@ -1441,40 +1911,35 @@ export function LayerPanel({
                           </DropdownMenuSubTrigger>
                           <DropdownMenuSubContent>
                             <DropdownMenuItem
-                              onSelect={(e: Event) => {
-                                e.preventDefault();
+                              onSelect={() => {
                                 void handleExportLayer(layer, "geojson");
                               }}
                             >
                               GeoJSON
                             </DropdownMenuItem>
                             <DropdownMenuItem
-                              onSelect={(e: Event) => {
-                                e.preventDefault();
+                              onSelect={() => {
                                 void handleExportLayer(layer, "geoparquet");
                               }}
                             >
                               GeoParquet
                             </DropdownMenuItem>
                             <DropdownMenuItem
-                              onSelect={(e: Event) => {
-                                e.preventDefault();
+                              onSelect={() => {
                                 void handleExportLayer(layer, "geopackage");
                               }}
                             >
                               GeoPackage
                             </DropdownMenuItem>
                             <DropdownMenuItem
-                              onSelect={(e: Event) => {
-                                e.preventDefault();
+                              onSelect={() => {
                                 void handleExportLayer(layer, "shapefile");
                               }}
                             >
                               Shapefile (zipped)
                             </DropdownMenuItem>
                             <DropdownMenuItem
-                              onSelect={(e: Event) => {
-                                e.preventDefault();
+                              onSelect={() => {
                                 void handleExportLayer(layer, "csv");
                               }}
                             >
@@ -1483,10 +1948,37 @@ export function LayerPanel({
                           </DropdownMenuSubContent>
                         </DropdownMenuSub>
                       )}
+                      {canEditRasterStyle && (
+                        <DropdownMenuItem
+                          onSelect={() => {
+                            selectLayer(layer.id);
+                            onOpenRasterStylePanel();
+                          }}
+                        >
+                          <Palette className="mr-2 h-3.5 w-3.5" />
+                          {t("layers.openRasterStylePanel")}
+                        </DropdownMenuItem>
+                      )}
+                      {canExportRaster && (
+                        <DropdownMenuSub>
+                          <DropdownMenuSubTrigger>
+                            <Download className="h-3.5 w-3.5" />
+                            Export
+                          </DropdownMenuSubTrigger>
+                          <DropdownMenuSubContent>
+                            <DropdownMenuItem
+                              onSelect={() => {
+                                void handleExportRasterLayer(layer);
+                              }}
+                            >
+                              {t("layers.exportGeoTiff")}
+                            </DropdownMenuItem>
+                          </DropdownMenuSubContent>
+                        </DropdownMenuSub>
+                      )}
                       <DropdownMenuItem
                         disabled={!canRefresh || isRefreshing}
-                        onSelect={(e: Event) => {
-                          e.preventDefault();
+                        onSelect={() => {
                           void handleRefreshLayer(layer);
                         }}
                       >
@@ -1499,8 +1991,7 @@ export function LayerPanel({
                       </DropdownMenuItem>
                       <DropdownMenuItem
                         disabled={!canRefresh}
-                        onSelect={(e: Event) => {
-                          e.preventDefault();
+                        onSelect={() => {
                           setRefreshSettingsLayerId(layer.id);
                         }}
                       >
@@ -1558,16 +2049,24 @@ export function LayerPanel({
                 ? "border-primary bg-primary/5"
                 : "border-border bg-background hover:border-muted-foreground/40 hover:bg-muted/20"
             }`}
+            title={t("layers.doubleClickToChangeBasemap")}
             onClick={() => selectLayer(BACKGROUND_SELECTION_ID)}
+            onDoubleClick={() => setBasemapPickerOpen(true)}
             onKeyDown={(e) => {
               if (e.key === "Enter") selectLayer(BACKGROUND_SELECTION_ID);
+              // Keyboard equivalent of the double-click: Space opens the basemap
+              // picker (preventDefault stops the panel from scrolling).
+              if (e.key === " ") {
+                e.preventDefault();
+                setBasemapPickerOpen(true);
+              }
             }}
             role="button"
             tabIndex={0}
           >
             <div className="flex items-center gap-1">
               <span
-                title="Background cannot be reordered"
+                title={t("layers.backgroundCannotReorder")}
                 className="rounded p-0.5 text-muted-foreground/50"
               >
                 <GripVertical className="h-3.5 w-3.5" />
@@ -1575,9 +2074,15 @@ export function LayerPanel({
               <button
                 type="button"
                 className="rounded p-0.5 hover:bg-muted"
-                title={basemapVisible ? "Hide background" : "Show background"}
+                title={
+                  basemapVisible
+                    ? t("layers.hideBackground")
+                    : t("layers.showBackground")
+                }
                 aria-label={
-                  basemapVisible ? "Hide background" : "Show background"
+                  basemapVisible
+                    ? t("layers.hideBackground")
+                    : t("layers.showBackground")
                 }
                 onClick={(e) => {
                   e.stopPropagation();
@@ -1591,33 +2096,129 @@ export function LayerPanel({
                 )}
               </button>
               <Layers className="h-3.5 w-3.5 text-muted-foreground" />
-              <span className="flex-1 truncate text-sm font-medium">
-                Background
+              <span
+                className="flex-1 truncate text-sm font-medium"
+                title={t("layers.backgroundNameFixed")}
+                onDoubleClick={(e: ReactMouseEvent) => {
+                  // The card's own onDoubleClick opens the basemap picker; on
+                  // the name we instead explain that the name is fixed, since
+                  // that is where users attempt the rename gesture (#838).
+                  e.stopPropagation();
+                  showBackgroundNameNotice();
+                }}
+              >
+                {t("layers.background")}
               </span>
               <span className="text-[10px] uppercase text-muted-foreground">
-                basemap
+                {t("layers.typeBasemap")}
               </span>
             </div>
-            <div className="mt-2 flex items-center gap-1">
-              <span className="text-[10px] text-muted-foreground">Opacity</span>
-              <Slider
-                aria-label="Basemap opacity"
-                className="flex-1"
-                min={0}
-                max={1}
-                step={0.05}
-                value={[basemapOpacity]}
-                onValueChange={([v]: number[]) => setBasemapOpacity(v ?? basemapOpacity)}
-                onClick={(e: ReactMouseEvent) => e.stopPropagation()}
-              />
-            </div>
+            {backgroundNameNotice && (
+              <p className="mt-1 text-[10px] text-amber-600">
+                {t("layers.backgroundNameFixed")}
+              </p>
+            )}
+            <LayerOpacitySlider
+              label={t("layers.opacity")}
+              ariaLabel={t("layers.basemapOpacity")}
+              value={basemapOpacity}
+              onChange={setBasemapOpacity}
+            />
           </div>
         </div>
       </ScrollArea>
       <Separator />
-      <p className="p-2 text-[10px] text-muted-foreground">
-        Advanced formats: see docs/roadmap.md
-      </p>
+      <LayerPanelPlaceSearch mapControllerRef={mapControllerRef} />
+      <BasemapPickerDialog
+        open={basemapPickerOpen}
+        onOpenChange={setBasemapPickerOpen}
+      />
+      <Dialog
+        open={!!bindTimeSliderLayerId}
+        onOpenChange={(open: boolean) => {
+          if (!open) closeBindTimeSliderDialog();
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("layers.bindToTimeSlider")}</DialogTitle>
+            <DialogDescription>
+              {t("layers.bindDialogDescription")}
+            </DialogDescription>
+          </DialogHeader>
+          {bindCandidates === null ? (
+            <p className="text-sm text-muted-foreground">
+              {t("layers.bindScanning")}
+            </p>
+          ) : bindCandidates.length === 0 ? (
+            <p className="text-sm text-destructive">
+              {t("layers.bindNoProperty")}
+            </p>
+          ) : (
+            <div className="space-y-3">
+              <div className="space-y-2">
+                <Label htmlFor="time-slider-property">
+                  {t("layers.bindProperty")}
+                </Label>
+                <Select
+                  id="time-slider-property"
+                  value={bindProperty}
+                  onChange={(event) => {
+                    setBindProperty(event.target.value);
+                    setBindError(null);
+                  }}
+                >
+                  {bindCandidates.map((candidate) => (
+                    <option key={candidate.property} value={candidate.property}>
+                      {candidate.property}
+                      {candidate.coverage < 1
+                        ? ` (${Math.round(candidate.coverage * 100)}%)`
+                        : ""}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="time-slider-window">
+                  {t("layers.bindWindow")}
+                </Label>
+                <Select
+                  id="time-slider-window"
+                  value={bindWindowMode}
+                  onChange={(event) =>
+                    setBindWindowMode(
+                      event.target.value as "step" | "wide" | "wider",
+                    )
+                  }
+                >
+                  <option value="step">{t("layers.bindWindowStep")}</option>
+                  <option value="wide">{t("layers.bindWindowWide")}</option>
+                  <option value="wider">{t("layers.bindWindowWider")}</option>
+                </Select>
+              </div>
+              {bindError && (
+                <p className="text-sm text-destructive">{bindError}</p>
+              )}
+            </div>
+          )}
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={closeBindTimeSliderDialog}
+            >
+              {t("layers.bindCancel")}
+            </Button>
+            <Button
+              type="button"
+              disabled={!bindProperty}
+              onClick={() => void confirmBindTimeSlider()}
+            >
+              {t("layers.bindConfirm")}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
       <Dialog
         open={!!refreshSettingsLayerId}
         onOpenChange={(open: boolean) => {
@@ -1739,14 +2340,7 @@ export function LayerPanel({
           <ScrollArea className="max-h-80">
             <pre className="whitespace-pre-wrap break-all text-xs">
               {metadataLayer &&
-                JSON.stringify(
-                  {
-                    ...metadataLayer.metadata,
-                    sourcePath: metadataLayer.sourcePath,
-                  },
-                  null,
-                  2,
-                )}
+                JSON.stringify(layerMetadataPayload(metadataLayer), null, 2)}
             </pre>
           </ScrollArea>
         </DialogContent>

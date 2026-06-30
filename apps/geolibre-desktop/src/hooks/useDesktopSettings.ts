@@ -3,6 +3,21 @@ import { useEffect } from "react";
 import { create } from "zustand";
 import { normalizeStringList } from "../lib/string-lists";
 import { DESKTOP_SETTINGS_STORAGE_KEY } from "../lib/storage-keys";
+import {
+  DEFAULT_CUSTOM_COLOR,
+  DEFAULT_THEME_SCHEME,
+  isHexColor,
+  isThemeScheme,
+  type ThemeScheme,
+} from "../lib/theme-schemes";
+import type { UpdateNotificationLevel } from "../lib/updates";
+
+/** Notification-granularity options, in order. Single source of truth. */
+export const UPDATE_NOTIFICATION_LEVELS: readonly UpdateNotificationLevel[] = [
+  "all",
+  "minor",
+  "major",
+];
 
 export interface DesktopSettings {
   additionalPluginDirectories: string[];
@@ -25,6 +40,36 @@ export interface DesktopSettings {
    * hardening (see PR #190 review).
    */
   shareToken: string;
+  /**
+   * Appearance preferences (the accent color scheme). The light/dark mode is
+   * handled separately by `useThemeMode` (it tracks the OS / embed preference).
+   */
+  theme: ThemeSettings;
+  /**
+   * Customizable UI profile: which data sources / web services / plugins are
+   * visible, an optional experience-level preset, first-launch onboarding state,
+   * and an admin lock. See `src/lib/ui-profile.ts` and `docs/ui-profiles.md`.
+   */
+  uiProfile: UiProfileSettings;
+  /**
+   * Automated software-update preferences. The startup check only runs in the
+   * desktop (Tauri) build; on the web these settings are inert.
+   */
+  updates: UpdateSettings;
+}
+
+export interface ThemeSettings {
+  /** Accent color scheme. Presets set a `data-theme` attribute on <html>. */
+  scheme: ThemeScheme;
+  /** Hex color backing the "custom" scheme (ignored by the presets). */
+  customColor: string;
+}
+
+export interface UpdateSettings {
+  /** Whether to check for a newer version each time the desktop app starts. */
+  checkOnStartup: boolean;
+  /** Which kinds of releases raise a startup notification. */
+  notificationLevel: UpdateNotificationLevel;
 }
 
 export interface DesktopLayoutSettings {
@@ -32,6 +77,41 @@ export interface DesktopLayoutSettings {
   showProjectInfo: boolean;
   stylePanelVisible: boolean;
   toolbarLabels: boolean;
+}
+
+/** Experience-level presets offered by the onboarding wizard and Settings. */
+export type ExperienceLevel = "beginner" | "intermediate" | "advanced";
+
+export interface UiProfileSettings {
+  /**
+   * When false, every data source and plugin is visible regardless of the hidden
+   * lists below. This is the back-compat default so existing users see no change
+   * until they opt in via onboarding, the Settings dialog, or an admin file.
+   */
+  enabled: boolean;
+  /**
+   * The experience-level preset last applied, or null for a custom selection
+   * (the user manually toggled an item). Only used to highlight the active preset.
+   */
+  level: ExperienceLevel | null;
+  /** Whether the first-launch onboarding wizard has been completed or dismissed. */
+  onboarded: boolean;
+  /**
+   * Set by an admin config file (`docs/ui-profiles.md`). When true the profile is
+   * managed centrally and the Settings controls are disabled.
+   */
+  locked: boolean;
+  /** Data-source catalog ids hidden from the Add Data menu. */
+  hiddenDataSources: string[];
+  /** Plugin ids hidden from the Plugins menu. */
+  hiddenPlugins: string[];
+  /** Top-level toolbar menu ids hidden entirely (e.g. `processing`, `help`). */
+  hiddenMenus: string[];
+  /**
+   * Menu-item catalog ids hidden from their menu (Project/Edit/Processing/
+   * Controls/Settings/Help). Add Data and Plugins use the two lists above.
+   */
+  hiddenMenuItems: string[];
 }
 
 interface DesktopSettingsState {
@@ -46,13 +126,44 @@ export const DEFAULT_DESKTOP_LAYOUT_SETTINGS: DesktopLayoutSettings = {
   toolbarLabels: true,
 };
 
+export const DEFAULT_UI_PROFILE_SETTINGS: UiProfileSettings = {
+  enabled: false,
+  level: null,
+  onboarded: false,
+  locked: false,
+  hiddenDataSources: [],
+  hiddenPlugins: [],
+  hiddenMenus: [],
+  hiddenMenuItems: [],
+};
+
+export const DEFAULT_UPDATE_SETTINGS: UpdateSettings = {
+  checkOnStartup: true,
+  notificationLevel: "all",
+};
+
+export const DEFAULT_THEME_SETTINGS: ThemeSettings = {
+  scheme: DEFAULT_THEME_SCHEME,
+  customColor: DEFAULT_CUSTOM_COLOR,
+};
+
 const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   additionalPluginDirectories: [],
   language: "",
   layout: DEFAULT_DESKTOP_LAYOUT_SETTINGS,
   pluginManifestUrls: [],
   shareToken: "",
+  theme: DEFAULT_THEME_SETTINGS,
+  uiProfile: DEFAULT_UI_PROFILE_SETTINGS,
+  updates: DEFAULT_UPDATE_SETTINGS,
 };
+
+/** The experience-level presets, in order. Single source of truth. */
+export const EXPERIENCE_LEVELS: readonly ExperienceLevel[] = [
+  "beginner",
+  "intermediate",
+  "advanced",
+];
 
 function normalizeDesktopSettings(settings: unknown): DesktopSettings {
   if (!settings || typeof settings !== "object") {
@@ -74,6 +185,86 @@ function normalizeDesktopSettings(settings: unknown): DesktopSettings {
     ),
     shareToken:
       typeof candidate.shareToken === "string" ? candidate.shareToken.trim() : "",
+    theme: normalizeThemeSettings(candidate.theme),
+    uiProfile: normalizeUiProfileSettings(candidate.uiProfile),
+    updates: normalizeUpdateSettings(candidate.updates),
+  };
+}
+
+function normalizeThemeSettings(theme: unknown): ThemeSettings {
+  if (!theme || typeof theme !== "object") {
+    return DEFAULT_THEME_SETTINGS;
+  }
+
+  // Require a known scheme id and a valid hex color so tampered localStorage
+  // values cannot smuggle an unknown scheme into the `data-theme` attribute or an
+  // arbitrary string into the inline custom-color tokens.
+  const candidate = theme as Partial<ThemeSettings>;
+  return {
+    scheme: isThemeScheme(candidate.scheme)
+      ? candidate.scheme
+      : DEFAULT_THEME_SETTINGS.scheme,
+    // Normalize so the value bound to `<input type="color">` is exactly
+    // `#rrggbb` lowercase (isHexColor already requires the leading `#`).
+    customColor: isHexColor(candidate.customColor)
+      ? candidate.customColor.trim().toLowerCase()
+      : DEFAULT_THEME_SETTINGS.customColor,
+  };
+}
+
+function normalizeUpdateSettings(updates: unknown): UpdateSettings {
+  if (!updates || typeof updates !== "object") {
+    return DEFAULT_UPDATE_SETTINGS;
+  }
+
+  // Require a strict boolean and a known level so tampered localStorage values
+  // cannot smuggle non-boolean / unknown values into the update settings.
+  const candidate = updates as Partial<UpdateSettings>;
+  return {
+    checkOnStartup:
+      typeof candidate.checkOnStartup === "boolean"
+        ? candidate.checkOnStartup
+        : DEFAULT_UPDATE_SETTINGS.checkOnStartup,
+    notificationLevel:
+      typeof candidate.notificationLevel === "string" &&
+      UPDATE_NOTIFICATION_LEVELS.includes(
+        candidate.notificationLevel as UpdateNotificationLevel,
+      )
+        ? (candidate.notificationLevel as UpdateNotificationLevel)
+        : DEFAULT_UPDATE_SETTINGS.notificationLevel,
+  };
+}
+
+function normalizeUiProfileSettings(profile: unknown): UiProfileSettings {
+  if (!profile || typeof profile !== "object") {
+    return DEFAULT_UI_PROFILE_SETTINGS;
+  }
+
+  // Require strict booleans and a known level so tampered localStorage values
+  // cannot smuggle non-boolean / unknown values into the profile.
+  const candidate = profile as Partial<UiProfileSettings>;
+  return {
+    enabled:
+      typeof candidate.enabled === "boolean"
+        ? candidate.enabled
+        : DEFAULT_UI_PROFILE_SETTINGS.enabled,
+    level:
+      typeof candidate.level === "string" &&
+      EXPERIENCE_LEVELS.includes(candidate.level as ExperienceLevel)
+        ? (candidate.level as ExperienceLevel)
+        : null,
+    onboarded:
+      typeof candidate.onboarded === "boolean"
+        ? candidate.onboarded
+        : DEFAULT_UI_PROFILE_SETTINGS.onboarded,
+    locked:
+      typeof candidate.locked === "boolean"
+        ? candidate.locked
+        : DEFAULT_UI_PROFILE_SETTINGS.locked,
+    hiddenDataSources: normalizeStringList(candidate.hiddenDataSources),
+    hiddenPlugins: normalizeStringList(candidate.hiddenPlugins),
+    hiddenMenus: normalizeStringList(candidate.hiddenMenus),
+    hiddenMenuItems: normalizeStringList(candidate.hiddenMenuItems),
   };
 }
 

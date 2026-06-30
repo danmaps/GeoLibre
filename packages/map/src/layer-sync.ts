@@ -25,10 +25,17 @@ import {
   fillExtrusionLayerId,
   fillLayerId,
   heatmapLayerId,
+  labelLayerId,
+  labelSourceId,
   lineLayerId,
+  markerLayerId,
   sourceId,
   textLayerId,
 } from "./geojson-loader";
+import { buildDedupedLabelFeatures } from "./label-dedup";
+import { ensureGeneratedImageHandler } from "./generated-images";
+import { prepareFillPattern } from "./fill-patterns";
+import { prepareMarker } from "./markers";
 import { isPlaceholderLayer } from "./placeholders";
 import {
   circlePaint,
@@ -39,6 +46,24 @@ import {
   linePaint,
   rasterPaint,
 } from "./style-mapper";
+
+/**
+ * Notified of the computed `beforeId` for a deck.gl-backed external custom layer
+ * (a `maplibre-gl-raster` COG) whenever layers are synced. Such a layer is not a
+ * real MapLibre style layer — `@deck.gl/mapbox` groups it by a `beforeId` prop —
+ * so `moveLayer` cannot reorder it; the host registers a handler that pushes the
+ * `beforeId` into the owning control instead. See issue #393 follow-up.
+ */
+let externalDeckLayerOrderHandler:
+  | ((layerId: string, beforeId: string | undefined) => void)
+  | null = null;
+
+/** Register (or clear with `null`) the deck-layer order handler. */
+export function setExternalDeckLayerOrderHandler(
+  handler: ((layerId: string, beforeId: string | undefined) => void) | null,
+): void {
+  externalDeckLayerOrderHandler = handler;
+}
 
 const WMS_PROXY_PATH = "/__geolibre_wms_proxy";
 const PMTILES_PROTOCOL = "pmtiles";
@@ -89,6 +114,134 @@ function unclusteredPointFilter(
     ["!", ["has", "point_count"]],
     nonTextMarkerPointFilter,
   ] as maplibregl.FilterSpecification;
+}
+
+/**
+ * Combine a sub-layer's geometry filter with the layer's transient
+ * {@link GeoLibreLayer.timeFilter}, when set, so a Time-Slider-bound vector
+ * layer only renders features inside the current timeline window. Returns the
+ * geometry filter unchanged when no time filter is set, so the common (unbound)
+ * path produces an identical spec and `ensureLayer` performs no filter update.
+ *
+ * Aggregate cluster layers (the bubble and its count) intentionally do not pass
+ * through here: a cluster feature carries no time property, so an `["all", ...]`
+ * wrap would drop every cluster whenever a window is active. Per-feature layers
+ * (fill, line, point, heatmap, text) filter correctly.
+ *
+ * @param layer - The store layer being synced.
+ * @param geometryFilter - The sub-layer's own geometry-type filter.
+ * @returns The combined filter, or the original when no time filter applies.
+ */
+function withTimeFilter(
+  layer: GeoLibreLayer,
+  geometryFilter: maplibregl.FilterSpecification,
+): maplibregl.FilterSpecification {
+  const timeFilter = layer.timeFilter;
+  if (!Array.isArray(timeFilter) || timeFilter.length === 0) {
+    return geometryFilter;
+  }
+  return [
+    "all",
+    geometryFilter,
+    timeFilter,
+  ] as unknown as maplibregl.FilterSpecification;
+}
+
+// Tracked filter state for external-native vector layers whose Time Slider
+// window GeoLibre applies. `base` is the control's own filter, captured the
+// first time a window is applied so the window can be combined without nesting
+// and fully restored when the binding is removed; `appliedKey` is the JSON of
+// the combined filter we last pushed, compared against the next combined filter
+// (both built here, so they round-trip) to avoid calling `setFilter` on every
+// sync tick. Keyed first by the map instance (a WeakMap, so entries are
+// garbage-collected when a map is destroyed and a fresh map never inherits
+// stale base filters) then by native MapLibre layer id.
+interface NativeFilterState {
+  base: maplibregl.FilterSpecification | null;
+  appliedKey: string;
+}
+const externalNativeBaseFilters = new WeakMap<
+  maplibregl.Map,
+  Map<string, NativeFilterState>
+>();
+
+function nativeFilterStatesFor(
+  map: maplibregl.Map,
+): Map<string, NativeFilterState> {
+  let perLayer = externalNativeBaseFilters.get(map);
+  if (!perLayer) {
+    perLayer = new Map();
+    externalNativeBaseFilters.set(map, perLayer);
+  }
+  return perLayer;
+}
+
+/**
+ * Whether a MapLibre layer type accepts a `filter`. Raster/hillshade/background
+ * layers do not, so a time window is never pushed onto them.
+ */
+function nativeLayerSupportsFilter(type: string): boolean {
+  return (
+    type === "circle" ||
+    type === "fill" ||
+    type === "line" ||
+    type === "symbol" ||
+    type === "fill-extrusion" ||
+    type === "heatmap"
+  );
+}
+
+/**
+ * Apply (or clear) a Time-Slider window on an external-native vector layer that
+ * a control owns and paints itself (e.g. the Add Vector Layer control). The
+ * control segregates geometry across its own native layers with a base filter
+ * such as `["==", ["geometry-type"], "Point"]`; this combines that base filter
+ * with the layer's transient {@link GeoLibreLayer.timeFilter} via `["all", ...]`
+ * so the window narrows the visible features without disturbing the control's
+ * paint. The control's base filter is captured once and restored on unbind.
+ *
+ * @param map - The MapLibre map.
+ * @param nativeLayerId - A control-owned native layer id.
+ * @param timeFilter - The layer's current time filter, or undefined when none.
+ */
+function applyExternalNativeTimeFilter(
+  map: maplibregl.Map,
+  nativeLayerId: string,
+  timeFilter: unknown[] | undefined,
+): void {
+  if (!map.getLayer(nativeLayerId)) return;
+  const states = nativeFilterStatesFor(map);
+  const hasTimeFilter = Array.isArray(timeFilter) && timeFilter.length > 0;
+
+  if (!hasTimeFilter) {
+    // No window: restore the control's own filter (once) and stop tracking.
+    const state = states.get(nativeLayerId);
+    if (state) {
+      map.setFilter(nativeLayerId, state.base ?? undefined);
+      states.delete(nativeLayerId);
+    }
+    return;
+  }
+
+  // Window active: capture the control's base filter the first time, then keep
+  // reusing it so repeated ticks combine rather than nest.
+  let state = states.get(nativeLayerId);
+  if (!state) {
+    const base =
+      (map.getFilter(nativeLayerId) as maplibregl.FilterSpecification) ?? null;
+    state = { base, appliedKey: "" };
+    states.set(nativeLayerId, state);
+  }
+  const combined = (
+    state.base ? ["all", state.base, timeFilter] : timeFilter
+  ) as unknown as maplibregl.FilterSpecification;
+  // Compare against the last filter we applied (not `getFilter`, which MapLibre
+  // may have normalized) so an unchanged window does not re-push on every tick.
+  const combinedKey = JSON.stringify(combined);
+  if (state.appliedKey !== combinedKey) {
+    map.setFilter(nativeLayerId, combined);
+    state.appliedKey = combinedKey;
+  }
 }
 
 // Native layer ids whose zoom range GeoLibre has taken over. A pristine external
@@ -193,6 +346,11 @@ export function syncLayer(
     syncVideoLayer(map, layer, beforeId);
     return;
   }
+
+  if (layer.type === "image") {
+    syncImageLayer(map, layer, beforeId);
+    return;
+  }
 }
 
 function isExternalNativeLayer(layer: GeoLibreLayer): boolean {
@@ -216,6 +374,20 @@ function syncExternalNativeLayer(
   if (isExternalCustomLayer(layer)) {
     for (const nativeLayerId of nativeLayerIds) {
       moveLayer(map, nativeLayerId, beforeId);
+      // Control-painted vector layers (e.g. Add Vector Layer's circle/fill/line
+      // layers) still honor a Time Slider window: filtering is independent of
+      // the paint the control owns. Native layers without a filter (deck.gl /
+      // 3D Tiles custom layers) are skipped by the type guard.
+      const nativeLayer = map.getLayer(nativeLayerId);
+      if (nativeLayer && nativeLayerSupportsFilter(nativeLayer.type)) {
+        applyExternalNativeTimeFilter(map, nativeLayerId, layer.timeFilter);
+      }
+    }
+    // A deck.gl raster has no real MapLibre style layer to move (it renders in a
+    // `deck-layer-group-*` keyed by its beforeId prop), so forward the computed
+    // beforeId to the control that owns it.
+    if (layer.metadata.externalDeckLayer === true) {
+      externalDeckLayerOrderHandler?.(layer.id, beforeId);
     }
     return;
   }
@@ -232,6 +404,19 @@ function syncExternalNativeLayer(
 
   if (isWebServiceTileRasterLayer(layer)) {
     syncWebServiceTileRasterLayer(map, layer, nativeLayerIds, beforeId);
+    return;
+  }
+
+  // Generic external raster tiles registered by third-party plugins (e.g. a
+  // titiler-served XYZ source) carry no recognized sourceKind, so they match
+  // none of the handlers above. Honor the documented external-layer contract
+  // (a `source` with `tiles` and `type: "raster"`) by building the source and
+  // raster layer here instead of dropping through to the GeoJSON path below.
+  // IMPORTANT: this is a structural catch-all, so add any new named raster
+  // handler (new sourceKind) BEFORE this check — placing it after would let a
+  // layer that also has `source.tiles` be intercepted by the generic path.
+  if (isExternalRasterTileLayer(layer)) {
+    syncExternalRasterTileLayer(map, layer, nativeLayerIds, beforeId);
     return;
   }
 
@@ -284,6 +469,13 @@ function syncExternalNativeLayer(
       nativeLayerId,
       layer.visible ? "visible" : "none",
     );
+
+    // Narrow the control-painted features to the Time Slider window (if the
+    // layer is bound). Filtering is independent of paint, so this applies even
+    // when the control owns the paint.
+    if (nativeLayerSupportsFilter(nativeLayer.type)) {
+      applyExternalNativeTimeFilter(map, nativeLayerId, layer.timeFilter);
+    }
 
     if (!controlOwnsPaint(layer)) {
       setExternalNativeLayerPaint(map, nativeLayerId, nativeLayer.type, layer);
@@ -745,6 +937,73 @@ function isBasemapControlRasterLayer(layer: GeoLibreLayer): boolean {
   );
 }
 
+// A raster layer registered by a third-party plugin through
+// registerExternalNativeLayer that supplies its own XYZ tile template(s) in
+// `source.tiles`. Unlike the basemap/web-service/PMTiles raster paths above it
+// carries no GeoLibre-internal sourceKind, so it is matched structurally: any
+// external raster layer with concrete tiles and no dedicated handler.
+function isExternalRasterTileLayer(layer: GeoLibreLayer): boolean {
+  return (
+    layer.type === "raster" &&
+    layer.metadata.externalNativeLayer === true &&
+    getSourceTiles(layer).length > 0
+  );
+}
+
+// Build the MapLibre source and raster layer for a generic external raster tile
+// registration. Mirrors syncBasemapControlRasterLayer/syncWebServiceTileRasterLayer
+// but reads everything from the registration's own `source`, so any plugin that
+// hands GeoLibre an XYZ raster source renders without needing a bespoke handler.
+function syncExternalRasterTileLayer(
+  map: maplibregl.Map,
+  layer: GeoLibreLayer,
+  nativeLayerIds: string[],
+  beforeId?: string,
+): void {
+  const nativeLayerId = nativeLayerIds[0] ?? layer.id;
+  const sourceId = getExternalSourceIds(layer)[0] ?? `${nativeLayerId}-source`;
+  const tiles = getSourceTiles(layer);
+  if (tiles.length === 0) return;
+
+  // The source is built once and never rebuilt while it exists, matching the
+  // other raster handlers above. A plugin that re-registers the same sourceId
+  // with a different `tiles` array will keep serving the original tiles; to
+  // switch tile URLs it must register under a new sourceId.
+  if (!map.getSource(sourceId)) {
+    const bounds = boundsSource(layer.source.bounds);
+    map.addSource(sourceId, {
+      type: "raster",
+      tiles,
+      tileSize: numberSource(layer.source.tileSize) ?? 256,
+      ...(numberSource(layer.source.minzoom) !== undefined
+        ? { minzoom: numberSource(layer.source.minzoom) }
+        : {}),
+      ...(numberSource(layer.source.maxzoom) !== undefined
+        ? { maxzoom: numberSource(layer.source.maxzoom) }
+        : {}),
+      ...(bounds ? { bounds } : {}),
+      ...(layer.source.scheme === "tms" ? { scheme: "tms" as const } : {}),
+      ...(stringSource(layer.source.attribution)
+        ? { attribution: stringSource(layer.source.attribution) }
+        : {}),
+    });
+  }
+
+  ensureLayer(
+    map,
+    nativeLayerId,
+    {
+      id: nativeLayerId,
+      type: "raster",
+      source: sourceId,
+      ...styleLayerZoomRange(layer.style),
+      paint: rasterPaint(layer.style, layer.opacity),
+      layout: { visibility: layer.visible ? "visible" : "none" },
+    },
+    beforeId,
+  );
+}
+
 // Raster basemaps selected in the basemap control are normally rendered by the
 // control itself. Rebuilding them here too keeps them on the map after a style
 // reload (e.g. reopening a project), where the control does not replay them.
@@ -891,14 +1150,24 @@ function boundsSource(
     : undefined;
 }
 
-function getBasemapControlTiles(layer: GeoLibreLayer): string[] {
+// Concrete XYZ tile templates from the registration's own `source.tiles`. This
+// is the documented external-raster contract and the only source the generic
+// external-raster path reads — it deliberately does not look at
+// metadata.tileUrl (see getBasemapControlTiles for that basemap-internal key).
+function getSourceTiles(layer: GeoLibreLayer): string[] {
   const tiles = layer.source.tiles;
-  if (Array.isArray(tiles)) {
-    const valid = tiles.filter(
-      (tile): tile is string => typeof tile === "string" && tile.length > 0,
-    );
-    if (valid.length > 0) return valid;
-  }
+  if (!Array.isArray(tiles)) return [];
+  return tiles.filter(
+    (tile): tile is string => typeof tile === "string" && tile.length > 0,
+  );
+}
+
+function getBasemapControlTiles(layer: GeoLibreLayer): string[] {
+  const tiles = getSourceTiles(layer);
+  if (tiles.length > 0) return tiles;
+  // The basemap control stores its single tile template under this internal
+  // metadata key rather than source.tiles; that fallback is specific to the
+  // basemap/web-service paths and intentionally not part of getSourceTiles.
   const tileUrl = stringMetadata(layer.metadata.tileUrl);
   return tileUrl ? [tileUrl] : [];
 }
@@ -1117,6 +1386,9 @@ function syncGeoJsonLayer(
   }
 
   if (!map.getSource(src)) {
+    // Carry a source attribution (e.g. an ArcGIS service's copyrightText) into
+    // MapLibre's attribution control when the layer declares one.
+    const attribution = stringSource(layer.source.attribution);
     map.addSource(
       src,
       wantCluster
@@ -1126,8 +1398,13 @@ function syncGeoJsonLayer(
             cluster: true,
             clusterRadius,
             clusterMaxZoom,
+            ...(attribution ? { attribution } : {}),
           }
-        : { type: "geojson", data: layer.geojson! },
+        : {
+            type: "geojson",
+            data: layer.geojson!,
+            ...(attribution ? { attribution } : {}),
+          },
     );
   } else {
     (map.getSource(src) as maplibregl.GeoJSONSource).setData(layer.geojson!);
@@ -1216,6 +1493,12 @@ function applyVectorDataRenderLayers(
   const visibility = layer.visible ? "visible" : "none";
   const opacity = layer.opacity;
   const hasTextMarkers = hasTextMarkerFeatures(layer.geojson!);
+  // Lazy sprite generation for fill patterns and marker icons relies on the
+  // map's styleimagemissing handler being installed before any layer references
+  // a generated image id.
+  ensureGeneratedImageHandler(map);
+  const fillPatternId = prepareFillPattern(layer.style);
+  const markerImageId = prepareMarker(layer.style);
 
   if (profile.hasPolygon) {
     if (layer.style.extrusionEnabled) {
@@ -1228,13 +1511,13 @@ function applyVectorDataRenderLayers(
           type: "fill-extrusion",
           ...sourceSpec,
           ...styleLayerZoomRange(layer.style),
-          filter: [
+          filter: withTimeFilter(layer, [
             "match",
             ["geometry-type"],
             ["Polygon", "MultiPolygon"],
             true,
             false,
-          ],
+          ]),
           paint: fillExtrusionPaint(layer.style, opacity),
           layout: { visibility },
         },
@@ -1250,14 +1533,24 @@ function applyVectorDataRenderLayers(
           type: "fill",
           ...sourceSpec,
           ...styleLayerZoomRange(layer.style),
-          filter: [
+          filter: withTimeFilter(layer, [
             "match",
             ["geometry-type"],
             ["Polygon", "MultiPolygon"],
             true,
             false,
-          ],
-          paint: fillPaint(layer.style, opacity),
+          ]),
+          paint: {
+            ...fillPaint(layer.style, opacity),
+            // A set fill-pattern replaces fill-color with the recolorable
+            // sprite tile; null resets it on the setPaintProperty update path in
+            // ensureLayer (MapLibre documents null, not undefined, as the value
+            // that removes a paint property — undefined can silently no-op and
+            // leave a stale pattern rendered after the user selects "None"). The
+            // cast is needed because FillLayerSpecification's paint type omits
+            // null even though setPaintProperty accepts it as the reset value.
+            "fill-pattern": (fillPatternId ?? null) as unknown as string,
+          },
           layout: { visibility },
         },
         beforeId,
@@ -1280,13 +1573,13 @@ function applyVectorDataRenderLayers(
         type: "line",
         ...sourceSpec,
         ...styleLayerZoomRange(layer.style),
-        filter: [
+        filter: withTimeFilter(layer, [
           "match",
           ["geometry-type"],
           ["LineString", "MultiLineString", "Polygon", "MultiPolygon"],
           true,
           false,
-        ],
+        ]),
         paint: linePaint(layer.style, opacity),
         layout: { visibility },
       },
@@ -1297,8 +1590,9 @@ function applyVectorDataRenderLayers(
   }
 
   if (!layer.style.extrusionEnabled && profile.hasPoint && renderer === "heatmap") {
-    // Heatmap renderer: one density layer, no circle/cluster layers.
+    // Heatmap renderer: one density layer, no circle/cluster/marker layers.
     removeIfExists(map, circleLayerId(layer.id));
+    removeIfExists(map, markerLayerId(layer.id));
     removeIfExists(map, clusterLayerId(layer.id));
     removeIfExists(map, clusterCountLayerId(layer.id));
     ensureLayer(
@@ -1311,7 +1605,10 @@ function applyVectorDataRenderLayers(
         ...styleLayerZoomRange(layer.style),
         // Keep text-marker points out of the density, mirroring single mode;
         // they still render through the text symbol layer below.
-        filter: hasTextMarkers ? nonTextMarkerPointFilter : pointGeometryFilter,
+        filter: withTimeFilter(
+          layer,
+          hasTextMarkers ? nonTextMarkerPointFilter : pointGeometryFilter,
+        ),
         paint: heatmapPaint(layer.style, opacity),
         layout: { visibility },
       },
@@ -1326,6 +1623,7 @@ function applyVectorDataRenderLayers(
     // for the individual (unclustered) points. The source carries clusters
     // (geojson source-level clustering, or supercluster tiles on the tiled path).
     removeIfExists(map, heatmapLayerId(layer.id));
+    removeIfExists(map, markerLayerId(layer.id));
     ensureLayer(
       map,
       clusterLayerId(layer.id),
@@ -1374,33 +1672,65 @@ function applyVectorDataRenderLayers(
         ...styleLayerZoomRange(layer.style),
         // Unclustered points, excluding text markers (which the symbol layer
         // renders) so they don't also appear as plain circles.
-        filter: unclusteredPointFilter(hasTextMarkers),
+        filter: withTimeFilter(layer, unclusteredPointFilter(hasTextMarkers)),
         paint: circlePaint(layer.style, opacity),
         layout: { visibility },
       },
       beforeId,
     );
   } else if (!layer.style.extrusionEnabled && profile.hasPoint) {
-    // Single (default) renderer: one circle per point.
+    // Single (default) renderer: a marker icon per point when a marker is
+    // configured, otherwise one circle per point.
     removeIfExists(map, heatmapLayerId(layer.id));
     removeIfExists(map, clusterLayerId(layer.id));
     removeIfExists(map, clusterCountLayerId(layer.id));
-    ensureLayer(
-      map,
-      circleLayerId(layer.id),
-      {
-        id: circleLayerId(layer.id),
-        type: "circle",
-        ...sourceSpec,
-        ...styleLayerZoomRange(layer.style),
-        filter: hasTextMarkers ? nonTextMarkerPointFilter : pointGeometryFilter,
-        paint: circlePaint(layer.style, opacity),
-        layout: { visibility },
-      },
-      beforeId,
+    const pointFilter = withTimeFilter(
+      layer,
+      hasTextMarkers ? nonTextMarkerPointFilter : pointGeometryFilter,
     );
+    if (markerImageId) {
+      removeIfExists(map, circleLayerId(layer.id));
+      ensureLayer(
+        map,
+        markerLayerId(layer.id),
+        {
+          id: markerLayerId(layer.id),
+          type: "symbol",
+          ...sourceSpec,
+          ...styleLayerZoomRange(layer.style),
+          filter: pointFilter,
+          layout: {
+            "icon-image": markerImageId,
+            // The sprite is baked at its display size, so keep icon-size at 1.
+            "icon-size": 1,
+            "icon-allow-overlap": true,
+            "icon-ignore-placement": true,
+            visibility,
+          },
+          paint: { "icon-opacity": opacity },
+        },
+        beforeId,
+      );
+    } else {
+      removeIfExists(map, markerLayerId(layer.id));
+      ensureLayer(
+        map,
+        circleLayerId(layer.id),
+        {
+          id: circleLayerId(layer.id),
+          type: "circle",
+          ...sourceSpec,
+          ...styleLayerZoomRange(layer.style),
+          filter: pointFilter,
+          paint: circlePaint(layer.style, opacity),
+          layout: { visibility },
+        },
+        beforeId,
+      );
+    }
   } else {
     removeIfExists(map, circleLayerId(layer.id));
+    removeIfExists(map, markerLayerId(layer.id));
     removeIfExists(map, heatmapLayerId(layer.id));
     removeIfExists(map, clusterLayerId(layer.id));
     removeIfExists(map, clusterCountLayerId(layer.id));
@@ -1415,7 +1745,7 @@ function applyVectorDataRenderLayers(
         type: "symbol",
         ...sourceSpec,
         ...styleLayerZoomRange(layer.style),
-        filter: textMarkerFilter,
+        filter: withTimeFilter(layer, textMarkerFilter),
         layout: {
           "text-allow-overlap": true,
           "text-font": textFontForMapStyle(map),
@@ -1433,7 +1763,14 @@ function applyVectorDataRenderLayers(
           visibility,
         },
         paint: {
-          "text-color": styleValue(layer.style, "textColor"),
+          // Honor an optional per-feature `text-color` (used by annotation text
+          // labels so each can keep its own color); text markers without it fall
+          // back to the layer's text color.
+          "text-color": [
+            "coalesce",
+            ["get", "text-color"],
+            styleValue(layer.style, "textColor"),
+          ],
           "text-halo-color": styleValue(layer.style, "textHaloColor"),
           "text-halo-width": Math.max(
             0,
@@ -1447,12 +1784,204 @@ function applyVectorDataRenderLayers(
   } else {
     removeIfExists(map, textLayerId(layer.id));
   }
+
+  // Attribute-driven labels: a symbol layer that renders the configured field
+  // (or expression) for every feature. Distinct from the geoman text-marker
+  // layer above, which only renders annotation features.
+  const labels = {
+    ...DEFAULT_LAYER_STYLE.labels,
+    ...styleValue(layer.style, "labels"),
+  };
+  // Unique/concatenate labels collapse co-located points into a single label.
+  // Only the inline GeoJSON path (no source-layer) can build the aggregated
+  // source, and dedup keys off the field value rather than the expression. It is
+  // gated to point-only layers: the aggregated source holds just points, so a
+  // mixed-geometry layer would silently lose its line/polygon labels. It is also
+  // skipped while a Time Slider filter is active: the aggregated source is built
+  // from the raw features (no MapLibre filter applies to it), so dedup labels
+  // would otherwise ignore the time window and disagree with the visible data.
+  const hasTimeFilter =
+    Array.isArray(layer.timeFilter) && layer.timeFilter.length > 0;
+  const dedupedLabelFc =
+    labels.enabled &&
+    labels.dedupe !== "off" &&
+    !sourceLayer &&
+    !hasTimeFilter &&
+    layer.geojson &&
+    labels.field &&
+    profile.hasPoint &&
+    !profile.hasLine &&
+    !profile.hasPolygon
+      ? getDedupedLabelFeatures(layer.geojson, labels.field, labels.dedupe)
+      : null;
+  if (
+    !layer.style.extrusionEnabled &&
+    renderer !== "heatmap" &&
+    labels.enabled &&
+    (dedupedLabelFc || labels.expression.trim() || labels.field)
+  ) {
+    const fieldTextField = (
+      labels.field
+        ? ["to-string", ["coalesce", ["get", labels.field], ""]]
+        : ""
+    ) as unknown as maplibregl.ExpressionSpecification | string;
+    let textField: maplibregl.ExpressionSpecification | string;
+    if (dedupedLabelFc) {
+      // The aggregated source carries the resolved label in `__geolibre_label`.
+      textField = [
+        "get",
+        "__geolibre_label",
+      ] as unknown as maplibregl.ExpressionSpecification;
+    } else {
+      try {
+        if (labels.expression.trim()) {
+          const parsed = JSON.parse(labels.expression);
+          // JSON.parse accepts non-expressions (numbers, objects, null); only an
+          // array is a usable MapLibre expression, so reject anything else and
+          // fall back to the field.
+          if (!Array.isArray(parsed)) throw new Error("not an expression");
+          textField = parsed as maplibregl.ExpressionSpecification;
+        } else {
+          textField = fieldTextField;
+        }
+      } catch {
+        // A typo'd or non-expression value must not break the whole layer sync.
+        textField = fieldTextField;
+      }
+    }
+    if (textField === "") {
+      // An invalid expression with no field falls back to an empty text-field,
+      // which would create an invisible label layer that still consumes
+      // renderer resources. Remove it instead of adding an empty one.
+      removeIfExists(map, labelLayerId(layer.id));
+      removeSourceIfExists(map, labelSourceId(layer.id));
+    } else {
+      const labelZoom = intersectZoomRange(
+        {
+          minzoom: clampLayerZoom(labels.minZoom, MIN_LAYER_ZOOM),
+          maxzoom: clampLayerZoom(labels.maxZoom, MAX_LAYER_ZOOM),
+        },
+        layer.style,
+      );
+      const dedupSourceId = labelSourceId(layer.id);
+      // The aggregated label features live in their own GeoJSON source so the
+      // symbol layer can read one-per-point labels without altering the data the
+      // other render layers draw.
+      if (dedupedLabelFc) {
+        if (map.getSource(dedupSourceId)) {
+          (map.getSource(dedupSourceId) as maplibregl.GeoJSONSource).setData(
+            dedupedLabelFc,
+          );
+        } else {
+          map.addSource(dedupSourceId, {
+            type: "geojson",
+            data: dedupedLabelFc,
+          });
+        }
+      }
+      // A layer's source is immutable, so when the label source switches between
+      // the shared source and the dedup source the layer must be recreated.
+      const targetSource = dedupedLabelFc ? dedupSourceId : src;
+      const existingLabel = map.getLayer(labelLayerId(layer.id)) as
+        | { source?: string }
+        | undefined;
+      if (existingLabel && existingLabel.source !== targetSource) {
+        removeIfExists(map, labelLayerId(layer.id));
+      }
+      // Skip geoman text-marker points (they carry their own annotation text),
+      // reusing the same two-property predicate the circle/text layers use. The
+      // dedup source holds only synthetic points, so it needs neither that
+      // filter nor the time filter.
+      const nonMarkerFilter = [
+        "!",
+        textMarkerShapeFilter,
+      ] as unknown as maplibregl.FilterSpecification;
+      const sourceRef = dedupedLabelFc
+        ? { source: dedupSourceId }
+        : sourceSpec;
+      ensureLayer(
+        map,
+        labelLayerId(layer.id),
+        {
+          id: labelLayerId(layer.id),
+          type: "symbol",
+          ...sourceRef,
+          ...labelZoom,
+          ...(dedupedLabelFc
+            ? {}
+            : { filter: withTimeFilter(layer, nonMarkerFilter) }),
+          layout: {
+            "text-field": textField,
+            "text-font": textFontForMapStyle(map),
+            "text-size": Math.max(1, labels.size),
+            // The dedup source is points, so it cannot use line placement.
+            "symbol-placement":
+              !dedupedLabelFc && labels.placement === "line"
+                ? "line"
+                : "point",
+            "text-allow-overlap": labels.allowOverlap,
+            "text-ignore-placement": labels.allowOverlap,
+            "text-anchor": labels.anchor,
+            "text-offset": [labels.offsetX, labels.offsetY],
+            "text-rotate": labels.rotation,
+            "text-max-width": Math.max(1, labels.maxWidth),
+            "text-transform": labels.transform,
+            visibility,
+          },
+          paint: {
+            "text-color": labels.color,
+            "text-halo-color": labels.haloColor,
+            "text-halo-width": Math.max(0, labels.haloWidth),
+            "text-opacity": opacity,
+          },
+        },
+        beforeId,
+      );
+      // Drop the dedup source once the label layer no longer references it (it is
+      // recreated on the shared source above before this runs).
+      if (!dedupedLabelFc) {
+        removeSourceIfExists(map, dedupSourceId);
+      }
+    }
+  } else {
+    removeIfExists(map, labelLayerId(layer.id));
+    removeSourceIfExists(map, labelSourceId(layer.id));
+  }
 }
 
 // syncs can fire rapidly (e.g. dragging an opacity slider), and this is an O(n)
 // scan that the tiled path now runs against 50k+ feature collections. Memoize by
 // collection reference — the store replaces the object on every mutation.
 const textMarkerCache = new WeakMap<GeoJSON.FeatureCollection, boolean>();
+
+// Deduplicated label features are also O(n) over the source, so memoize them by
+// collection reference (keyed by the field + mode, since both change the result)
+// to avoid rebuilding on every rapid sync.
+const dedupedLabelCache = new WeakMap<
+  GeoJSON.FeatureCollection,
+  Map<string, GeoJSON.FeatureCollection | null>
+>();
+
+function getDedupedLabelFeatures(
+  collection: GeoJSON.FeatureCollection,
+  field: string,
+  mode: "off" | "unique" | "concatenate",
+): GeoJSON.FeatureCollection | null {
+  let byKey = dedupedLabelCache.get(collection);
+  if (!byKey) {
+    byKey = new Map();
+    dedupedLabelCache.set(collection, byKey);
+  }
+  const key = `${mode}:${field}`;
+  if (byKey.has(key)) return byKey.get(key) ?? null;
+  const result = buildDedupedLabelFeatures(collection, field, mode);
+  byKey.set(key, result);
+  return result;
+}
+
+function removeSourceIfExists(map: maplibregl.Map, id: string): void {
+  if (map.getSource(id)) map.removeSource(id);
+}
 
 // Keep this predicate aligned with textMarkerFilter: any text-marker-shaped
 // point routes to the symbol layer, even with empty text, so features are
@@ -1555,10 +2084,23 @@ function syncRasterTileLayer(
   const src = sourceId(layer.id);
   const lid = `layer-${layer.id}-raster`;
   const tiles = getRenderableRasterTiles(layer);
-  const tileSize = (layer.source.tileSize as number | undefined) ?? 256;
+  const tileSize = numberSource(layer.source.tileSize) ?? 256;
   if (tiles.length === 0) return;
   if (!map.getSource(src)) {
-    map.addSource(src, { type: "raster", tiles, tileSize });
+    const bounds = boundsSource(layer.source.bounds);
+    const minzoom = numberSource(layer.source.minzoom);
+    const maxzoom = numberSource(layer.source.maxzoom);
+    const attribution = stringSource(layer.source.attribution);
+    map.addSource(src, {
+      type: "raster",
+      tiles,
+      tileSize,
+      ...(minzoom !== undefined ? { minzoom } : {}),
+      ...(maxzoom !== undefined ? { maxzoom } : {}),
+      ...(bounds ? { bounds } : {}),
+      ...(layer.source.scheme === "tms" ? { scheme: "tms" as const } : {}),
+      ...(attribution ? { attribution } : {}),
+    });
   }
   ensureLayer(
     map,
@@ -1575,15 +2117,15 @@ function syncRasterTileLayer(
   );
 }
 
-type VideoCoordinates = [
+type CornerCoordinates = [
   [number, number],
   [number, number],
   [number, number],
   [number, number],
 ];
 
-/** Validate persisted video corners: four in-range [lng, lat] pairs. */
-function isVideoCoordinates(value: unknown): value is VideoCoordinates {
+/** Validate persisted overlay corners (video/image): four in-range [lng, lat] pairs. */
+function isCornerCoordinates(value: unknown): value is CornerCoordinates {
   return (
     Array.isArray(value) &&
     value.length === 4 &&
@@ -1623,7 +2165,7 @@ function syncVideoLayer(
           typeof value === "string" && value.trim().length > 0,
       )
     : [];
-  const coordinates = isVideoCoordinates(layer.source.coordinates)
+  const coordinates = isCornerCoordinates(layer.source.coordinates)
     ? layer.source.coordinates
     : undefined;
   if (urls.length === 0 || !coordinates) return;
@@ -1631,6 +2173,51 @@ function syncVideoLayer(
     map.addSource(src, { type: "video", urls, coordinates });
     // MapLibre's VideoSource exposes setCoordinates() but no URL setter, so a
     // future edit-layer flow would need to remove + re-add to change urls.
+  }
+  ensureLayer(
+    map,
+    lid,
+    {
+      id: lid,
+      type: "raster",
+      source: src,
+      ...styleLayerZoomRange(layer.style),
+      paint: rasterPaint(layer.style, layer.opacity),
+      layout: { visibility: layer.visible ? "visible" : "none" },
+    },
+    beforeId,
+  );
+}
+
+/**
+ * A georeferenced image overlay (MapLibre `type: "image"` source rendered as a
+ * raster layer), produced by the Raster Georeferencer. The source carries a
+ * single image `url` (an http(s) or data URL) and the four corner `coordinates`
+ * in [lng, lat] order: top-left, top-right, bottom-right, bottom-left.
+ */
+function syncImageLayer(
+  map: maplibregl.Map,
+  layer: GeoLibreLayer,
+  beforeId?: string,
+): void {
+  const src = sourceId(layer.id);
+  const lid = `layer-${layer.id}-image`;
+  const url =
+    typeof layer.source.url === "string" && layer.source.url.length > 0
+      ? layer.source.url
+      : undefined;
+  const coordinates = isCornerCoordinates(layer.source.coordinates)
+    ? layer.source.coordinates
+    : undefined;
+  if (!url || !coordinates) return;
+  const existing = map.getSource(src);
+  if (!existing) {
+    map.addSource(src, { type: "image", url, coordinates });
+  } else if (existing.type === "image") {
+    // Unlike VideoSource, MapLibre's ImageSource can replace both the url and
+    // the corners in place, so a re-render (e.g. a future edit-GCPs flow) keeps
+    // the overlay in sync instead of leaving the old image pinned.
+    (existing as maplibregl.ImageSource).updateImage({ url, coordinates });
   }
   ensureLayer(
     map,
@@ -2154,7 +2741,25 @@ function ensureLayer(
   }
   const validBeforeId =
     beforeId && map.getLayer(beforeId) ? beforeId : undefined;
-  map.addLayer(spec, validBeforeId);
+  // MapLibre's addLayer rejects (and silently drops, without throwing) a layer
+  // whose paint carries an explicit `null`. `null` is only valid as a
+  // setPaintProperty reset, which the update branch above uses; on first add it
+  // must be stripped so e.g. `fill-pattern: null` (the "no pattern" reset) does
+  // not blank the whole fill layer. Properties simply absent default correctly.
+  // Scoped to `paint` deliberately: `fill-pattern` is the only reset-via-null in
+  // this file. Extend to `layout` here if a layout property ever uses the same
+  // null-reset pattern.
+  const addSpec =
+    spec.paint &&
+    Object.values(spec.paint).some((value) => value === null)
+      ? {
+          ...spec,
+          paint: Object.fromEntries(
+            Object.entries(spec.paint).filter(([, value]) => value !== null),
+          ),
+        }
+      : spec;
+  map.addLayer(addSpec, validBeforeId);
 }
 
 function setLayerZoomRange(
@@ -2229,6 +2834,8 @@ function removeGeoJsonRenderLayers(map: maplibregl.Map, layerId: string): void {
     clusterLayerId(layerId),
     clusterCountLayerId(layerId),
     textLayerId(layerId),
+    markerLayerId(layerId),
+    labelLayerId(layerId),
   ]) {
     removeIfExists(map, id);
   }
@@ -2265,8 +2872,11 @@ export function removeLayerFromMap(
     clusterLayerId(layerId),
     clusterCountLayerId(layerId),
     textLayerId(layerId),
+    markerLayerId(layerId),
+    labelLayerId(layerId),
     `layer-${layerId}-raster`,
     `layer-${layerId}-video`,
+    `layer-${layerId}-image`,
     ...(layer ? vectorTileAllStyleLayerIds(layer) : []),
     vectorTileCircleLayerId(layerId),
     vectorTileLineLayerId(layerId),
@@ -2275,7 +2885,11 @@ export function removeLayerFromMap(
   ]) {
     if (map.getLayer(id)) map.removeLayer(id);
   }
-  for (const src of [...getExternalSourceIds(layer), sourceId(layerId)]) {
+  for (const src of [
+    ...getExternalSourceIds(layer),
+    sourceId(layerId),
+    labelSourceId(layerId),
+  ]) {
     if (src && map.getSource(src)) map.removeSource(src);
   }
   // Free any client-side tile index built for this layer's tiled render path.

@@ -1,36 +1,57 @@
+import { useAppStore } from "@geolibre/core";
 import {
-  DEFAULT_LAYER_STYLE,
-  type GeoLibreLayer,
-  useAppStore,
-} from "@geolibre/core";
-import {
+  addCogRasterLayer,
+  maplibreAnnotationsPlugin,
   maplibreBasemapControlPlugin,
   maplibreComponentsPlugin,
   maplibreDeckGlVizPlugin,
   maplibreDirectionsPlugin,
   maplibreEffectsPlugin,
+  getEffectsSettings,
+  setEffectsSettings,
+  type EffectsSettings,
   maplibreEnviroAtlasPlugin,
   maplibreEsriWaybackPlugin,
   maplibreFemaWmsPlugin,
   maplibreGeoAgentPlugin,
   maplibreGeoEditorPlugin,
   maplibreLayerControlPlugin,
-  maplibreLidarPlugin,
   maplibreNasaEarthdataPlugin,
   maplibreNationalMapPlugin,
   maplibreOvertureMapsPlugin,
+  maplibreGraticulePlugin,
   maplibreReverseGeocodePlugin,
   maplibreStreetViewPlugin,
   maplibreSwipePlugin,
+  SWIPE_PLUGIN_ID,
   maplibreTimeSliderPlugin,
+  maplibreUsgsLidarPlugin,
   PluginManager,
+  registerRightPanel,
+  unregisterRightPanel,
+  openRightPanel,
+  collapseRightPanel,
+  closeRightPanel,
+  getActiveRightPanel,
+  setActiveRightPanelDock,
+  getActiveRightPanelDock,
+  registerToolbarMenu,
+  unregisterToolbarMenu,
+  registerFloatingPanel,
+  unregisterFloatingPanel,
+  openFloatingPanel,
+  closeFloatingPanel,
+  getOpenFloatingPanels,
 } from "@geolibre/plugins";
 import type { MapController } from "@geolibre/map";
 import type {
+  GeoLibreCogLayerOptions,
   GeoLibreDeckGL,
   GeoLibreExternalNativeLayerRegistration,
   GeoLibreFileDialogOptions,
   GeoLibreMapControlPosition,
+  GeoLibreTileLayerOptions,
+  GeoLibreWmsLayerOptions,
 } from "@geolibre/plugins";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -39,20 +60,44 @@ import type { RefObject } from "react";
 import { useEffect, useSyncExternalStore } from "react";
 import { bundledPluginManifestPaths } from "virtual:bundled-plugins";
 import {
+  installWebPluginArchive,
+  listInstalledWebPlugins,
   loadExternalPlugins,
   reloadExternalUrlPlugin,
   resolvePluginAssetUrlForLoadedPlugin,
+  uninstallWebPlugin,
+  unloadFilesystemPlugin,
   unloadRemovedUrlPlugins,
+  type InstalledWebPlugin,
 } from "../lib/external-plugins";
 import { appendDiagnostic } from "../lib/diagnostics";
+import { createWmsTileUrl } from "../components/layout/add-data/helpers";
+import { createExternalNativeStoreLayer } from "../lib/external-native-layer";
 import { mergeStringLists } from "../lib/string-lists";
 import {
+  browserSaveFallsBackToDownload,
   openLocalDataFileWithFallback,
+  pickVectorFilesWithSidecars,
+  readVectorFileWithSidecars,
   saveTextFileWithFallback,
 } from "../lib/tauri-io";
 import { useDesktopSettingsStore } from "./useDesktopSettings";
+import { ensureFileExtension, useFileNamePrompt } from "./useFileNamePrompt";
 
 const RASTER_PROXY_PATH = "/__geolibre_raster_proxy";
+
+/**
+ * Translate the public {@link GeoLibreTileLayerOptions} into the option bag
+ * passed straight to `store.addTileLayer(name, opts, ...)`, dropping
+ * `beforeLayerId` (which the store takes as a separate positional argument).
+ * The remaining keys mix source-level fields (tileSize, bounds, ...) and
+ * layer-level ones (visible, opacity); the store reads each by name.
+ */
+function tileLayerStoreOptions(options?: GeoLibreTileLayerOptions) {
+  if (!options) return {};
+  const { beforeLayerId: _beforeLayerId, ...rest } = options;
+  return rest;
+}
 
 /** Records a plugin failure in the diagnostics panel without crashing the app. */
 function reportPluginError(
@@ -77,6 +122,8 @@ interface TauriRuntimeWindow extends Window {
 const manager = new PluginManager();
 manager.registerAll([
   maplibreLayerControlPlugin,
+  maplibreGeoEditorPlugin,
+  maplibreAnnotationsPlugin,
   maplibreBasemapControlPlugin,
   // The four web service plugins are grouped into the "Web Services"
   // submenu, rendered where the first of them appears in this order.
@@ -88,10 +135,10 @@ manager.registerAll([
   maplibreTimeSliderPlugin,
   maplibreOvertureMapsPlugin,
   maplibreGeoAgentPlugin,
-  maplibreGeoEditorPlugin,
-  maplibreLidarPlugin,
+  maplibreUsgsLidarPlugin,
   maplibreStreetViewPlugin,
   maplibreSwipePlugin,
+  maplibreGraticulePlugin,
   maplibreEffectsPlugin,
   maplibreDirectionsPlugin,
   maplibreReverseGeocodePlugin,
@@ -99,54 +146,28 @@ manager.registerAll([
   maplibreComponentsPlugin,
 ]);
 
-function createExternalNativeStoreLayer(
-  registration: GeoLibreExternalNativeLayerRegistration,
-  existing?: GeoLibreLayer,
-): GeoLibreLayer {
-  const sourceIds = registration.sourceIds?.length
-    ? registration.sourceIds
-    : registration.sourceId
-      ? [registration.sourceId]
-      : [];
-  const sourceId = registration.sourceId ?? sourceIds[0];
-
-  return {
-    id: registration.id,
-    name: registration.name,
-    type: registration.type ?? "geojson",
-    source: {
-      ...(registration.source ?? { type: "geojson" }),
-      ...(sourceId ? { sourceId } : {}),
-    },
-    visible: existing?.visible ?? true,
-    opacity: existing?.opacity ?? registration.opacity ?? 1,
-    style: {
-      ...DEFAULT_LAYER_STYLE,
-      ...(registration.style ?? {}),
-      ...(existing?.style ?? {}),
-    } as GeoLibreLayer["style"],
-    metadata: {
-      ...(existing?.metadata ?? {}),
-      ...(registration.metadata ?? {}),
-      externalNativeLayer: true,
-      nativeLayerIds: registration.nativeLayerIds,
-      sourceIds,
-      ...(sourceId ? { sourceId } : {}),
-    },
-    beforeId: registration.beforeId ?? existing?.beforeId,
-    geojson: registration.geojson ?? existing?.geojson,
-    sourcePath: registration.sourcePath ?? existing?.sourcePath,
-  };
-}
-
 let externalPluginsLoaded = false;
 let externalPluginsLoadPromise: Promise<void> | null = null;
 let externalPluginsLoadKey: string | null = null;
+let externalPluginLoadIssues = new Map<string, string>();
 const externalPluginsListeners = new Set<() => void>();
 const EMPTY_PLUGIN_MANIFEST_URLS: string[] = [];
 
 export function getPluginManager(): PluginManager {
   return manager;
+}
+
+export function getExternalPluginLoadIssues(): ReadonlyMap<string, string> {
+  return externalPluginLoadIssues;
+}
+
+export function subscribeToExternalPluginLoads(
+  listener: () => void,
+): () => void {
+  // Shares the ready-state listener set so marketplace rows update for both
+  // successful loads and per-plugin load issues.
+  externalPluginsListeners.add(listener);
+  return () => externalPluginsListeners.delete(listener);
 }
 
 // Upgrade an installed external plugin in place by re-fetching its manifest URL
@@ -163,6 +184,72 @@ export async function upgradeExternalPlugin(
   );
 }
 
+// Install a plugin from a local `.zip` archive (desktop only). The Rust backend
+// validates the archive and copies it into GeoLibre's app-data plugins
+// directory so it persists across restarts; the plugins directory is then
+// re-scanned so the new plugin loads without a reload. A reinstall of an
+// already-loaded plugin id is unloaded first so the updated archive replaces it
+// instead of being skipped by the loaded-source dedup. Returns the installed
+// plugin id.
+export async function installPluginArchive(
+  sourcePath: string,
+  mapControllerRef: RefObject<MapController | null>,
+): Promise<string> {
+  if (!isTauriRuntime()) {
+    throw new Error("Installing plugin archives requires the desktop app.");
+  }
+  const pluginId = await invoke<string>("install_external_plugin_archive", {
+    sourcePath,
+  });
+  const app = createAppAPI(mapControllerRef);
+  // The archive was overwritten in place for a reinstall; drop the loaded copy
+  // so the forced re-scan re-registers the updated version under the same id.
+  unloadFilesystemPlugin(manager, pluginId, app);
+  const desktopSettings = useDesktopSettingsStore.getState().desktopSettings;
+  const projectManifestUrls =
+    useAppStore.getState().projectPlugins?.manifestUrls ??
+    EMPTY_PLUGIN_MANIFEST_URLS;
+  await ensureExternalPluginsLoadedWithSettings(
+    desktopSettings,
+    projectManifestUrls,
+    app,
+    { force: true },
+  );
+  return pluginId;
+}
+
+// Install a plugin from an uploaded `.zip` in the browser (web build). The
+// archive is unpacked and validated client-side, registered immediately, and
+// persisted in IndexedDB so it reloads on the next visit. On desktop, use
+// installPluginArchive instead (it copies the zip onto disk via the backend).
+// Returns the installed plugin id.
+export async function installPluginArchiveFromFile(
+  fileName: string,
+  bytes: Uint8Array,
+  mapControllerRef: RefObject<MapController | null>,
+): Promise<string> {
+  return installWebPluginArchive(
+    manager,
+    fileName,
+    bytes,
+    createAppAPI(mapControllerRef),
+  );
+}
+
+// Uninstall a plugin that was installed from a file in the browser.
+export async function uninstallPluginArchiveFromFile(
+  pluginId: string,
+  mapControllerRef: RefObject<MapController | null>,
+): Promise<void> {
+  await uninstallWebPlugin(manager, pluginId, createAppAPI(mapControllerRef));
+}
+
+// List plugins installed from a file (browser IndexedDB), for the Manage
+// Plugins UI. Returns an empty list on desktop and where IndexedDB is absent.
+export function listPluginArchivesFromFile(): Promise<InstalledWebPlugin[]> {
+  return listInstalledWebPlugins();
+}
+
 export function usePluginRegistry() {
   useSyncExternalStore(
     (listener) => manager.subscribe(listener),
@@ -177,6 +264,12 @@ export function usePluginRegistry() {
     getProjectState: () => manager.getProjectState(),
     toggle: (id: string, appApi: ReturnType<typeof createAppAPI>) => {
       const before = JSON.stringify(projectPluginStateSnapshot());
+      // Layer Swipe and split view are mutually exclusive comparison modes:
+      // stacking the swipe slider over a multi-pane grid fragments the
+      // workspace (#844). The reverse direction (entering split view turns
+      // swipe off) is handled by useSwipeSplitViewExclusivity.
+      const collapseGridForSwipe =
+        id === SWIPE_PLUGIN_ID && !manager.isActive(id);
       // Plugin controls are imperative MapLibre code, so a throw here escapes
       // React's error boundaries. Contain it so one bad plugin can't break the
       // toggle handler — surface it in diagnostics instead. Return without
@@ -190,6 +283,20 @@ export function usePluginRegistry() {
         // early return below; in-memory state is not rolled back.
         reportPluginError(id, "toggle", error);
         return;
+      }
+      // Collapse the grid only once swipe actually activated, so a failed
+      // activation (a throw above, or addMapControl returning false) leaves the
+      // user's split-view layout intact. Done synchronously before React flushes
+      // effects so useSwipeSplitViewExclusivity sees the single-pane grid and
+      // doesn't undo the activation it just allowed.
+      // Relies on maplibre-swipe activating synchronously (activate returns
+      // false/undefined, never a Promise). PluginManager.activate marks a plugin
+      // active optimistically and only rolls back async failures via
+      // watchAsyncActivation, so isActive() would read true here before an async
+      // mount confirms — revisit this guard if swipe ever gains a dynamic import.
+      if (collapseGridForSwipe && manager.isActive(id)) {
+        const { mapLayout, setMapGrid } = useAppStore.getState();
+        if (mapLayout.rows * mapLayout.cols > 1) setMapGrid(1, 1);
       }
       persistProjectPluginState(before);
     },
@@ -206,6 +313,43 @@ export function usePluginRegistry() {
         return;
       }
       persistProjectPluginState(before);
+    },
+    getEffectsSettings,
+    // Live preview: push the appearance change straight to the engine for an
+    // instant redraw, but do NOT persist. A color-picker drag or slider scrub
+    // fires this every frame, so keeping persistence out avoids marking the
+    // project dirty and sweeping Zustand subscribers on every pixel of movement.
+    previewEffectsSettings: (next: Partial<EffectsSettings>) => {
+      // Contained like toggle/reposition: setEffectsSettings drives imperative
+      // canvas code (engine.applySettings) that can throw and escape React's
+      // error boundaries; surface it in diagnostics instead of crashing.
+      try {
+        setEffectsSettings(next);
+      } catch (error) {
+        reportPluginError(maplibreEffectsPlugin.id, "preview-effects", error);
+      }
+    },
+    // Commit: called once when an edit gesture ends (slider release, color
+    // input blur, reset, or the submenu closing). Persists only when the
+    // appearance actually differs from what the project already holds, so a
+    // no-op gesture does not flag the project dirty.
+    commitEffectsSettings: () => {
+      try {
+        const storedSettings =
+          useAppStore.getState().projectPlugins?.settings?.[
+            maplibreEffectsPlugin.id
+          ];
+        const currentSettings = maplibreEffectsPlugin.getProjectState?.();
+        if (
+          JSON.stringify(storedSettings ?? null) ===
+          JSON.stringify(currentSettings ?? null)
+        ) {
+          return;
+        }
+        useAppStore.getState().setProjectPlugins(projectPluginStateSnapshot());
+      } catch (error) {
+        reportPluginError(maplibreEffectsPlugin.id, "commit-effects", error);
+      }
     },
   };
 }
@@ -243,6 +387,39 @@ export function useExternalPluginsReady(
   );
 }
 
+/**
+ * Enforces mutual exclusivity between Layer Swipe and split view (#844). The two
+ * are competing comparison tools: overlaying the swipe slider on a multi-pane
+ * grid fragments the workspace, so whenever the grid becomes multi-pane the
+ * Layer Swipe control is deactivated. The reverse direction (activating swipe
+ * collapses the grid to a single map) lives in `usePluginRegistry().toggle`.
+ *
+ * Mounted once near the app root so it covers every way into split view — the
+ * View menu, loading a project, or a plugin — not just the toolbar item.
+ */
+export function useSwipeSplitViewExclusivity(
+  mapControllerRef: RefObject<MapController | null>,
+): void {
+  const paneCount = useAppStore(
+    (state) => state.mapLayout.rows * state.mapLayout.cols,
+  );
+
+  useEffect(() => {
+    if (paneCount <= 1 || !manager.isActive(SWIPE_PLUGIN_ID)) return;
+    // Deactivate via the manager and persist, mirroring usePluginRegistry's
+    // toggle so the project records swipe as off and a stray throw from the
+    // imperative control can't escape React.
+    const before = JSON.stringify(projectPluginStateSnapshot());
+    try {
+      manager.toggle(SWIPE_PLUGIN_ID, createAppAPI(mapControllerRef));
+    } catch (error) {
+      reportPluginError(SWIPE_PLUGIN_ID, "toggle", error);
+      return;
+    }
+    persistProjectPluginState(before);
+  }, [paneCount, mapControllerRef]);
+}
+
 // Manifest URLs for plugins baked into the build under public/plugins/<id>/.
 // Resolved against the app origin and base so they fetch same-origin on both
 // the web build and the desktop build (which serves the same frontend from
@@ -268,6 +445,7 @@ function ensureExternalPluginsLoadedWithSettings(
   >["desktopSettings"],
   projectPluginManifestUrls: string[],
   app: ReturnType<typeof createAppAPI>,
+  options?: { force?: boolean },
 ): Promise<void> {
   const pluginManifestUrls = mergeStringLists(
     bundledPluginManifestUrls(),
@@ -278,13 +456,23 @@ function ensureExternalPluginsLoadedWithSettings(
     additionalPluginDirectories: desktopSettings.additionalPluginDirectories,
     pluginManifestUrls,
   });
-  if (externalPluginsLoaded && externalPluginsLoadKey === loadKey) {
+  // `force` re-scans even when the merged settings are unchanged. Installing a
+  // zip writes a new archive into the app-data plugins directory without
+  // touching the settings that make up loadKey, so the cache-key short-circuits
+  // below would otherwise skip loading the freshly installed plugin.
+  if (!options?.force && externalPluginsLoaded && externalPluginsLoadKey === loadKey) {
     return Promise.resolve();
   }
-  if (externalPluginsLoadPromise && externalPluginsLoadKey === loadKey) {
+  if (
+    !options?.force &&
+    externalPluginsLoadPromise &&
+    externalPluginsLoadKey === loadKey
+  ) {
     return externalPluginsLoadPromise;
   }
 
+  externalPluginLoadIssues = new Map();
+  notifyExternalPluginsListeners();
   setExternalPluginsLoaded(false);
   externalPluginsLoadKey = loadKey;
   // Serialize scans: loadExternalPlugins reads and writes module-level state
@@ -312,6 +500,13 @@ function ensureExternalPluginsLoadedWithSettings(
       );
     })
     .then((result) => {
+      externalPluginLoadIssues = new Map(
+        result.issues.map((issue) => [
+          issue.sourceUrl ?? issue.archiveName,
+          issue.message,
+        ]),
+      );
+      notifyExternalPluginsListeners();
       if (result.loadedPluginIds.length) {
         console.info(
           `Loaded external GeoLibre plugins from ${result.pluginSources.join(
@@ -332,7 +527,12 @@ function ensureExternalPluginsLoadedWithSettings(
       // A settings change can start a new load while this one is in flight.
       // Only the load that still owns the current key may mark plugins ready.
       if (externalPluginsLoadKey !== loadKey) return;
-      externalPluginsLoadPromise = null;
+      // A forced re-scan (install) chains a second load onto this one under the
+      // SAME key, so guard the clear by identity: only null the slot when it
+      // still points at this promise, never at the newer in-flight load.
+      if (externalPluginsLoadPromise === loadPromise) {
+        externalPluginsLoadPromise = null;
+      }
       setExternalPluginsLoaded(true);
     });
 
@@ -344,7 +544,10 @@ export function createAppAPI(
   mapControllerRef?: RefObject<MapController | null>,
 ) {
   const store = useAppStore.getState();
-  return {
+  // Captured so methods that delegate to plugin helpers taking the AppAPI
+  // itself (e.g. addCogLayer -> addCogRasterLayer) can pass `api`. Only read
+  // when those methods are called, which is always after assignment.
+  const api = {
     setBasemap: (url: string) => store.setBasemapStyleUrl(url),
     addGeoJsonLayer: (
       name: string,
@@ -354,6 +557,118 @@ export function createAppAPI(
       const id = store.addGeoJsonLayer(name, data, sourcePath);
       return id;
     },
+    addTileLayer: (
+      name: string,
+      url: string,
+      options?: GeoLibreTileLayerOptions,
+    ) =>
+      store.addTileLayer(
+        name,
+        { type: "xyz", tiles: [url], url, ...tileLayerStoreOptions(options) },
+        options?.beforeLayerId ?? null,
+      ),
+    // Intentionally identical to addTileLayer except for the layer `type`.
+    // XYZ and WMTS tile templates render through the same syncRasterTileLayer
+    // path; the distinct type only changes how the layer is labelled/stored,
+    // so the two helpers share an implementation by design (not a copy-paste).
+    addWmtsLayer: (
+      name: string,
+      url: string,
+      options?: GeoLibreTileLayerOptions,
+    ) =>
+      store.addTileLayer(
+        name,
+        { type: "wmts", tiles: [url], url, ...tileLayerStoreOptions(options) },
+        options?.beforeLayerId ?? null,
+      ),
+    addWmsLayer: (name: string, options: GeoLibreWmsLayerOptions) => {
+      const {
+        beforeLayerId,
+        url,
+        layers,
+        styles,
+        format,
+        transparent,
+        ...tileOptions
+      } = options;
+      // TypeScript enforces these, but an untyped JS plugin can pass "" — an
+      // empty endpoint yields a relative GetMap URL that resolves against the
+      // app origin and passes the store's empty-tile guard, persisting a layer
+      // that only 404s. Reject at the API boundary instead.
+      if (!url) {
+        throw new Error("addWmsLayer: options.url must be a non-empty string.");
+      }
+      if (!layers) {
+        throw new Error(
+          "addWmsLayer: options.layers must be a non-empty string.",
+        );
+      }
+      const tileSize = tileOptions.tileSize ?? 256;
+      const resolvedStyles = styles ?? "";
+      const resolvedFormat = format ?? "image/png";
+      const resolvedTransparent = transparent ?? true;
+      const tileUrl = createWmsTileUrl({
+        endpoint: url,
+        layers,
+        styles: resolvedStyles,
+        format: resolvedFormat,
+        transparent: resolvedTransparent,
+        tileSize,
+      });
+      return store.addTileLayer(
+        name,
+        {
+          type: "wms",
+          tiles: [tileUrl],
+          url,
+          // Persist the WMS request parameters so the layer round-trips through
+          // a saved project, mirroring the Add Data dialog's WMS source.
+          source: {
+            layers,
+            styles: resolvedStyles,
+            format: resolvedFormat,
+            transparent: resolvedTransparent,
+          },
+          ...tileOptions,
+        },
+        beforeLayerId ?? null,
+      );
+    },
+    // Unlike the tile helpers above, a COG is read client-side by the maplibre
+    // raster control (band/rescale/colormap/nodata), so it delegates to the
+    // components plugin's addCogRasterLayer rather than building a store layer
+    // here. It takes the AppAPI itself (to mount the control on demand), so we
+    // hand it the captured `api`.
+    addCogLayer: (
+      name: string,
+      url: string,
+      options?: GeoLibreCogLayerOptions,
+    ) =>
+      addCogRasterLayer(api, {
+        url,
+        name,
+        ...(options?.bands !== undefined ? { bands: options.bands } : {}),
+        // The public option is a loose `string` (so JS plugins need not import
+        // the renderer's colormap union); the renderer validates the name and
+        // falls back to its default for anything it doesn't recognize.
+        ...(options?.colormap !== undefined
+          ? {
+              colormap:
+                options.colormap as Parameters<
+                  typeof addCogRasterLayer
+                >[1]["colormap"],
+            }
+          : {}),
+        ...(options?.rescaleMin !== undefined
+          ? { rescaleMin: options.rescaleMin }
+          : {}),
+        ...(options?.rescaleMax !== undefined
+          ? { rescaleMax: options.rescaleMax }
+          : {}),
+        ...(options?.nodata !== undefined ? { nodata: options.nodata } : {}),
+        ...(options?.opacity !== undefined ? { opacity: options.opacity } : {}),
+        beforeLayerId: options?.beforeLayerId ?? null,
+      }),
     getActiveBasemap: () => useAppStore.getState().basemapStyleUrl,
     onBasemapChange: (callback: (styleUrl: string) => void) =>
       useAppStore.subscribe((state, prev) => {
@@ -367,6 +682,13 @@ export function createAppAPI(
       mapControllerRef?.current?.fitBounds(bounds),
     getMap: () => mapControllerRef?.current?.getMap() ?? null,
     pickLocalDirectoryFiles,
+    // Present only on desktop (filesystem access); the Vector panel keys off its
+    // presence to auto-discover shapefile sidecars instead of forcing the user
+    // to select every component, and to capture the file's path for restore.
+    pickVectorFilesWithSidecars: isTauriRuntime()
+      ? pickVectorFilesWithSidecars
+      : undefined,
+    readLocalVectorFile: readVectorFileWithSidecars,
     exportTextFile: (
       filename: string,
       content: string,
@@ -375,17 +697,30 @@ export function createAppAPI(
       const description = options?.description ?? "GeoJSON";
       const extensions = options?.extensions ?? ["geojson", "json"];
       const mimeType = options?.mimeType ?? "application/geo+json";
-      void saveTextFileWithFallback(content, {
-        defaultName: filename,
-        filters: [{ name: description, extensions }],
-        browserTypes: [
-          {
-            description,
-            accept: { [mimeType]: extensions.map((ext) => `.${ext}`) },
-          },
-        ],
-        mimeType,
-      }).catch((error) => {
+      void (async () => {
+        let defaultName = filename;
+        // Browsers without the File System Access picker can only download under
+        // a fixed name. When the caller opts in, prompt so the user can choose
+        // it (Tauri and Chromium already offer a name via their save dialogs).
+        if (options?.promptName && browserSaveFallsBackToDownload()) {
+          const chosen = await useFileNamePrompt.getState().prompt({
+            defaultName: filename,
+          });
+          if (chosen === null) return;
+          defaultName = ensureFileExtension(chosen, extensions);
+        }
+        await saveTextFileWithFallback(content, {
+          defaultName,
+          filters: [{ name: description, extensions }],
+          browserTypes: [
+            {
+              description,
+              accept: { [mimeType]: extensions.map((ext) => `.${ext}`) },
+            },
+          ],
+          mimeType,
+        });
+      })().catch((error) => {
         console.error(`Could not export ${filename}.`, error);
       });
     },
@@ -466,7 +801,63 @@ export function createAppAPI(
           }),
         ));
     })(),
+    // Hand external plugins GeoLibre's own maplibre-gl-raster module so they
+    // render COGs on the host's single deck.gl/luma.gl instance. A bundled
+    // second copy throws on luma.gl's "already initialized" guard. Memoized so
+    // repeated calls reuse one resolved module.
+    getMaplibreGlRaster: (() => {
+      let cached: Promise<typeof import("maplibre-gl-raster")> | undefined;
+      return () =>
+        (cached ??= import("maplibre-gl-raster").catch((error) => {
+          // Don't memoize a rejection: a transient chunk-load failure would
+          // otherwise poison getMaplibreGlRaster() for the whole session.
+          cached = undefined;
+          throw error;
+        }));
+    })(),
+    // Set the persisted projection preference so the host's projection
+    // enforcement keeps it (a raw map.setProjection is reverted on idle).
+    // deck.gl-backed plugins need mercator; globe breaks deck tile traversal.
+    setMapProjection: (projection: "globe" | "mercator") => {
+      // External plugins call through a JS boundary where TypeScript can't
+      // enforce the union, so reject anything else. An invalid value would be
+      // persisted and make enforceProjection throw and reschedule on every idle
+      // forever.
+      if (projection !== "globe" && projection !== "mercator") {
+        console.warn(
+          `[GeoLibre] setMapProjection: ignoring unknown projection "${String(projection)}" (expected "globe" or "mercator").`,
+        );
+        return;
+      }
+      const store = useAppStore.getState();
+      const { map } = store.preferences;
+      if (map.projection === projection) return;
+      store.setPreferences({
+        ...store.preferences,
+        map: { ...map, projection },
+      });
+    },
+    getMapProjection: () =>
+      // Legacy projects may not carry a projection preference; default to globe
+      // like MapController.enforceProjection so the declared return type holds.
+      useAppStore.getState().preferences.map.projection ?? "globe",
+    registerRightPanel,
+    unregisterRightPanel,
+    openRightPanel,
+    collapseRightPanel,
+    closeRightPanel,
+    getActiveRightPanel,
+    setActiveRightPanelDock,
+    getActiveRightPanelDock,
+    registerToolbarMenu,
+    unregisterToolbarMenu,
+    registerFloatingPanel,
+    unregisterFloatingPanel,
+    openFloatingPanel,
+    closeFloatingPanel,
+    getOpenFloatingPanels,
   };
+  return api;
 }
 
 async function fetchRemoteArrayBuffer(url: string): Promise<ArrayBuffer> {
@@ -580,6 +971,10 @@ function isTauriRuntime(): boolean {
 function setExternalPluginsLoaded(loaded: boolean): void {
   if (externalPluginsLoaded === loaded) return;
   externalPluginsLoaded = loaded;
+  notifyExternalPluginsListeners();
+}
+
+function notifyExternalPluginsListeners(): void {
   for (const listener of externalPluginsListeners) listener();
 }
 

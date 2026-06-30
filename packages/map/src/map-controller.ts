@@ -6,6 +6,7 @@ import {
 } from "@geolibre/core";
 import type {
   GeoLibreLayer,
+  LayerStyle,
   MapPreferences,
   MapProjection,
   MapViewState,
@@ -38,6 +39,8 @@ import {
   syncLayer,
   vectorTileStyleLayerIds,
 } from "./layer-sync";
+import { installGlobePopupOcclusion } from "./globe-popup-occlusion";
+import { ResetBearingControl } from "./reset-bearing-control";
 
 const DEFAULT_PROJECTION: maplibregl.ProjectionSpecification = {
   type: "globe",
@@ -58,7 +61,10 @@ const NON_BASEMAP_STYLE_LAYER_IDS = [
 ];
 const OPACITY_PAINT_PROPERTIES: Record<string, string[]> = {
   background: ["background-opacity"],
-  circle: ["circle-opacity"],
+  // A point's outline fades with its fill so story playback can fully hide a
+  // circle layer; without the stroke property a faded-out point still renders
+  // as a hollow ring (#934).
+  circle: ["circle-opacity", "circle-stroke-opacity"],
   fill: ["fill-opacity"],
   "fill-extrusion": ["fill-extrusion-opacity"],
   heatmap: ["heatmap-opacity"],
@@ -90,6 +96,45 @@ const EMPTY_HIGHLIGHT: FeatureCollection = {
 
 function isCustomControllableLayer(layer: GeoLibreLayer): boolean {
   return typeof layer.metadata.customLayerType === "string";
+}
+
+/**
+ * Translate a MapLibre paint property edited in the layer control's per-layer
+ * style editor into a partial {@link LayerStyle} update for the store, so the
+ * floating editor and the right-hand Style sidebar stay in sync (issue #912).
+ *
+ * Scope is deliberately limited to the raster color adjustments, which map
+ * one-to-one to {@link LayerStyle} fields. Vector paint is **not** round-tripped
+ * here: GeoLibre renders vector layers through an expression-based style model
+ * (opacities are scaled by the layer opacity, and width/radius/colors become
+ * `interpolate`/`case` expressions under proportional sizing, the meters width
+ * unit, a data-driven `vectorStyleMode`, or simplestyle). The value the control
+ * reads back is the *rendered* paint, so storing it verbatim would corrupt
+ * those configurations. The control still applies vector edits to the map; the
+ * sidebar Style panel remains the canonical editor for vector symbology.
+ * Layer-level opacity is handled separately — see
+ * {@link MapController.applyLayerControlStyleChange}.
+ */
+export function layerControlPaintToStyle(
+  property: string,
+  value: unknown,
+): Partial<LayerStyle> | null {
+  if (typeof value !== "number") return null;
+
+  switch (property) {
+    case "raster-brightness-min":
+      return { rasterBrightnessMin: value };
+    case "raster-brightness-max":
+      return { rasterBrightnessMax: value };
+    case "raster-saturation":
+      return { rasterSaturation: value };
+    case "raster-contrast":
+      return { rasterContrast: value };
+    case "raster-hue-rotate":
+      return { rasterHueRotate: value };
+    default:
+      return null;
+  }
 }
 
 function nativeLayerSuffix(layerId: string): string | undefined {
@@ -159,6 +204,7 @@ interface GeoLibreLayerLabelWindow extends Window {
 export type BuiltInMapControl =
   | "navigation"
   | "fullscreen"
+  | "compass"
   | "geolocate"
   | "globe"
   | "terrain"
@@ -171,8 +217,9 @@ export const DEFAULT_BUILT_IN_CONTROL_VISIBILITY: Record<
   BuiltInMapControl,
   boolean
 > = {
-  navigation: true,
+  navigation: false,
   fullscreen: true,
+  compass: true,
   geolocate: false,
   globe: true,
   terrain: false,
@@ -188,6 +235,7 @@ export const DEFAULT_BUILT_IN_CONTROL_POSITIONS: Record<
 > = {
   navigation: "top-right",
   fullscreen: "top-right",
+  compass: "top-right",
   geolocate: "top-right",
   globe: "top-right",
   terrain: "top-right",
@@ -201,6 +249,9 @@ export class MapController {
   private map: maplibregl.Map | null = null;
   private navigationControl: maplibregl.NavigationControl | null = null;
   private fullscreenControl: maplibregl.FullscreenControl | null = null;
+  private compassControl: ResetBearingControl | null = null;
+  private compassLabel = "Reset pitch & bearing";
+  private backgroundLabel = "Background";
   private geolocateControl: maplibregl.GeolocateControl | null = null;
   private globeControl: maplibregl.GlobeControl | null = null;
   private terrainControl: maplibregl.TerrainControl | null = null;
@@ -209,6 +260,10 @@ export class MapController {
   private logoControl: maplibregl.LogoControl | null = null;
   private layerControl: LayerControl | null = null;
   private layerControlSignature = "";
+  // True while pushing store paint back into the layer control's open style
+  // editor, so onLayerStyleChange callbacks during that refresh are ignored
+  // (reentrancy guard against a sync loop). See syncLayerControlState.
+  private refreshingStyleEditor = false;
   private basemapStyleUrl = DEFAULT_BASEMAP;
   private basemapVisible = true;
   private basemapOpacity = 1;
@@ -233,9 +288,22 @@ export class MapController {
       styleUrl?: string;
       mapView?: MapViewState;
       mapPreferences?: MapPreferences;
+      /**
+       * Override built-in control visibility before the controls are added.
+       * Secondary (split/grid) map panes pass `{ "layer-control": false }` so
+       * they don't mount a second layer control that would write the shared
+       * layer/basemap state back to the global store.
+       */
+      controlVisibility?: Partial<Record<BuiltInMapControl, boolean>>;
     },
   ): maplibregl.Map {
     const view = options.mapView;
+    if (options.controlVisibility) {
+      this.controlVisibility = {
+        ...this.controlVisibility,
+        ...options.controlVisibility,
+      };
+    }
     const mapPreferences = options.mapPreferences ?? this.mapPreferences;
     const minZoom = clampNumber(mapPreferences.minZoom, 0, 24);
     const maxZoom = Math.max(minZoom, clampNumber(mapPreferences.maxZoom, 0, 24));
@@ -263,6 +331,7 @@ export class MapController {
       // Trade-off: adds one extra framebuffer copy per frame on tiled renderers.
       canvasContextAttributes: { preserveDrawingBuffer: true },
     });
+    installGlobePopupOcclusion(maplibregl);
     // The constructor options above already apply the static constraints.
     // The transform constraint is installed by the MapCanvas effect that
     // fires on mount, so calling applyMapPreferences here would only add a
@@ -278,8 +347,16 @@ export class MapController {
     this.map.on("style.load", handleStyleReady);
     this.map.once("load", handleStyleReady);
     this.map.once("idle", () => this.enforceProjection());
-    this.addNavigationControl();
+    // Add the fullscreen toggle first so it anchors the top of the top-right
+    // control cluster, matching the universal placement users expect (issue
+    // #512). MapLibre stacks controls in insertion order within a corner.
     this.addFullscreenControl();
+    // Added right after fullscreen so, with both at their default top-right
+    // position, the compass stacks directly below the fullscreen toggle (the
+    // placement requested in issue #508). MapLibre orders controls by insertion
+    // within a corner.
+    this.addCompassControl();
+    this.addNavigationControl();
     this.addGeolocateControl();
     this.addGlobeControl();
     this.addTerrainControl();
@@ -291,6 +368,49 @@ export class MapController {
 
   getMap(): maplibregl.Map | null {
     return this.map;
+  }
+
+  /**
+   * Resolve a layer's rendered GeoJSON from its live MapLibre source.
+   *
+   * The store only keeps inline GeoJSON for layers added from in-memory data;
+   * URL-backed layers (remote GeoJSON, or Parquet/Shapefile converted in the
+   * browser) keep their features only in the MapLibre source. Reading the
+   * source lets callers such as the story-map HTML export inline those features
+   * even when the layer record carries no `geojson`, so the export renders the
+   * same data as the live map (#936).
+   *
+   * @param layerId GeoLibre store layer id.
+   * @returns The source's FeatureCollection, or null when it has none.
+   */
+  async getLayerGeoJson(layerId: string): Promise<FeatureCollection | null> {
+    if (!this.map) return null;
+    const map = this.map;
+    for (const nativeId of this.getNativeLayerIdsByLayerId(layerId)) {
+      const styleLayer = map.getLayer(nativeId);
+      const sourceId =
+        styleLayer && "source" in styleLayer
+          ? (styleLayer as { source?: unknown }).source
+          : undefined;
+      if (typeof sourceId !== "string") continue;
+      const source = map.getSource(sourceId);
+      if (source?.type !== "geojson") continue;
+      try {
+        const data = await (source as maplibregl.GeoJSONSource).getData();
+        // `getData()` returns the source's original data spec: the inline
+        // FeatureCollection for sources set via setData (in-browser-converted
+        // layers), or the raw URL string for URL-backed sources. The `"features"`
+        // guard skips the string case so the export omits such a layer rather
+        // than embedding a bare URL.
+        if (data && typeof data === "object" && "features" in data) {
+          return data as FeatureCollection;
+        }
+      } catch {
+        // A source still loading (or a URL that failed) has no usable data;
+        // fall through so the export simply omits this layer's features.
+      }
+    }
+    return null;
   }
 
   /**
@@ -449,12 +569,17 @@ export class MapController {
    * @param location Target camera (center, zoom, pitch, bearing).
    */
   flyToView(location: StoryChapterLocation): void {
-    this.map?.flyTo({
-      center: location.center,
-      zoom: location.zoom,
-      pitch: location.pitch,
-      bearing: location.bearing,
-    });
+    this.map?.flyTo(
+      {
+        center: location.center,
+        zoom: location.zoom,
+        pitch: location.pitch,
+        bearing: location.bearing,
+      },
+      // Tag as a story camera move (like applyStoryChapterCamera) so viewport
+      // history skips this scripted preview rather than recording it.
+      { storyCameraToken: this.storyCameraToken },
+    );
   }
 
   private isStyleReady(): boolean {
@@ -488,6 +613,7 @@ export class MapController {
     if (visible) {
       if (control === "navigation") return this.addNavigationControl();
       if (control === "fullscreen") return this.addFullscreenControl();
+      if (control === "compass") return this.addCompassControl();
       if (control === "geolocate") return this.addGeolocateControl();
       if (control === "globe") return this.addGlobeControl();
       if (control === "terrain") return this.addTerrainControl();
@@ -499,6 +625,7 @@ export class MapController {
 
     if (control === "navigation") this.removeNavigationControl();
     else if (control === "fullscreen") this.removeFullscreenControl();
+    else if (control === "compass") this.removeCompassControl();
     else if (control === "geolocate") this.removeGeolocateControl();
     else if (control === "globe") this.removeGlobeControl();
     else if (control === "terrain") this.removeTerrainControl();
@@ -529,6 +656,7 @@ export class MapController {
   destroy(): void {
     this.removeNavigationControl();
     this.removeFullscreenControl();
+    this.removeCompassControl();
     this.removeGeolocateControl();
     this.removeGlobeControl();
     this.removeTerrainControl();
@@ -539,7 +667,7 @@ export class MapController {
     this.map?.remove();
     this.map = null;
     this.styleReady = false;
-    this.publishLayerDisplayNames([]);
+    this.clearLayerDisplayNames();
   }
 
   setStyle(url: string): void {
@@ -566,6 +694,15 @@ export class MapController {
   applyView(view: MapViewState): void {
     if (!this.map) return;
     this.map.jumpTo(constrainMapView(view, this.mapPreferences, this.map));
+  }
+
+  /**
+   * Like {@link applyView} but animates the camera (MapLibre `easeTo`) instead
+   * of jumping, for browser-style back/forward viewport navigation.
+   */
+  easeToView(view: MapViewState): void {
+    if (!this.map) return;
+    this.map.easeTo(constrainMapView(view, this.mapPreferences, this.map));
   }
 
   applyMapPreferences(preferences: MapPreferences): void {
@@ -812,6 +949,120 @@ export class MapController {
   }
 
   /**
+   * Drop a draggable pin at `lngLat` so the user can fine-tune the position of a
+   * feature that was just placed without coordinates of its own (e.g. a
+   * non-geotagged photo dropped at the map center). Every drag reports the new
+   * position through `onMove`; clicking the pin's "Done" button (label supplied
+   * by the caller so it stays translatable) removes the pin and runs `onDone`.
+   *
+   * The pin and its hint popup live outside the React tree, so the interaction
+   * survives the dialog that started it being closed. Returns a disposer that
+   * removes the pin early (e.g. if the caller needs to abort).
+   *
+   * @param lngLat - Where to drop the pin, as `[lng, lat]`.
+   * @param options - Translated labels plus the move/done callbacks.
+   * @returns A function that removes the pin and its popup.
+   */
+  startManualPlacement(
+    lngLat: [number, number],
+    options: {
+      /** Instruction shown in the pin's popup while it is draggable. */
+      hint: string;
+      /** Label for the button that finishes placement. */
+      doneLabel: string;
+      /** Called with `[lng, lat]` on every drag of the pin. */
+      onMove: (lngLat: [number, number]) => void;
+      /** Called once when the user clicks the "Done" button. */
+      onDone?: () => void;
+    },
+  ): () => void {
+    const map = this.map;
+    if (!map) return () => {};
+
+    const marker = new maplibregl.Marker({ draggable: true, color: "#ef4444" })
+      .setLngLat(lngLat)
+      .addTo(map);
+
+    const container = document.createElement("div");
+    container.className = "geolibre-placement-popup";
+    const hintText = document.createElement("p");
+    hintText.className = "geolibre-placement-popup-hint";
+    hintText.textContent = options.hint;
+    const doneButton = document.createElement("button");
+    doneButton.type = "button";
+    doneButton.className = "geolibre-placement-popup-done";
+    doneButton.textContent = options.doneLabel;
+    container.append(hintText, doneButton);
+
+    const popup = new maplibregl.Popup({
+      closeButton: false,
+      closeOnClick: false,
+      offset: 28,
+      className: "geolibre-placement-popup-root",
+    })
+      .setLngLat(lngLat)
+      .setDOMContent(container)
+      .addTo(map);
+
+    let disposed = false;
+    // The `drag` event fires once per pointer-move frame (60-120 Hz), and each
+    // call rewrites the store and re-syncs the source. Coalesce to one update
+    // per animation frame so a heavier `onMove` cannot stutter the drag.
+    let rafPending = false;
+    let dragRaf: number | null = null;
+    const cancelPendingFrame = () => {
+      if (dragRaf !== null) {
+        cancelAnimationFrame(dragRaf);
+        dragRaf = null;
+      }
+      rafPending = false;
+    };
+    const commit = () => {
+      const next = marker.getLngLat();
+      popup.setLngLat(next);
+      options.onMove([next.lng, next.lat]);
+    };
+    const handleDrag = () => {
+      if (rafPending) return;
+      rafPending = true;
+      dragRaf = requestAnimationFrame(() => {
+        dragRaf = null;
+        rafPending = false;
+        if (disposed) return;
+        commit();
+      });
+    };
+    // The final `drag` may still be sitting in a pending frame when the user
+    // releases and clicks Done; commit the release position synchronously so the
+    // photo never lands one frame stale, dropping the queued frame so it does
+    // not fire a second, identical update.
+    const handleDragEnd = () => {
+      if (disposed) return;
+      cancelPendingFrame();
+      commit();
+    };
+    const dispose = () => {
+      if (disposed) return;
+      disposed = true;
+      cancelPendingFrame();
+      marker.off("drag", handleDrag);
+      marker.off("dragend", handleDragEnd);
+      doneButton.removeEventListener("click", handleDone);
+      popup.remove();
+      marker.remove();
+    };
+    const handleDone = () => {
+      dispose();
+      options.onDone?.();
+    };
+
+    marker.on("drag", handleDrag);
+    marker.on("dragend", handleDragEnd);
+    doneButton.addEventListener("click", handleDone);
+    return dispose;
+  }
+
+  /**
    * Imperatively animate the camera, for the programmatic scripting API.
    *
    * Unlike {@link applyView} (which the store sync uses) this passes straight to
@@ -836,6 +1087,43 @@ export class MapController {
       ...(typeof camera.pitch === "number" ? { pitch: camera.pitch } : {}),
       duration: typeof camera.duration === "number" ? camera.duration : 800,
     });
+  }
+
+  /** Animate the map in by one zoom level, mirroring the navigation control. */
+  zoomIn(): void {
+    this.map?.zoomIn();
+  }
+
+  /** Animate the map out by one zoom level, mirroring the navigation control. */
+  zoomOut(): void {
+    this.map?.zoomOut();
+  }
+
+  /**
+   * Animate the map back to north-up (bearing 0), leaving the center, zoom, and
+   * pitch untouched. Mirrors MapLibre's compass-control click.
+   */
+  resetNorth(): void {
+    this.map?.resetNorth();
+  }
+
+  /**
+   * Animate the map back to north-up and flat (bearing 0 and pitch 0), leaving
+   * the center and zoom untouched.
+   */
+  resetNorthPitch(): void {
+    this.map?.resetNorthPitch();
+  }
+
+  /**
+   * Animate the map back to flat (pitch 0), leaving the center, zoom, and
+   * bearing untouched. The pitch counterpart to {@link resetNorth}, so the
+   * heading and tilt can be reset independently.
+   */
+  resetPitch(): void {
+    // Match MapLibre's native resetNorth/resetNorthPitch 1s animation so the
+    // sibling orientation resets feel consistent (easeTo defaults to 300ms).
+    this.map?.easeTo({ pitch: 0, duration: 1000 });
   }
 
   /**
@@ -1072,6 +1360,22 @@ export class MapController {
       panelMinWidth: 240,
       panelMaxWidth: 450,
       ...layerControlConfig,
+      // The control toggles the basemap internally; mirror the change into the
+      // store (the source of truth) so external basemap UI — e.g. the left
+      // layer panel's visibility icon and opacity slider — stays in sync.
+      // Placed after the spread so these wired callbacks always win.
+      onBackgroundVisibilityChange: (visible) => {
+        useAppStore.getState().setBasemapVisible(visible);
+      },
+      onBackgroundOpacityChange: (opacity) => {
+        useAppStore.getState().setBasemapOpacity(opacity);
+      },
+      // The per-layer style editor edits MapLibre paint directly; mirror those
+      // edits into the store (the source of truth) so the right-hand Style
+      // sidebar stays in sync and the change survives the next layer sync.
+      onLayerStyleChange: (layerId, property, value) => {
+        this.applyLayerControlStyleChange(layerId, property, value);
+      },
     });
     this.map.addControl(
       this.layerControl,
@@ -1108,6 +1412,60 @@ export class MapController {
   private syncLayerControlState(): void {
     this.syncLayerControlBackgroundState();
     this.syncLayerControlLayerStates(this.syncedLayers);
+    // Push the latest paint (already applied to the map by syncLayer) into the
+    // layer control's open style editor so edits made elsewhere — e.g. the
+    // right-hand Style sidebar — are reflected there too (issue #912). No-op
+    // when no editor is open; skips the input the user is actively dragging.
+    //
+    // Invariant: refreshStyleEditor() must NOT fire onLayerStyleChange. If it
+    // did, this path would loop forever (sync → refresh → onLayerStyleChange →
+    // applyLayerControlStyleChange → setLayerStyle → sync → ...). The upstream
+    // library guarantees this by setting input values programmatically, which
+    // does not dispatch an input event. The reentrancy guard below is a cheap
+    // defense in case a future upstream version regresses that guarantee.
+    this.refreshingStyleEditor = true;
+    try {
+      this.layerControl?.refreshStyleEditor();
+    } finally {
+      this.refreshingStyleEditor = false;
+    }
+  }
+
+  /**
+   * Mirror a paint property edited via the layer control's per-layer style
+   * editor into the store. The per-type opacities that GeoLibre derives
+   * directly from the layer-level opacity (raster/line/text/icon) map to
+   * {@link AppState.setLayerOpacity}; raster color adjustments map to
+   * {@link LayerStyle} via {@link layerControlPaintToStyle}. Other properties
+   * (vector paint) are ignored — see that helper for why.
+   */
+  private applyLayerControlStyleChange(
+    layerId: string,
+    property: string,
+    value: unknown,
+  ): void {
+    // Ignore callbacks that fire while we are pushing store values back into
+    // the editor; otherwise a misbehaving refresh could create a sync loop.
+    if (this.refreshingStyleEditor) return;
+    const store = useAppStore.getState();
+    // These paint properties equal the layer-level opacity in syncLayer
+    // (rasterPaint/heatmapPaint/linePaint use it directly; symbol layers set
+    // text-opacity/icon-opacity to it), so an edit to them is an edit to the
+    // layer's opacity and round-trips losslessly. fill-opacity/circle-opacity
+    // are deliberately not here: syncLayer scales them by the layer opacity, so
+    // the rendered value the control reports is not the raw style value.
+    if (
+      property === "raster-opacity" ||
+      property === "heatmap-opacity" ||
+      property === "line-opacity" ||
+      property === "text-opacity" ||
+      property === "icon-opacity"
+    ) {
+      if (typeof value === "number") store.setLayerOpacity(layerId, value);
+      return;
+    }
+    const styleUpdate = layerControlPaintToStyle(property, value);
+    if (styleUpdate) store.setLayerStyle(layerId, styleUpdate);
   }
 
   private createLayerControlConfig(
@@ -1461,6 +1819,10 @@ export class MapController {
       return [{ id: `layer-${layer.id}-video` }];
     }
 
+    if (layer.type === "image") {
+      return [{ id: `layer-${layer.id}-image` }];
+    }
+
     if (layer.type === "vector-tiles") {
       return vectorTileStyleLayerIds(layer).map((id) => ({
         id,
@@ -1482,11 +1844,28 @@ export class MapController {
     if (typeof window === "undefined") return;
 
     const labelWindow = window as GeoLibreLayerLabelWindow;
-    labelWindow.__GEOLIBRE_LAYER_LABELS__ = Object.fromEntries(
-      layers
+    labelWindow.__GEOLIBRE_LAYER_LABELS__ = Object.fromEntries([
+      ...layers
         .flatMap((layer) => this.getNamedStyleLayers(layer))
-        .map(({ id, name }) => [id, name]),
-    );
+        .map(({ id, name }): [string, string] => [id, name]),
+      // The Layer Swipe panel groups all basemap layers under "__basemap__";
+      // publish the translated base-layer label last so this synthetic key
+      // always wins over a layer that happens to share the id, matching the
+      // sidebar. It is published even with no overlay layers, since the panel
+      // always lists the basemap entry.
+      ["__basemap__", this.backgroundLabel],
+    ]);
+    window.dispatchEvent(new CustomEvent("geolibre-layer-labels-change"));
+  }
+
+  /**
+   * Clear all published layer display names. Used on teardown so the bridge
+   * does not retain stale labels; kept separate from publishLayerDisplayNames,
+   * which always re-publishes the basemap entry.
+   */
+  private clearLayerDisplayNames(): void {
+    if (typeof window === "undefined") return;
+    (window as GeoLibreLayerLabelWindow).__GEOLIBRE_LAYER_LABELS__ = {};
     window.dispatchEvent(new CustomEvent("geolibre-layer-labels-change"));
   }
 
@@ -1520,6 +1899,13 @@ export class MapController {
     ) {
       return false;
     }
+    // Fullscreen the map container so only the map canvas (and its floating
+    // controls) fills the screen. MapLibre defaults to `map.getContainer()`,
+    // which is what we want here. The surrounding workspace chrome (toolbar and
+    // side panels) is hidden by the app while fullscreen is active: Chromium
+    // promotes the fullscreen element to the top layer so the chrome is hidden
+    // automatically, but WebKit (the Tauri desktop webview) leaves it painted
+    // around the map, so the app hides it via CSS. See opengeos/GeoLibre#611.
     this.fullscreenControl = new maplibregl.FullscreenControl();
     this.map.addControl(
       this.fullscreenControl,
@@ -1534,6 +1920,44 @@ export class MapController {
     this.fullscreenControl = null;
   }
 
+  private addCompassControl(): boolean {
+    if (!this.map || this.compassControl || !this.controlVisibility.compass) {
+      return false;
+    }
+    this.compassControl = new ResetBearingControl({
+      label: this.compassLabel,
+    });
+    this.map.addControl(this.compassControl, this.controlPositions.compass);
+    return true;
+  }
+
+  private removeCompassControl(): void {
+    if (!this.compassControl) return;
+    this.removeControl(this.compassControl);
+    this.compassControl = null;
+  }
+
+  /**
+   * Update the compass control's tooltip/aria label, e.g. after a UI language
+   * change. The label is cached so a control re-added after a full map
+   * reinitialisation picks up the latest translation without an extra call.
+   */
+  setCompassLabel(label: string): void {
+    this.compassLabel = label;
+    this.compassControl?.setLabel(label);
+  }
+
+  /**
+   * Update the label used for the grouped base layer (e.g. after a UI language
+   * change). It is published through the layer-display-name bridge so the
+   * Layer Swipe panel, which lives outside React, shows the same translated
+   * base-layer label as the main layer manager.
+   */
+  setBackgroundLabel(label: string): void {
+    this.backgroundLabel = label;
+    this.publishLayerDisplayNames(this.syncedLayers);
+  }
+
   private addGeolocateControl(): boolean {
     if (
       !this.map ||
@@ -1542,18 +1966,73 @@ export class MapController {
     ) {
       return false;
     }
-    this.geolocateControl = new maplibregl.GeolocateControl({
+    const control = new maplibregl.GeolocateControl({
       positionOptions: {
         enableHighAccuracy: true,
       },
       trackUserLocation: true,
     });
-    this.map.addControl(this.geolocateControl, this.controlPositions.geolocate);
+    // MapLibre permanently disables the GeolocateControl button on a
+    // PERMISSION_DENIED error (code 1). Browsers report code 1 both for a real
+    // denial and when the user simply dismisses the permission prompt without
+    // choosing, which leaves the button stuck in a blocked state with no way to
+    // retry (issue #839). Re-create the control whenever the permission was not
+    // actually denied so the button returns to a neutral, clickable state.
+    control.on("error", this.handleGeolocateError);
+    this.geolocateControl = control;
+    this.map.addControl(control, this.controlPositions.geolocate);
     return true;
   }
 
+  private handleGeolocateError = (event: { code?: number }): void => {
+    // Only react to PERMISSION_DENIED; other errors (timeout, position
+    // unavailable) leave the button usable, so MapLibre's own handling is fine.
+    if (!this.map || !this.geolocateControl || event?.code !== 1) return;
+
+    // Snapshot the control that errored. The reset always runs in a later
+    // microtask (the Permissions API query's `.then`, or `queueMicrotask`), so
+    // we never tear down the control mid error-dispatch. It also means the
+    // control could be torn down or replaced in between (e.g. the user toggles
+    // it off then on), so recreate() bails unless this exact instance is still
+    // mounted and never disturbs a healthy replacement.
+    const controlAtError = this.geolocateControl;
+
+    const recreate = (): void => {
+      if (!this.map || !this.controlVisibility.geolocate) return;
+      if (this.geolocateControl !== controlAtError) return;
+      // Re-create the control to clear MapLibre's permanently-disabled button.
+      this.removeGeolocateControl();
+      this.addGeolocateControl();
+    };
+
+    const permissions =
+      typeof navigator !== "undefined" ? navigator.permissions : undefined;
+    if (!permissions?.query) {
+      // No Permissions API: assume a dismissal so the user is never stuck.
+      queueMicrotask(recreate);
+      return;
+    }
+    try {
+      permissions
+        .query({ name: "geolocation" as PermissionName })
+        .then((status) => {
+          // Only a pending "prompt" means the dialog was dismissed, so reset to
+          // allow a retry. "denied" keeps MapLibre's disabled state, and
+          // "granted" (a contradictory code-1) is left alone rather than reset.
+          if (status.state === "prompt") recreate();
+        })
+        .catch(() => recreate());
+    } catch {
+      // Some Permissions API implementations throw synchronously (partial
+      // support, CSP, private browsing). Fall back to a deferred reset so the
+      // user is never stuck.
+      queueMicrotask(recreate);
+    }
+  };
+
   private removeGeolocateControl(): void {
     if (!this.geolocateControl) return;
+    this.geolocateControl.off("error", this.handleGeolocateError);
     this.removeControl(this.geolocateControl);
     this.geolocateControl = null;
   }
@@ -1652,6 +2131,7 @@ export class MapController {
   private addBuiltInControl(control: BuiltInMapControl): boolean {
     if (control === "navigation") return this.addNavigationControl();
     if (control === "fullscreen") return this.addFullscreenControl();
+    if (control === "compass") return this.addCompassControl();
     if (control === "geolocate") return this.addGeolocateControl();
     if (control === "globe") return this.addGlobeControl();
     if (control === "terrain") return this.addTerrainControl();
@@ -1664,6 +2144,7 @@ export class MapController {
   private removeBuiltInControl(control: BuiltInMapControl): void {
     if (control === "navigation") this.removeNavigationControl();
     else if (control === "fullscreen") this.removeFullscreenControl();
+    else if (control === "compass") this.removeCompassControl();
     else if (control === "geolocate") this.removeGeolocateControl();
     else if (control === "globe") this.removeGlobeControl();
     else if (control === "terrain") this.removeTerrainControl();

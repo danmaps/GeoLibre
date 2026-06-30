@@ -22,28 +22,40 @@ import {
 } from "./layer-groups";
 import {
   DEFAULT_BASEMAP,
+  DEFAULT_DASHBOARD_COLUMNS,
   DEFAULT_LAYER_STYLE,
   DEFAULT_LEGEND_CONFIG,
+  DEFAULT_MAP_GRID_LAYOUT,
   DEFAULT_PROJECT_PREFERENCES,
+  MAX_MAP_GRID_DIM,
   DEFAULT_STORY_MAP,
+  MAX_DASHBOARD_COLUMNS,
+  MIN_DASHBOARD_COLUMNS,
+  type AddTileLayerOptions,
+  type CollaborationChatMessage,
   type CollaborationParticipant,
   type CollaborationPresence,
   type CollaborationState,
+  type DashboardWidget,
   type GeoLibreLayer,
   type GeoLibreProject,
   type LayerGroup,
   type LayerStyle,
   type LegendConfig,
+  type MapGridLayout,
   type MapViewState,
   type ProcessingModel,
+  type SecondaryMapView,
   type ProjectPluginState,
   type ProjectPreferences,
   type RecentProjectEntry,
   type StoryChapter,
   type StoryMap,
 } from "./types";
+import { hasSimpleStyleProperties } from "./vector-color";
 
 export type ConversionToolKind =
+  | "vector-to-vector"
   | "vector-to-geoparquet"
   | "vector-to-flatgeobuf"
   | "vector-to-shapefile"
@@ -78,11 +90,15 @@ export type VectorToolKind =
   | "smooth"
   | "grid"
   | "voronoi"
+  | "cell-sectors"
   | "h3-grid"
-  | "h3-bin-points";
+  | "h3-bin-points"
+  | "trajectory-speed"
+  | "detect-stops"
+  | "space-time-proximity";
 
 /** Identifiers of the network-analysis tools (`NETWORK_TOOLS` ids). */
-export type NetworkToolKind = "isochrone" | "od-matrix";
+export type NetworkToolKind = "isochrone" | "od-matrix" | "sequential-route";
 
 /** Identifiers of the spatial-statistics tools (`STATISTICS_TOOLS` ids). */
 export type StatisticsToolKind =
@@ -110,6 +126,7 @@ export type RasterToolKind =
   | "interpolate"
   | "zonal"
   | "raster-calc"
+  | "spectral-index"
   | "reclassify"
   | "mosaic"
   | "focal";
@@ -131,6 +148,23 @@ export interface AppState {
   storymap: StoryMap | null;
   /** Saved processing pipelines (batch/model chaining; issue #344). */
   models: ProcessingModel[];
+  /** Saved Dashboard panel chart widgets (issue #401). */
+  widgets: DashboardWidget[];
+  /** Number of columns in the Dashboard widget grid. */
+  dashboardColumns: number;
+  /**
+   * Multi-map grid layout (issue: split/grid view). A 1x1 grid is the normal
+   * single-map workspace. `rows * cols` panes are shown; pane 0 is the primary
+   * map driven by `mapView` / `basemap*`, panes 1.. are `secondaryMapViews`.
+   */
+  mapLayout: MapGridLayout;
+  /**
+   * Secondary map panes (everything past the primary pane). The store keeps
+   * exactly `rows * cols - 1` entries in sync with `mapLayout`.
+   */
+  secondaryMapViews: SecondaryMapView[];
+  /** User-entered label for the primary pane (shown only in multi-map mode). */
+  primaryMapLabel: string;
   selectedLayerId: string | null;
   selectedFeatureId: string | null;
   identifyLayerId: string | null;
@@ -144,6 +178,12 @@ export interface AppState {
   collaboration: CollaborationState;
   ui: {
     processingOpen: boolean;
+    /**
+     * Tool id to preselect when the Whitebox toolbox dialog opens, set when the
+     * user picks a specific tool from the Processing menu's category submenus.
+     * Consumed and cleared by ProcessingDialog. Null means "no preselection".
+     */
+    processingInitialTool: string | null;
     conversionOpen: ConversionToolKind | null;
     vectorToolOpen: VectorToolKind | null;
     networkToolOpen: NetworkToolKind | null;
@@ -153,12 +193,26 @@ export interface AppState {
     geocodeOpen: boolean;
     sqlWorkspaceOpen: boolean;
     pythonConsoleOpen: boolean;
+    notebookOpen: boolean;
     assistantOpen: boolean;
     attributeTableOpen: boolean;
+    dashboardOpen: boolean;
     storymapPanelOpen: boolean;
     storymapPresenting: boolean;
+    // True when the active presentation was launched from the editor, so exiting
+    // it reopens the Story Map editor instead of dropping to the bare map
+    // (#918). Auto-presented projects (opened for viewing) leave this false.
+    storymapReturnToEditor: boolean;
+    // Id of the chapter currently being composed on the live map. When set, the
+    // Story Map dialog is hidden so the user can pan/zoom/tilt the real map and
+    // save the resulting camera back into this chapter (issue #775).
+    storymapComposingId: string | null;
     modelBuilderOpen: boolean;
     zoomToSelectedFeature: boolean;
+    // Live-collaboration dialog visibility. Lifted into the store (rather than
+    // local toolbar state) so the on-canvas session-status badge can reopen the
+    // Collaborate dialog from outside the toolbar's component tree (#754).
+    collaborateDialogOpen: boolean;
   };
 
   setPointerCoords: (coords: [number, number] | null) => void;
@@ -167,8 +221,40 @@ export interface AppState {
     clientId: string,
     presence: CollaborationPresence | null
   ) => void;
+  /** Append a chat message to the session log (bounded; #754). */
+  addCollaborationChat: (message: CollaborationChatMessage) => void;
   resetCollaboration: () => void;
   setMapView: (view: Partial<MapViewState>, markDirty?: boolean) => void;
+  /**
+   * Resize the map grid. Clamps `rows`/`cols` into range and grows/shrinks
+   * `secondaryMapViews` so it always holds `rows * cols - 1` panes; new panes
+   * clone the primary map's current camera and basemap.
+   */
+  setMapGrid: (rows: number, cols: number) => void;
+  /** Toggle synchronized camera across all panes. */
+  setSyncView: (syncView: boolean) => void;
+  /** Patch one secondary pane's camera by id (no-op if the id is unknown). */
+  setSecondaryMapView: (
+    id: string,
+    view: Partial<MapViewState>,
+    markDirty?: boolean
+  ) => void;
+  /**
+   * Override a layer's visibility in one secondary pane (no-op if the pane id is
+   * unknown). The override forces the layer visible/hidden in that pane only,
+   * independent of the primary map's visibility.
+   */
+  setSecondaryLayerVisibility: (
+    id: string,
+    layerId: string,
+    visible: boolean
+  ) => void;
+  /** Set the primary pane's custom label. */
+  setPrimaryMapLabel: (label: string) => void;
+  /** Set one secondary pane's custom label (no-op if the id is unknown). */
+  setSecondaryMapLabel: (id: string, label: string) => void;
+  /** Remove one secondary pane and collapse the grid back toward 1x1. */
+  removeSecondaryMapView: (id: string) => void;
   setBasemapStyleUrl: (url: string) => void;
   setBasemapVisible: (visible: boolean) => void;
   setBasemapOpacity: (opacity: number) => void;
@@ -183,6 +269,7 @@ export interface AppState {
   setIdentifyLayer: (id: string | null) => void;
   setAttributeFilter: (filter: string) => void;
   setProcessingOpen: (open: boolean) => void;
+  setProcessingInitialTool: (toolId: string | null) => void;
   setConversionOpen: (kind: ConversionToolKind | null) => void;
   setVectorToolOpen: (kind: VectorToolKind | null) => void;
   setNetworkToolOpen: (kind: NetworkToolKind | null) => void;
@@ -192,17 +279,35 @@ export interface AppState {
   setGeocodeOpen: (open: boolean) => void;
   setSqlWorkspaceOpen: (open: boolean) => void;
   setPythonConsoleOpen: (open: boolean) => void;
+  setNotebookOpen: (open: boolean) => void;
   setAssistantOpen: (open: boolean) => void;
   setAttributeTableOpen: (open: boolean) => void;
+  setDashboardOpen: (open: boolean) => void;
   setStorymapPanelOpen: (open: boolean) => void;
-  setStorymapPresenting: (presenting: boolean) => void;
+  setStorymapPresenting: (
+    presenting: boolean,
+    returnToEditor?: boolean,
+  ) => void;
+  setStorymapComposing: (chapterId: string | null) => void;
   setModelBuilderOpen: (open: boolean) => void;
+  setCollaborateDialogOpen: (open: boolean) => void;
   setZoomToSelectedFeature: (enabled: boolean) => void;
 
   /** Insert a new model or replace an existing one matching by `id`. */
   saveModel: (model: ProcessingModel) => void;
   /** Remove a saved model by id. */
   deleteModel: (id: string) => void;
+
+  /** Append a new dashboard widget. */
+  addWidget: (widget: DashboardWidget) => void;
+  /** Patch an existing dashboard widget by id (no-op if absent). */
+  updateWidget: (id: string, patch: Partial<Omit<DashboardWidget, "id">>) => void;
+  /** Remove a dashboard widget by id. */
+  removeWidget: (id: string) => void;
+  /** Move a widget to a new index, clamped into range, preserving the rest. */
+  moveWidget: (id: string, toIndex: number) => void;
+  /** Set the Dashboard widget-grid column count (clamped into range). */
+  setDashboardColumns: (columns: number) => void;
 
   setStorymap: (storymap: StoryMap | null) => void;
   updateStorymapSettings: (
@@ -239,6 +344,18 @@ export interface AppState {
     name: string,
     geojson: FeatureCollection,
     sourcePath?: string,
+    beforeLayerId?: string | null
+  ) => string;
+  /**
+   * Add a native raster tile layer (XYZ, WMS, or WMTS) from one or more tile
+   * URL templates and return its id. The layer appears in the Layers panel and
+   * persists with the project exactly like a layer added through the Add Data
+   * dialog, so callers (e.g. an external plugin) do not have to touch MapLibre
+   * directly. See {@link AddTileLayerOptions}.
+   */
+  addTileLayer: (
+    name: string,
+    options: AddTileLayerOptions,
     beforeLayerId?: string | null
   ) => string;
 
@@ -279,8 +396,15 @@ export const DEFAULT_COLLABORATION_STATE: CollaborationState = Object.freeze({
     CollaborationPresence
   >,
   followHost: false,
+  chat: Object.freeze([] as CollaborationChatMessage[]) as CollaborationChatMessage[],
   error: null,
 });
+
+// Cap the in-store chat log so a long session can't grow it without bound. This
+// is intentionally larger than the relay's persisted history (50): the live
+// session accumulates messages locally, while the relay only retains the tail
+// for late joiners.
+const MAX_COLLABORATION_CHAT = 200;
 
 /** Derive a human-friendly display name from a file path or URL. */
 export function projectPathLabel(path: string): string {
@@ -349,6 +473,64 @@ function layerGroupsEqualForHistory(
   return true;
 }
 
+/** True when two camera states have identical center/zoom/bearing/pitch. */
+function sameCamera(a: MapViewState, b: MapViewState): boolean {
+  return (
+    a.center[0] === b.center[0] &&
+    a.center[1] === b.center[1] &&
+    a.zoom === b.zoom &&
+    a.bearing === b.bearing &&
+    a.pitch === b.pitch
+  );
+}
+
+/** Clamp a requested grid row/column count into the supported [1, MAX] range. */
+function clampGridDim(value: number): number {
+  if (!Number.isFinite(value)) return 1;
+  return Math.max(1, Math.min(MAX_MAP_GRID_DIM, Math.floor(value)));
+}
+
+/**
+ * Pick a grid that holds at least `total` panes within the supported
+ * `MAX_MAP_GRID_DIM x MAX_MAP_GRID_DIM` bound, minimizing empty cells first and
+ * then preferring a column count close to (and, on ties, no smaller than)
+ * `preferredCols` so removing a pane keeps the layout's orientation. Used when
+ * collapsing the grid after a pane is removed.
+ *
+ * Bounding both dimensions matters: a prime `total` (e.g. 5 panes left after
+ * removing one from a 2x3 grid) has no gap-free factor pair inside the bound, so
+ * the only gap-free options (1x5 / 5x1) would exceed `MAX_MAP_GRID_DIM`. In that
+ * case we accept the smallest bounded grid with one empty trailing cell (2x3)
+ * rather than returning an out-of-range dimension.
+ */
+function fitGrid(
+  total: number,
+  preferredCols: number,
+): { rows: number; cols: number } {
+  if (total <= 1) return { rows: 1, cols: 1 };
+  let best: { rows: number; cols: number; empty: number; score: number } | null =
+    null;
+  for (let rows = 1; rows <= MAX_MAP_GRID_DIM; rows++) {
+    for (let cols = 1; cols <= MAX_MAP_GRID_DIM; cols++) {
+      const capacity = rows * cols;
+      if (capacity < total) continue;
+      const empty = capacity - total;
+      const score = Math.abs(cols - preferredCols);
+      // Fewest empty cells wins; then the column count closest to
+      // preferredCols; then, on a tie, the larger column count (favoring wider,
+      // side-by-side layouts over tall ones).
+      const better =
+        best === null ||
+        empty < best.empty ||
+        (empty === best.empty &&
+          (score < best.score ||
+            (score === best.score && cols > best.cols)));
+      if (better) best = { rows, cols, empty, score };
+    }
+  }
+  return best ? { rows: best.rows, cols: best.cols } : { rows: 1, cols: 1 };
+}
+
 /** Cancels the active history coalesce window (assigned by zundo's handleSet). */
 let cancelHistoryCoalesce: () => void = () => {};
 
@@ -386,6 +568,11 @@ export const useAppStore = create<AppState>()(
       legend: { ...DEFAULT_LEGEND_CONFIG },
       storymap: null,
       models: [],
+      widgets: [],
+      dashboardColumns: DEFAULT_DASHBOARD_COLUMNS,
+      mapLayout: { ...DEFAULT_MAP_GRID_LAYOUT },
+      secondaryMapViews: [],
+      primaryMapLabel: "",
       selectedLayerId: null,
       selectedFeatureId: null,
       identifyLayerId: null,
@@ -396,6 +583,7 @@ export const useAppStore = create<AppState>()(
       collaboration: DEFAULT_COLLABORATION_STATE,
       ui: {
         processingOpen: false,
+        processingInitialTool: null,
         conversionOpen: null,
         vectorToolOpen: null,
         networkToolOpen: null,
@@ -405,12 +593,17 @@ export const useAppStore = create<AppState>()(
         geocodeOpen: false,
         sqlWorkspaceOpen: false,
         pythonConsoleOpen: false,
+        notebookOpen: false,
         assistantOpen: false,
         attributeTableOpen: false,
+        dashboardOpen: false,
         storymapPanelOpen: false,
         storymapPresenting: false,
+        storymapReturnToEditor: false,
+        storymapComposingId: null,
         modelBuilderOpen: false,
         zoomToSelectedFeature: false,
+        collaborateDialogOpen: false,
       },
 
       setPointerCoords: (coords) => set({ pointerCoords: coords }),
@@ -429,13 +622,131 @@ export const useAppStore = create<AppState>()(
           }
           return { collaboration: { ...s.collaboration, presence: next } };
         }),
+      addCollaborationChat: (message) =>
+        set((s) => {
+          // Default to [] in case an older relay left the slice undefined.
+          const current = s.collaboration.chat ?? [];
+          // Ignore a duplicate id: the server broadcasts to the sender too, and a
+          // reconnect can replay recent history, so de-dupe defensively.
+          if (current.some((m) => m.id === message.id)) return s;
+          const chat = [...current, message].slice(-MAX_COLLABORATION_CHAT);
+          return { collaboration: { ...s.collaboration, chat } };
+        }),
       resetCollaboration: () =>
-        set({ collaboration: DEFAULT_COLLABORATION_STATE }),
+        // Also close the Collaborate dialog: an unexpected disconnect resets the
+        // slice without a user-initiated leave(), and leaving the dialog open
+        // would drop the user onto the start/join form with no context.
+        set((s) => ({
+          collaboration: DEFAULT_COLLABORATION_STATE,
+          ui: { ...s.ui, collaborateDialogOpen: false },
+        })),
       setMapView: (view, markDirty = false) =>
         set((s) => ({
           mapView: { ...s.mapView, ...view },
           isDirty: markDirty || s.isDirty,
         })),
+      setMapGrid: (rows, cols) =>
+        set((s) => {
+          const clampedRows = clampGridDim(rows);
+          const clampedCols = clampGridDim(cols);
+          const desiredSecondary = clampedRows * clampedCols - 1;
+          let secondaryMapViews = s.secondaryMapViews;
+          if (desiredSecondary < secondaryMapViews.length) {
+            secondaryMapViews = secondaryMapViews.slice(0, desiredSecondary);
+          } else if (desiredSecondary > secondaryMapViews.length) {
+            const additions: SecondaryMapView[] = [];
+            for (let i = secondaryMapViews.length; i < desiredSecondary; i++) {
+              // New panes start as a clone of the primary map's camera and (by
+              // having no overrides) inherit its layer visibility, so the
+              // comparison begins from the same view the user is looking at.
+              additions.push({
+                id: uuidv4(),
+                view: { ...s.mapView },
+                layerVisibility: {},
+              });
+            }
+            secondaryMapViews = [...secondaryMapViews, ...additions];
+          }
+          return {
+            mapLayout: {
+              ...s.mapLayout,
+              rows: clampedRows,
+              cols: clampedCols,
+            },
+            secondaryMapViews,
+            isDirty: true,
+          };
+        }),
+      setSyncView: (syncView) =>
+        set((s) => ({
+          mapLayout: { ...s.mapLayout, syncView },
+          isDirty: true,
+        })),
+      setSecondaryMapView: (id, view, markDirty = false) =>
+        set((s) => {
+          let changed = false;
+          const secondaryMapViews = s.secondaryMapViews.map((pane) => {
+            if (pane.id !== id) return pane;
+            const merged = { ...pane.view, ...view };
+            // Skip value-identical writes: a programmatic `applyView` (camera
+            // sync, initial load) fires "moveend" too, so without this guard
+            // each pane re-stores the same camera it was just given, churning a
+            // new `secondaryMapViews` array and re-rendering every subscriber.
+            if (sameCamera(pane.view, merged)) return pane;
+            changed = true;
+            return { ...pane, view: merged };
+          });
+          if (!changed) return s;
+          return {
+            secondaryMapViews,
+            isDirty: markDirty || s.isDirty,
+          };
+        }),
+      setSecondaryLayerVisibility: (id, layerId, visible) =>
+        set((s) => {
+          let changed = false;
+          const secondaryMapViews = s.secondaryMapViews.map((pane) => {
+            if (pane.id !== id) return pane;
+            changed = true;
+            return {
+              ...pane,
+              layerVisibility: { ...pane.layerVisibility, [layerId]: visible },
+            };
+          });
+          if (!changed) return s;
+          return { secondaryMapViews, isDirty: true };
+        }),
+      setPrimaryMapLabel: (label) =>
+        set({ primaryMapLabel: label, isDirty: true }),
+      setSecondaryMapLabel: (id, label) =>
+        set((s) => {
+          let changed = false;
+          const secondaryMapViews = s.secondaryMapViews.map((pane) => {
+            if (pane.id !== id) return pane;
+            changed = true;
+            return { ...pane, label };
+          });
+          if (!changed) return s;
+          return { secondaryMapViews, isDirty: true };
+        }),
+      removeSecondaryMapView: (id) =>
+        set((s) => {
+          const secondaryMapViews = s.secondaryMapViews.filter(
+            (pane) => pane.id !== id
+          );
+          if (secondaryMapViews.length === s.secondaryMapViews.length) {
+            return s;
+          }
+          // Collapse to a gap-free grid that fits the remaining panes, keeping
+          // the layout's orientation as close as possible to the current one.
+          const total = secondaryMapViews.length + 1;
+          const { rows, cols } = fitGrid(total, s.mapLayout.cols);
+          return {
+            secondaryMapViews,
+            mapLayout: { ...s.mapLayout, rows, cols },
+            isDirty: true,
+          };
+        }),
       setBasemapStyleUrl: (url) => set({ basemapStyleUrl: url, isDirty: true }),
       setBasemapVisible: (visible) =>
         set({ basemapVisible: visible, isDirty: true }),
@@ -457,6 +768,8 @@ export const useAppStore = create<AppState>()(
       setAttributeFilter: (filter) => set({ attributeFilter: filter }),
       setProcessingOpen: (open) =>
         set((s) => ({ ui: { ...s.ui, processingOpen: open } })),
+      setProcessingInitialTool: (toolId) =>
+        set((s) => ({ ui: { ...s.ui, processingInitialTool: toolId } })),
       setConversionOpen: (kind) =>
         set((s) => ({ ui: { ...s.ui, conversionOpen: kind } })),
       setVectorToolOpen: (kind) =>
@@ -475,16 +788,41 @@ export const useAppStore = create<AppState>()(
         set((s) => ({ ui: { ...s.ui, sqlWorkspaceOpen: open } })),
       setPythonConsoleOpen: (open) =>
         set((s) => ({ ui: { ...s.ui, pythonConsoleOpen: open } })),
+      setNotebookOpen: (open) =>
+        set((s) => ({ ui: { ...s.ui, notebookOpen: open } })),
       setAssistantOpen: (open) =>
         set((s) => ({ ui: { ...s.ui, assistantOpen: open } })),
       setAttributeTableOpen: (open) =>
         set((s) => ({ ui: { ...s.ui, attributeTableOpen: open } })),
+      setDashboardOpen: (open) =>
+        set((s) => ({ ui: { ...s.ui, dashboardOpen: open } })),
       setStorymapPanelOpen: (open) =>
-        set((s) => ({ ui: { ...s.ui, storymapPanelOpen: open } })),
-      setStorymapPresenting: (presenting) =>
-        set((s) => ({ ui: { ...s.ui, storymapPresenting: presenting } })),
+        set((s) => ({
+          ui: {
+            ...s.ui,
+            storymapPanelOpen: open,
+            // Opening the editor must leave compose mode, or the menu item could
+            // re-open the dialog while the compose bar is still active over a
+            // now-hidden map (#775). Closing (entering compose) leaves it as-is.
+            ...(open ? { storymapComposingId: null } : {}),
+          },
+        })),
+      setStorymapPresenting: (presenting, returnToEditor = false) =>
+        set((s) => ({
+          ui: {
+            ...s.ui,
+            storymapPresenting: presenting,
+            // Track whether exiting should reopen the editor; only meaningful
+            // while presenting, so it clears once the presentation ends (#918).
+            storymapReturnToEditor: presenting ? returnToEditor : false,
+          },
+        })),
+      setStorymapComposing: (chapterId) =>
+        set((s) => ({ ui: { ...s.ui, storymapComposingId: chapterId } })),
       setModelBuilderOpen: (open) =>
         set((s) => ({ ui: { ...s.ui, modelBuilderOpen: open } })),
+      setCollaborateDialogOpen: (open) =>
+        set((s) => ({ ui: { ...s.ui, collaborateDialogOpen: open } })),
       setZoomToSelectedFeature: (enabled) =>
         set((s) => ({ ui: { ...s.ui, zoomToSelectedFeature: enabled } })),
 
@@ -501,6 +839,53 @@ export const useAppStore = create<AppState>()(
           models: s.models.filter((m) => m.id !== id),
           isDirty: true,
         })),
+
+      addWidget: (widget) =>
+        set((s) => {
+          // Ignore a duplicate id so updateWidget/removeWidget stay unambiguous
+          // and a later entry isn't silently dropped when normalized on save.
+          if (s.widgets.some((w) => w.id === widget.id)) return s;
+          return { widgets: [...s.widgets, widget], isDirty: true };
+        }),
+      updateWidget: (id, patch) =>
+        set((s) => {
+          const exists = s.widgets.some((w) => w.id === id);
+          if (!exists) return s;
+          return {
+            widgets: s.widgets.map((w) =>
+              w.id === id ? { ...w, ...patch, id: w.id } : w,
+            ),
+            isDirty: true,
+          };
+        }),
+      removeWidget: (id) =>
+        set((s) => ({
+          widgets: s.widgets.filter((w) => w.id !== id),
+          isDirty: true,
+        })),
+      moveWidget: (id, toIndex) =>
+        set((s) => {
+          const from = s.widgets.findIndex((w) => w.id === id);
+          if (from < 0) return s;
+          const target = Math.max(0, Math.min(s.widgets.length - 1, toIndex));
+          if (target === from) return s;
+          const widgets = [...s.widgets];
+          const [moved] = widgets.splice(from, 1);
+          widgets.splice(target, 0, moved);
+          return { widgets, isDirty: true };
+        }),
+      setDashboardColumns: (columns) =>
+        set((s) => {
+          // Guard non-finite input so the clamp can't yield NaN columns.
+          if (!Number.isFinite(columns)) return s;
+          return {
+            dashboardColumns: Math.max(
+              MIN_DASHBOARD_COLUMNS,
+              Math.min(MAX_DASHBOARD_COLUMNS, Math.trunc(columns)),
+            ),
+            isDirty: true,
+          };
+        }),
 
       setStorymap: (storymap) => set({ storymap, isDirty: true }),
       updateStorymapSettings: (patch) =>
@@ -609,6 +994,13 @@ export const useAppStore = create<AppState>()(
       removeLayer: (id) =>
         set((s) => ({
           layers: s.layers.filter((l) => l.id !== id),
+          // Drop any per-pane visibility override for the removed layer so stale
+          // ids don't accumulate (and serialize) in secondary panes over time.
+          secondaryMapViews: s.secondaryMapViews.map((pane) => {
+            if (!(id in pane.layerVisibility)) return pane;
+            const { [id]: _removed, ...rest } = pane.layerVisibility;
+            return { ...pane, layerVisibility: rest };
+          }),
           selectedLayerId:
             s.selectedLayerId === id
               ? s.layers.find((l) => l.id !== id)?.id ?? null
@@ -672,10 +1064,73 @@ export const useAppStore = create<AppState>()(
           source: { type: "geojson" },
           visible: true,
           opacity: 1,
-          style: { ...DEFAULT_LAYER_STYLE },
+          style: {
+            ...DEFAULT_LAYER_STYLE,
+            simpleStyleEnabled: hasSimpleStyleProperties(geojson),
+          },
           metadata: {},
           geojson,
           sourcePath,
+        };
+        get().addLayer(layer, beforeLayerId);
+        return id;
+      },
+
+      addTileLayer: (name, options, beforeLayerId = null) => {
+        const id = uuidv4();
+        // Trim each template and drop blanks, then reject a registration that
+        // sanitizes down to nothing: syncRasterTileLayer returns early on an
+        // empty tile list, so without this the store would persist and select a
+        // layer that can never render.
+        const tiles = options.tiles
+          .filter((tile): tile is string => typeof tile === "string")
+          .map((tile) => tile.trim())
+          .filter((tile) => tile !== "");
+        if (tiles.length === 0) {
+          throw new Error(
+            "addTileLayer requires at least one non-empty tile URL template."
+          );
+        }
+        // MapLibre's addSource throws synchronously when maxzoom < minzoom, and
+        // syncRasterTileLayer does not catch it, which would strand a layer in
+        // the store with no rendered source. Reject the bad range up front.
+        if (
+          options.minzoom !== undefined &&
+          options.maxzoom !== undefined &&
+          options.minzoom > options.maxzoom
+        ) {
+          throw new Error(
+            `addTileLayer: minzoom (${options.minzoom}) must be <= maxzoom (${options.maxzoom}).`
+          );
+        }
+        const layer: GeoLibreLayer = {
+          id,
+          name,
+          type: options.type ?? "xyz",
+          source: {
+            // Extra source fields (e.g. WMS layers/styles) merge first so the
+            // required raster descriptor below always wins.
+            ...(options.source ?? {}),
+            type: "raster",
+            tiles,
+            tileSize: options.tileSize ?? 256,
+            ...(options.url !== undefined ? { url: options.url } : {}),
+            ...(options.attribution !== undefined
+              ? { attribution: options.attribution }
+              : {}),
+            ...(options.bounds !== undefined ? { bounds: options.bounds } : {}),
+            ...(options.minzoom !== undefined
+              ? { minzoom: options.minzoom }
+              : {}),
+            ...(options.maxzoom !== undefined
+              ? { maxzoom: options.maxzoom }
+              : {}),
+            ...(options.scheme !== undefined ? { scheme: options.scheme } : {}),
+          },
+          visible: options.visible ?? true,
+          opacity: options.opacity ?? 1,
+          style: { ...DEFAULT_LAYER_STYLE },
+          metadata: { ...(options.metadata ?? {}) },
         };
         get().addLayer(layer, beforeLayerId);
         return id;
@@ -844,7 +1299,13 @@ export const useAppStore = create<AppState>()(
           pointerCoords: null,
           attributeFilter: "",
           // Don't carry an active story presentation into a different project.
-          ui: { ...s.ui, storymapPresenting: false, storymapPanelOpen: false },
+          ui: {
+            ...s.ui,
+            storymapPresenting: false,
+            storymapReturnToEditor: false,
+            storymapPanelOpen: false,
+            storymapComposingId: null,
+          },
         }));
         clearHistory();
       },
@@ -870,7 +1331,11 @@ export const useAppStore = create<AppState>()(
           ui: {
             ...s.ui,
             storymapPresenting: presentStory,
+            // A bundled story auto-presents for viewing, so exiting it should
+            // not pop open the editor (#918).
+            storymapReturnToEditor: false,
             storymapPanelOpen: false,
+            storymapComposingId: null,
           },
         }));
         clearHistory();

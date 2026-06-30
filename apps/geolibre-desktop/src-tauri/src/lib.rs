@@ -1,4 +1,25 @@
 mod earth_engine_oauth;
+#[cfg(feature = "native-duckdb")]
+mod native_duckdb;
+#[cfg(not(feature = "native-duckdb"))]
+mod native_duckdb {
+    #[tauri::command]
+    pub async fn count_native_vector_file_features(
+        _path: String,
+        _layer: Option<String>,
+    ) -> Result<usize, String> {
+        Err("Native DuckDB is not enabled in this build.".to_string())
+    }
+
+    #[tauri::command]
+    pub async fn load_native_vector_file(
+        _path: String,
+        _layer: Option<String>,
+        _override_source_crs: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        Err("Native DuckDB is not enabled in this build.".to_string())
+    }
+}
 
 use earth_engine_oauth::{
     poll_earth_engine_oauth, start_earth_engine_oauth, EarthEngineOAuthState,
@@ -32,6 +53,13 @@ const MARTIN_START_ATTEMPTS: usize = 3;
 const MARTIN_HEALTH_ATTEMPTS: usize = 30;
 const SIDECAR_HEALTH_ATTEMPTS: usize = 180;
 const SIDECAR_PORT: u16 = 8765;
+// The desktop JupyterLab server for the Notebook panel. Loopback-bound and
+// token-gated; uses its own uv project environment so it never disturbs the
+// FastAPI sidecar's env. First start can be slow while uv syncs JupyterLab.
+const JUPYTER_PORT: u16 = 8766;
+// Polled once per second, so up to ~4 minutes — generous headroom for the
+// first-run `uv sync` of JupyterLab on a cold cache.
+const JUPYTER_HEALTH_ATTEMPTS: usize = 240;
 const UV_INSTALL_BASE_URL: &str = "https://astral.sh/uv";
 const REMOTE_TILE_TIMEOUT_SECS: u64 = 8;
 const REMOTE_TILE_CONNECT_TIMEOUT_SECS: u64 = 4;
@@ -55,11 +83,25 @@ struct SidecarServerState {
     process: Mutex<Option<SidecarProcess>>,
 }
 
+struct JupyterServerState {
+    process: Mutex<Option<JupyterProcess>>,
+    // Token of the currently running server, so a reuse path can hand the same
+    // URL back without restarting.
+    token: Mutex<Option<String>>,
+    // Held for the whole of start_jupyter_server_blocking so two concurrent
+    // start calls can't both spawn on the same port (the loser would exit 1).
+    startup: Mutex<()>,
+}
+
 struct MartinProcess {
     child: Child,
 }
 
 struct SidecarProcess {
+    child: Child,
+}
+
+struct JupyterProcess {
     child: Child,
 }
 
@@ -119,6 +161,20 @@ impl Drop for SidecarProcess {
     }
 }
 
+impl JupyterProcess {
+    fn terminate(&mut self) {
+        // Same process-group teardown as the sidecar (the child is spawned with
+        // its own group, so this reaps `uv`/`jupyter`/kernel descendants).
+        terminate_sidecar_child(&mut self.child);
+    }
+}
+
+impl Drop for JupyterProcess {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     configure_linux_webkit();
@@ -134,12 +190,23 @@ pub fn run() {
         .manage(SidecarServerState {
             process: Mutex::new(None),
         })
+        .manage(JupyterServerState {
+            process: Mutex::new(None),
+            token: Mutex::new(None),
+            startup: Mutex::new(()),
+        })
         .invoke_handler(tauri::generate_handler![
             close_oauth_popups,
+            native_duckdb::count_native_vector_file_features,
             ensure_martin_binary,
             fetch_url_bytes,
+            install_external_plugin_archive,
+            native_duckdb::load_native_vector_file,
             load_external_plugin_bundles,
+            read_admin_profile,
+            read_local_file,
             read_project_file,
+            read_shapefile_siblings,
             resolve_url_redirect,
             read_mbtiles_metadata,
             read_mbtiles_tile,
@@ -147,6 +214,8 @@ pub fn run() {
             stop_martin_server,
             start_geolibre_sidecar,
             stop_geolibre_sidecar,
+            start_jupyter_server,
+            stop_jupyter_server,
             start_earth_engine_oauth,
             poll_earth_engine_oauth
         ])
@@ -161,6 +230,199 @@ pub fn run() {
 #[tauri::command]
 fn read_project_file(path: String) -> Result<String, String> {
     fs::read_to_string(&path).map_err(|error| format!("Could not read project file: {error}"))
+}
+
+/// Local vector file extensions the restore path may re-read (lowercased, no
+/// dot). Mirrors `VECTOR_FILE_DIALOG_EXTENSIONS` in `tauri-io.ts`; keep the two
+/// in step.
+// SYNC: VECTOR_FILE_DIALOG_EXTENSIONS in src/lib/tauri-io.ts — grep "SYNC:" to
+// find the partner list and update both together.
+const RESTORABLE_VECTOR_EXTENSIONS: [&str; 17] = [
+    "geojson",
+    "json",
+    "gpkg",
+    "geoparquet",
+    "parquet",
+    "fgb",
+    "flatgeobuf",
+    "csv",
+    "tsv",
+    "kml",
+    "kmz",
+    "gml",
+    "gpx",
+    "dxf",
+    "tab",
+    "shp",
+    "zip",
+];
+
+/// Whether the renderer is permitted to re-read `path` through `read_local_file`:
+/// an absolute local path (POSIX `/...` or a Windows drive-letter `C:\...`, never
+/// a UNC `\\host\share`), free of `..` traversal segments, ending in a known
+/// vector extension.
+///
+/// This is a Rust-side backstop mirroring the frontend guard
+/// (`isAbsoluteLocalPath` + `hasPathTraversal` + `isRestorableVectorPath` in
+/// `tauri-io.ts`). It narrows the attack surface of a compromised webview or
+/// rogue plugin: arbitrary system files (`/etc/passwd`, SSH keys, most shell and
+/// app configs) are blocked. It does not make the command harmless — the
+/// allowlist still includes broad extensions like `json`, so a script that knows
+/// the path of a JSON-shaped secret could still read it — but it bounds reads to
+/// the vector formats the restore path actually needs. The checks are
+/// byte-oriented rather than `std::path` based so they behave identically for the
+/// Windows-style paths a project may carry regardless of the host the binary
+/// runs on.
+pub(crate) fn is_allowed_local_vector_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let is_separator = |byte: u8| byte == b'/' || byte == b'\\';
+
+    // Reject UNC paths first. Both the Windows form ("\\server\share") and the
+    // forward-slash form ("//server/share") start with two separators and can
+    // make Windows auto-authenticate against a remote host, so neither may slip
+    // through the POSIX-absolute check below.
+    if bytes.len() >= 2 && is_separator(bytes[0]) && is_separator(bytes[1]) {
+        return false;
+    }
+
+    // Absolute local path only: POSIX "/..." or a Windows drive-letter "C:\..."
+    // / "C:/...".
+    let is_posix_absolute = bytes.first() == Some(&b'/');
+    let is_windows_drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && is_separator(bytes[2]);
+    if !is_posix_absolute && !is_windows_drive {
+        return false;
+    }
+
+    // Reject a "/../" or "\..\" traversal segment (but not a ".." inside a
+    // filename like "v1..2.gpkg"), matching `hasPathTraversal`.
+    if path.split(['/', '\\']).any(|segment| segment == "..") {
+        return false;
+    }
+
+    // Known vector extension, case-insensitive, matching the JS
+    // `RESTORABLE_VECTOR_PATH` regex (built from `VECTOR_FILE_DIALOG_EXTENSIONS`).
+    // `rsplit_once` takes the text after the final dot without allocating.
+    let lower = path.to_ascii_lowercase();
+    lower
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| RESTORABLE_VECTOR_EXTENSIONS.contains(&extension))
+}
+
+/// Read a local file's raw bytes so a project's file-referenced vector layers
+/// can be re-read when the project is reopened.
+///
+/// On reopen, a layer saved as a file reference carries only its absolute
+/// `sourcePath` (stored in the `.geolibre.json`); that path was never picked or
+/// dropped this session, so it sits outside the `fs` plugin's runtime scope and
+/// the JS `readFile`/`readTextFile` reject it. This reads the file directly,
+/// mirroring `read_project_file` (which bypasses the same scope to read the
+/// project file itself). The path is validated here by
+/// `is_allowed_local_vector_path` (absolute, no `..` traversal, known vector
+/// extension) so the command cannot be abused to read arbitrary files even if
+/// the frontend guard is bypassed. Bytes are returned as a raw IPC response (an
+/// `ArrayBuffer` on the JS side) so a large GeoJSON does not pay the cost of a
+/// JSON number array.
+#[tauri::command]
+fn read_local_file(path: String) -> Result<tauri::ipc::Response, String> {
+    if !is_allowed_local_vector_path(&path) {
+        return Err(format!(
+            "Refusing to read \"{path}\": not an absolute local vector file path"
+        ));
+    }
+    fs::read(&path)
+        .map(tauri::ipc::Response::new)
+        .map_err(|error| format!("Could not read local file: {error}"))
+}
+
+/// Shapefile sidecar extensions read alongside a `.shp` (lowercased, no dot).
+const SHAPEFILE_SIDECAR_EXTENSIONS: [&str; 16] = [
+    "shx", "dbf", "prj", "cpg", "sbn", "sbx", "qix", "qpj", "cst", "aih", "ain", "atx", "ixs",
+    "mxs", "fbn", "fbx",
+];
+
+#[derive(Serialize)]
+struct ShapefileSibling {
+    /// `<shp base>.<lowercased sidecar extension>`, matching the `.shp` base name
+    /// so GDAL resolves the sidecar when reading the `.shp` directly.
+    name: String,
+    data: Vec<u8>,
+}
+
+/// Read a shapefile's sidecar files (`.shx`, `.dbf`, `.prj`, `.cpg`, ...) sitting
+/// next to the given `.shp`, so a loose `.shp` can be loaded without the user
+/// selecting every component.
+///
+/// The JS `fs` plugin can only read paths the user explicitly picked or dropped,
+/// so it cannot reach a sidecar that was not selected; this reads them directly.
+/// It is scoped to shapefile sidecar extensions, so it cannot read arbitrary
+/// files. The directory is matched case-insensitively (handling `.SHX`/`.DBF` and
+/// mixed-case base names), and each sidecar is returned under the `.shp`'s base
+/// name with a lowercased extension so the registered names line up. Missing
+/// siblings are skipped; an unreadable directory yields an empty list.
+#[tauri::command]
+fn read_shapefile_siblings(path: String) -> Result<Vec<ShapefileSibling>, String> {
+    let shp = Path::new(&path);
+    let Some(parent) = shp.parent() else {
+        return Ok(Vec::new());
+    };
+    let Some(stem) = shp.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(Vec::new());
+    };
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut siblings = Vec::new();
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if !entry_path.is_file() {
+            continue;
+        }
+        let (Some(entry_stem), Some(extension)) = (
+            entry_path.file_stem().and_then(|stem| stem.to_str()),
+            entry_path
+                .extension()
+                .and_then(|extension| extension.to_str()),
+        ) else {
+            continue;
+        };
+        if !entry_stem.eq_ignore_ascii_case(stem) {
+            continue;
+        }
+        let extension = extension.to_ascii_lowercase();
+        if !SHAPEFILE_SIDECAR_EXTENSIONS.contains(&extension.as_str()) {
+            continue;
+        }
+        if let Ok(data) = fs::read(&entry_path) {
+            siblings.push(ShapefileSibling {
+                name: format!("{stem}.{extension}"),
+                data,
+            });
+        }
+    }
+    Ok(siblings)
+}
+
+/// Read the optional admin UI-profile file (`<app_config_dir>/admin-profile.json`).
+///
+/// Returns `Ok(None)` when the file is absent so a missing file is not an error;
+/// administrators drop one in to pre-configure and optionally lock the UI profile
+/// for a deployment. See `docs/ui-profiles.md`.
+#[tauri::command]
+fn read_admin_profile(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("Could not resolve config directory: {error}"))?;
+    let path = config_dir.join("admin-profile.json");
+    match fs::read_to_string(&path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Could not read admin profile: {error}")),
+    }
 }
 
 #[tauri::command]
@@ -213,6 +475,97 @@ fn fetch_url_bytes_blocking(url: String) -> Result<Vec<u8>, String> {
         .bytes()
         .map(|bytes| bytes.to_vec())
         .map_err(|error| format!("Could not read response body: {error}"))
+}
+
+/// Install a packaged plugin from a local `.zip` archive into GeoLibre's
+/// app-data `plugins/` directory so it persists across restarts and is picked up
+/// by the regular plugin scan. The archive is validated first (parsing
+/// `plugin.json`, enforcing the manifest rules, and confirming the entry and
+/// optional style are present and within the size limit), so only a loadable
+/// plugin lands in the plugins directory. Returns the installed plugin id.
+#[tauri::command]
+async fn install_external_plugin_archive(
+    app: tauri::AppHandle,
+    source_path: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        install_external_plugin_archive_blocking(&app, source_path)
+    })
+    .await
+    .map_err(|error| format!("Plugin install task failed: {error}"))?
+}
+
+fn install_external_plugin_archive_blocking(
+    app: &tauri::AppHandle,
+    source_path: String,
+) -> Result<String, String> {
+    let source = PathBuf::from(&source_path);
+    if !is_zip_path(&source) {
+        return Err("Plugin file must be a .zip archive".to_string());
+    }
+
+    // Validate the archive up front by loading it the same way the startup scan
+    // does; this rejects a malformed manifest, a missing/oversized entry, or an
+    // unsafe asset path before any file is written.
+    let bundle = load_external_plugin_archive(&source, &source_path)?;
+    let plugin_id = bundle.manifest.id;
+
+    let plugins_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Could not resolve app data directory: {error}"))?
+        .join("plugins");
+    fs::create_dir_all(&plugins_dir)
+        .map_err(|error| format!("Could not create plugins directory: {error}"))?;
+
+    let destination = plugins_dir.join(plugin_archive_file_name(&plugin_id));
+
+    // Reinstalling from a file already inside the plugins directory (e.g. the
+    // user re-selects the installed copy) would otherwise truncate the source
+    // mid-copy. Treat the no-op copy as a successful install.
+    let same_file = source
+        .canonicalize()
+        .ok()
+        .zip(destination.canonicalize().ok())
+        .map(|(from, to)| from == to)
+        .unwrap_or(false);
+    if !same_file {
+        fs::copy(&source, &destination)
+            .map_err(|error| format!("Could not install plugin archive: {error}"))?;
+    }
+
+    Ok(plugin_id)
+}
+
+/// Build a filesystem-safe `<id>.zip` name for an installed plugin archive.
+///
+/// The manifest `id` is validated for emptiness and whitespace but not for
+/// filesystem safety, so any character outside `[A-Za-z0-9._-]` is replaced with
+/// `_` and leading dots are stripped to keep the name from escaping the plugins
+/// directory or producing a hidden file. Using the id as the file name gives a
+/// reinstall natural overwrite semantics.
+fn plugin_archive_file_name(id: &str) -> String {
+    let sanitized: String = id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric()
+                || character == '-'
+                || character == '_'
+                || character == '.'
+            {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_start_matches('.');
+    let safe = if trimmed.is_empty() {
+        "plugin"
+    } else {
+        trimmed
+    };
+    format!("{safe}.zip")
 }
 
 #[tauri::command]
@@ -367,14 +720,31 @@ fn load_external_plugin_archive(
     let file = File::open(path).map_err(|error| format!("Could not open zip: {error}"))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|error| format!("Could not read zip: {error}"))?;
-    let manifest_text = read_zip_text_entry(&mut archive, "plugin.json", "plugin manifest")?;
+    // Tolerate a wrapping folder (`my-plugin/plugin.json`) as produced by zipping
+    // a plugin directory, not just a root `plugin.json`. The entry/style paths
+    // then resolve against the manifest's own directory.
+    let manifest_path = find_zip_manifest_path(&archive)
+        .ok_or_else(|| "Plugin archive is missing a plugin.json".to_string())?;
+    let prefix = manifest_path
+        .strip_suffix("plugin.json")
+        .unwrap_or("")
+        .to_string();
+    let manifest_text = read_zip_text_entry(&mut archive, &manifest_path, "plugin manifest")?;
     let manifest: ExternalPluginManifest = serde_json::from_str(&manifest_text)
         .map_err(|error| format!("Could not parse plugin.json: {error}"))?;
     validate_external_plugin_manifest(&manifest)?;
 
-    let entry_source = read_zip_text_entry(&mut archive, &manifest.entry, "plugin entry")?;
+    let entry_source = read_zip_text_entry(
+        &mut archive,
+        &format!("{prefix}{}", manifest.entry),
+        "plugin entry",
+    )?;
     let style_source = match manifest.style.as_deref() {
-        Some(style) => Some(read_zip_text_entry(&mut archive, style, "plugin style")?),
+        Some(style) => Some(read_zip_text_entry(
+            &mut archive,
+            &format!("{prefix}{style}"),
+            "plugin style",
+        )?),
         None => None,
     };
 
@@ -384,6 +754,30 @@ fn load_external_plugin_archive(
         entry_source,
         style_source,
     })
+}
+
+/// Find plugin.json inside a zip, tolerating a single wrapping folder. Prefers a
+/// root `plugin.json`, otherwise returns the shallowest `*/plugin.json`, ignoring
+/// the `__MACOSX/` metadata folder macOS adds to archives. Returns the manifest's
+/// full path within the archive, or None when no plugin.json is present.
+fn find_zip_manifest_path<R: Read + std::io::Seek>(archive: &zip::ZipArchive<R>) -> Option<String> {
+    let names: Vec<&str> = archive.file_names().collect();
+    if names.iter().any(|name| *name == "plugin.json") {
+        return Some("plugin.json".to_string());
+    }
+    let mut best: Option<&str> = None;
+    let mut best_depth = usize::MAX;
+    for name in names {
+        if name.starts_with("__MACOSX/") || !name.ends_with("/plugin.json") {
+            continue;
+        }
+        let depth = name.matches('/').count();
+        if depth < best_depth || (depth == best_depth && best.is_none_or(|b| name < b)) {
+            best = Some(name);
+            best_depth = depth;
+        }
+    }
+    best.map(str::to_string)
 }
 
 fn load_external_plugin_directory(
@@ -638,6 +1032,14 @@ struct SidecarServerInfo {
     port: u16,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JupyterServerInfo {
+    url: String,
+    port: u16,
+    token: String,
+}
+
 #[tauri::command]
 fn ensure_martin_binary(app: tauri::AppHandle) -> Result<MartinBinaryInfo, String> {
     ensure_martin_binary_path(&app)
@@ -867,6 +1269,277 @@ fn stop_geolibre_sidecar_blocking(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+async fn start_jupyter_server(app: tauri::AppHandle) -> Result<JupyterServerInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || start_jupyter_server_blocking(app))
+        .await
+        .map_err(|error| format!("Could not join Jupyter startup task: {error}"))?
+}
+
+fn start_jupyter_server_blocking(app: tauri::AppHandle) -> Result<JupyterServerInfo, String> {
+    let state = app.state::<JupyterServerState>();
+    // Serialize the whole startup. Concurrent calls (e.g. React StrictMode
+    // double-invoking the Notebook panel's mount effect in dev) would otherwise
+    // both pass the reuse check below and both spawn on JUPYTER_PORT; with
+    // `--port-retries=0` the loser fails to bind and exits 1. The second caller
+    // blocks here, then finds the live process in the reuse check and returns it.
+    let _startup = state
+        .startup
+        .lock()
+        .map_err(|_| "Could not lock Jupyter startup.".to_string())?;
+    // Reuse an already-running server: hand back the same URL + token.
+    {
+        let mut process = state
+            .process
+            .lock()
+            .map_err(|_| "Could not lock Jupyter process state.".to_string())?;
+        if let Some(server) = process.as_mut() {
+            if server
+                .child
+                .try_wait()
+                .map_err(|error| format!("Could not inspect Jupyter process: {error}"))?
+                .is_none()
+            {
+                let token = state
+                    .token
+                    .lock()
+                    .map_err(|_| "Could not lock Jupyter token.".to_string())?
+                    .clone()
+                    .unwrap_or_default();
+                return Ok(JupyterServerInfo {
+                    url: jupyter_base_url(),
+                    port: JUPYTER_PORT,
+                    token,
+                });
+            }
+            *process = None;
+        }
+    }
+
+    // A Jupyter server from a previous app session may still hold the port. We
+    // can't reuse it (its per-launch token is unknown to us), and because we
+    // spawn with `--ServerApp.port_retries=0`, a new server would fail to bind
+    // and exit 1 ("exited before it was ready") while the orphan lingers. Clear
+    // any stale listener and wait for the port to free before spawning.
+    let _ = terminate_jupyter_listeners_on_port(JUPYTER_PORT);
+    wait_for_port_free(JUPYTER_PORT);
+
+    let uv = ensure_managed_uv(&app)?;
+    let project_dir = sidecar_project_dir(&app)?;
+    let config_path = project_dir.join("jupyter_server_config.py");
+    let runtime_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Could not resolve app data directory: {error}"))?
+        .join("runtime");
+    // Notebooks are saved here (the JupyterLab file browser root).
+    let notebooks_dir = runtime_dir.join("notebooks");
+    let _ = fs::create_dir_all(&notebooks_dir);
+    // Seed the starter Welcome notebook (the same one bundled into JupyterLite on
+    // web) on first run only, so we never clobber a user's edits.
+    let welcome_dest = notebooks_dir.join("Welcome.ipynb");
+    if !welcome_dest.exists() {
+        let _ = fs::copy(
+            project_dir.join("notebook_examples").join("Welcome.ipynb"),
+            &welcome_dest,
+        );
+    }
+    // Make the kernel-side `geolibre` client importable from any notebook: copy
+    // it out of the bundled backend resource into a dedicated lib dir placed on
+    // the kernel's PYTHONPATH (so `import geolibre` works regardless of where the
+    // notebook lives).
+    let lib_dir = runtime_dir.join("notebook-lib");
+    let _ = fs::create_dir_all(&lib_dir);
+    let _ = fs::copy(
+        project_dir.join("notebook_client.py"),
+        lib_dir.join("geolibre.py"),
+    );
+    let token = generate_jupyter_token();
+
+    let mut command = Command::new(&uv);
+    command
+        .arg("run")
+        .arg("--project")
+        .arg(&project_dir)
+        // The `notebook` extra carries JupyterLab. Synced into a dedicated
+        // project environment so it never disturbs the FastAPI sidecar's env
+        // (which syncs the `ml` extra).
+        .arg("--extra")
+        .arg("notebook")
+        .arg("jupyter")
+        .arg("lab")
+        .arg("--no-browser")
+        .arg(format!("--config={}", config_path.display()))
+        .arg("--ServerApp.ip=127.0.0.1")
+        .arg(format!("--ServerApp.port={JUPYTER_PORT}"))
+        // Fail fast instead of hopping to another port we'd never discover.
+        .arg("--ServerApp.port_retries=0")
+        .arg(format!("--ServerApp.root_dir={}", notebooks_dir.display()))
+        .arg(format!("--IdentityProvider.token={token}"))
+        .current_dir(&project_dir)
+        .env("GEOLIBRE_UV", &uv)
+        .env("GEOLIBRE_RUNTIME_DIR", &runtime_dir)
+        .env("UV_CACHE_DIR", runtime_dir.join("uv-cache"))
+        .env("UV_PYTHON_INSTALL_DIR", runtime_dir.join("uv-python"))
+        .env("UV_PROJECT_ENVIRONMENT", runtime_dir.join("jupyter-server"))
+        // Prepend the bundled `geolibre` client to the kernel import path,
+        // preserving any inherited PYTHONPATH rather than replacing it.
+        .env("PYTHONPATH", prepend_pythonpath(&lib_dir))
+        .stdin(Stdio::null())
+        // Inherit (don't capture) stdout/stderr. Unlike the sidecar's quiet
+        // uvicorn, `uv sync` of JupyterLab + JupyterLab's own startup write a lot;
+        // a captured 64 KB pipe we don't drain during the health wait would fill
+        // and block the child, so it would never become ready. Inheriting also
+        // surfaces the logs in the dev terminal for debugging.
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    configure_sidecar_process(&mut command);
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Could not start Jupyter server: {error}"))?;
+
+    let base_url = jupyter_base_url();
+    if let Err(error) = wait_for_jupyter_health(&base_url, &token, &mut child) {
+        terminate_sidecar_child(&mut child);
+        return Err(error);
+    }
+
+    // We hold the startup lock, so no concurrent start could have stored a
+    // process; record ours as the live server.
+    *state
+        .process
+        .lock()
+        .map_err(|_| "Could not lock Jupyter process state.".to_string())? =
+        Some(JupyterProcess { child });
+    *state
+        .token
+        .lock()
+        .map_err(|_| "Could not lock Jupyter token.".to_string())? = Some(token.clone());
+
+    Ok(JupyterServerInfo {
+        url: base_url,
+        port: JUPYTER_PORT,
+        token,
+    })
+}
+
+#[tauri::command]
+async fn stop_jupyter_server(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || stop_jupyter_server_blocking(app))
+        .await
+        .map_err(|error| format!("Could not join Jupyter stop task: {error}"))?
+}
+
+fn stop_jupyter_server_blocking(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<JupyterServerState>();
+    {
+        let mut process = state
+            .process
+            .lock()
+            .map_err(|_| "Could not lock Jupyter process state.".to_string())?;
+        // JupyterProcess::Drop terminates the child's process group; taking the
+        // value out is enough (see stop_geolibre_sidecar_blocking).
+        let taken = process.take();
+        drop(process);
+        drop(taken);
+    }
+    if let Ok(mut token) = state.token.lock() {
+        *token = None;
+    }
+    // Backstop: reap anything still bound to the port (no-op on non-unix and
+    // when nothing is listening).
+    terminate_jupyter_listeners_on_port(JUPYTER_PORT)?;
+    Ok(())
+}
+
+fn jupyter_base_url() -> String {
+    format!("http://127.0.0.1:{JUPYTER_PORT}")
+}
+
+// Wait (briefly) until `port` can be bound, i.e. a just-terminated listener has
+// fully released it. Binding then dropping leaves a small race window, but it is
+// enough to avoid a `--port-retries=0` bind failure right after killing an orphan.
+fn wait_for_port_free(port: u16) {
+    for _ in 0..20 {
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+// Prepend `dir` to any inherited PYTHONPATH (platform separator), so a user's
+// existing value is preserved rather than clobbered.
+fn prepend_pythonpath(dir: &Path) -> String {
+    let dir = dir.display().to_string();
+    match env::var("PYTHONPATH") {
+        Ok(existing) if !existing.is_empty() => {
+            let sep = if cfg!(windows) { ";" } else { ":" };
+            format!("{dir}{sep}{existing}")
+        }
+        _ => dir,
+    }
+}
+
+fn jupyter_health_is_ready(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    token: &str,
+) -> bool {
+    client
+        .get(format!("{base_url}/api/status"))
+        .header("Authorization", format!("token {token}"))
+        .send()
+        .map(|response| response.status().is_success())
+        .unwrap_or(false)
+}
+
+fn wait_for_jupyter_health(base_url: &str, token: &str, child: &mut Child) -> Result<(), String> {
+    // Build the HTTP client once and reuse it across all health polls (this loop
+    // runs up to JUPYTER_HEALTH_ATTEMPTS = 240 times).
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .map_err(|error| format!("Could not build HTTP client: {error}"))?;
+    for _ in 0..JUPYTER_HEALTH_ATTEMPTS {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("Could not inspect Jupyter process: {error}"))?
+        {
+            // Output is inherited (visible in the terminal), not captured, so we
+            // surface only the exit status here.
+            return Err(format!(
+                "Jupyter server exited before it was ready (exit status: {status}). \
+                 Check the terminal for the Jupyter/uv startup output."
+            ));
+        }
+
+        if jupyter_health_is_ready(&client, base_url, token) {
+            return Ok(());
+        }
+
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    Err("Jupyter server did not become ready in time.".to_string())
+}
+
+// A loopback-bound, per-launch token for the desktop Jupyter server. It is the
+// only barrier once the XSRF check is disabled for the embedded iframe (see
+// jupyter_server_config.py), so use the OS CSPRNG (128 random bits) rather than
+// anything derived from the clock/pid.
+fn generate_jupyter_token() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).expect("OS CSPRNG (getrandom) unavailable");
+    let mut token = String::with_capacity(32);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(token, "{byte:02x}");
+    }
+    token
+}
+
 fn sidecar_base_url() -> String {
     format!("http://127.0.0.1:{SIDECAR_PORT}")
 }
@@ -969,6 +1642,33 @@ fn terminate_sidecar_process_group(_child: &mut Child) {}
 
 #[cfg(target_os = "linux")]
 fn terminate_sidecar_listeners_on_port(port: u16) -> Result<(), String> {
+    terminate_listeners_on_port(port, is_geolibre_sidecar_process)
+}
+
+// Reap a stale Jupyter server that still holds the port (e.g. orphaned by a
+// non-graceful exit of a previous app session). Recognized by its cmdline so we
+// never touch an unrelated jupyter (the user's own JupyterHub, etc.).
+#[cfg(target_os = "linux")]
+fn terminate_jupyter_listeners_on_port(port: u16) -> Result<(), String> {
+    terminate_listeners_on_port(port, is_geolibre_jupyter_process)
+}
+
+// Known gap: this is a no-op on macOS/Windows (the /proc-based listener lookup is
+// Linux-only). The current session's child is still reaped on exit via
+// JupyterProcess::Drop, but an orphan left by a *previous* crashed session can
+// keep holding the port there, in which case the next launch fails to bind and
+// surfaces "exited before it was ready". A cross-platform port-owner lookup
+// (e.g. lsof on macOS) would be needed to close this.
+#[cfg(not(target_os = "linux"))]
+fn terminate_jupyter_listeners_on_port(_port: u16) -> Result<(), String> {
+    Ok(())
+}
+
+// Kill the processes listening on `port` that `is_ours` recognizes (SIGTERM then
+// SIGKILL). The `is_ours` guard prevents killing an unrelated process that
+// happens to hold the port.
+#[cfg(target_os = "linux")]
+fn terminate_listeners_on_port(port: u16, is_ours: fn(i32) -> bool) -> Result<(), String> {
     let inodes = listening_tcp_inodes(port)?;
     if inodes.is_empty() {
         return Ok(());
@@ -984,7 +1684,7 @@ fn terminate_sidecar_listeners_on_port(port: u16) -> Result<(), String> {
         else {
             continue;
         };
-        if process_has_socket(pid, &inodes)? && is_geolibre_sidecar_process(pid) {
+        if process_has_socket(pid, &inodes)? && is_ours(pid) {
             pids.insert(pid);
         }
     }
@@ -1071,6 +1771,19 @@ fn is_geolibre_sidecar_process(pid: i32) -> bool {
     let command_line = String::from_utf8_lossy(&command_line);
     command_line.contains("geolibre_server.app.main")
         || command_line.contains("geolibre_server/app")
+}
+
+// Recognize OUR Jupyter server (started by start_jupyter_server) by the bundled
+// config path on its command line — specific enough not to match the user's own
+// jupyter/JupyterHub processes.
+#[cfg(target_os = "linux")]
+fn is_geolibre_jupyter_process(pid: i32) -> bool {
+    let path = format!("/proc/{pid}/cmdline");
+    let Ok(command_line) = fs::read(path) else {
+        return false;
+    };
+    let command_line = String::from_utf8_lossy(&command_line);
+    command_line.contains("jupyter_server_config.py") && command_line.contains("geolibre_server")
 }
 
 #[cfg(unix)]
@@ -1758,10 +2471,17 @@ fn create_oauth_popup_window(
 ) -> tauri::webview::NewWindowResponse<tauri::Wry> {
     let popup_id = POPUP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let child_app_handle = app_handle.clone();
-    let window = tauri::WebviewWindowBuilder::new(
+    let blank_url: tauri::Url = match "about:blank".parse() {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("OAuth popup: could not parse blank URL: {error}");
+            return tauri::webview::NewWindowResponse::Deny;
+        }
+    };
+    let window = match tauri::WebviewWindowBuilder::new(
         &app_handle,
         format!("oauthPopup{popup_id}"),
-        tauri::WebviewUrl::External("about:blank".parse().expect("valid blank URL")),
+        tauri::WebviewUrl::External(blank_url),
     )
     .window_features(features)
     .title(url.as_str())
@@ -1772,7 +2492,13 @@ fn create_oauth_popup_window(
         let _ = window.set_title(&title);
     })
     .build()
-    .expect("failed to create OAuth popup window");
+    {
+        Ok(window) => window,
+        Err(error) => {
+            eprintln!("OAuth popup: failed to create popup window: {error}");
+            return tauri::webview::NewWindowResponse::Deny;
+        }
+    };
 
     tauri::webview::NewWindowResponse::Create { window }
 }
@@ -1794,3 +2520,113 @@ fn configure_linux_webkit() {
 
 #[cfg(not(target_os = "linux"))]
 fn configure_linux_webkit() {}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_zip_manifest_path, is_allowed_local_vector_path, plugin_archive_file_name};
+    use std::io::{Cursor, Write};
+
+    #[test]
+    fn allows_absolute_vector_paths() {
+        assert!(is_allowed_local_vector_path("/home/u/cities.geojson"));
+        assert!(is_allowed_local_vector_path(
+            "C:\\Users\\smith\\Mile_Markers.geojson"
+        ));
+        assert!(is_allowed_local_vector_path("C:/data/roads.gpkg"));
+        // Case-insensitive extension; a ".." inside the filename is fine.
+        assert!(is_allowed_local_vector_path("/data/v1..2.SHP"));
+    }
+
+    #[test]
+    fn rejects_non_vector_relative_or_traversal_paths() {
+        // Non-vector extension.
+        assert!(!is_allowed_local_vector_path("/etc/passwd"));
+        // Relative path.
+        assert!(!is_allowed_local_vector_path("cities.geojson"));
+        // Directory traversal segments.
+        assert!(!is_allowed_local_vector_path("/data/../etc/secret.geojson"));
+        assert!(!is_allowed_local_vector_path(
+            "C:\\data\\..\\secret.geojson"
+        ));
+        // UNC network paths, both the backslash and forward-slash forms.
+        assert!(!is_allowed_local_vector_path(
+            "\\\\server\\share\\x.geojson"
+        ));
+        assert!(!is_allowed_local_vector_path("//server/share/x.geojson"));
+        // Empty string is not an absolute path.
+        assert!(!is_allowed_local_vector_path(""));
+        // No extension, and a trailing dot (empty extension).
+        assert!(!is_allowed_local_vector_path("/home/user/noextension"));
+        assert!(!is_allowed_local_vector_path("/home/user/file."));
+    }
+
+    fn zip_with_names(names: &[&str]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for name in names {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(b"x").unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn manifest_path(names: &[&str]) -> Option<String> {
+        let bytes = zip_with_names(names);
+        let archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        find_zip_manifest_path(&archive)
+    }
+
+    #[test]
+    fn finds_root_manifest() {
+        assert_eq!(
+            manifest_path(&["plugin.json", "dist/plugin.js"]).as_deref(),
+            Some("plugin.json")
+        );
+    }
+
+    #[test]
+    fn finds_manifest_inside_a_wrapping_folder() {
+        assert_eq!(
+            manifest_path(&["my-plugin/plugin.json", "my-plugin/dist/plugin.js"]).as_deref(),
+            Some("my-plugin/plugin.json")
+        );
+    }
+
+    #[test]
+    fn prefers_root_and_ignores_macosx_metadata() {
+        // A root manifest wins over a deeper one.
+        assert_eq!(
+            manifest_path(&["wrap/plugin.json", "plugin.json"]).as_deref(),
+            Some("plugin.json")
+        );
+        // The __MACOSX folder is skipped, so the real wrapped manifest is found.
+        assert_eq!(
+            manifest_path(&["__MACOSX/wrap/._plugin.json", "wrap/plugin.json"]).as_deref(),
+            Some("wrap/plugin.json")
+        );
+    }
+
+    #[test]
+    fn returns_none_without_a_manifest() {
+        assert_eq!(manifest_path(&["dist/plugin.js"]), None);
+    }
+
+    #[test]
+    fn keeps_safe_plugin_ids() {
+        assert_eq!(plugin_archive_file_name("maplibre-foo"), "maplibre-foo.zip");
+        assert_eq!(plugin_archive_file_name("foo.bar_2"), "foo.bar_2.zip");
+    }
+
+    #[test]
+    fn sanitizes_unsafe_characters_and_traversal() {
+        // Path separators and other characters cannot escape the plugins dir;
+        // leading dots are then stripped, so "../evil" collapses to "_evil".
+        assert_eq!(plugin_archive_file_name("../evil"), "_evil.zip");
+        assert_eq!(plugin_archive_file_name("a/b"), "a_b.zip");
+        // Leading dots are stripped so the archive is never hidden.
+        assert_eq!(plugin_archive_file_name("..hidden"), "hidden.zip");
+        // A name that sanitizes away entirely falls back to a fixed stem.
+        assert_eq!(plugin_archive_file_name("..."), "plugin.zip");
+    }
+}

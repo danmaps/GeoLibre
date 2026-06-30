@@ -13,14 +13,16 @@ import {
 } from "@geolibre/ui";
 import {
   BookOpen,
+  FileCode2,
   FilePen,
   FilePlus2,
   FileText,
   Folder,
   FolderOpen,
+  HardDrive,
   HardDriveDownload,
   History,
-  LayoutTemplate,
+  LayoutGrid,
   Link2,
   Printer,
   Save,
@@ -29,40 +31,45 @@ import {
   X,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import type { ToolbarPanel } from "../../../hooks/useToolbarPanels";
+import { useDesktopSettingsStore } from "../../../hooks/useDesktopSettings";
+import { isMenuItemVisible } from "../../../lib/ui-profile";
 import { formatRecentProjectTime, type ToolbarChrome } from "./constants";
 
 interface ProjectMenuProps {
   chrome: ToolbarChrome;
   collaborationEnabled: boolean;
-  printPanel: ToolbarPanel;
   onNewProject: () => void;
   onOpenFromFile: () => void;
   onOpenFromUrl: () => void;
+  onOpenGallery: () => void;
   onOpenRecent: (path: string) => void;
   onSave: () => void;
   onSaveAs: () => void;
   onShare: () => void;
+  onExportHtml: () => void;
   onCollaborate: () => void;
   onPrintLayout: () => void;
   onDownloadOffline: () => void;
+  onManageOffline: () => void;
 }
 
 /** The Project menu: new/open/save/share, recent projects, print, and storymap. */
 export function ProjectMenu({
   chrome,
   collaborationEnabled,
-  printPanel,
   onNewProject,
   onOpenFromFile,
   onOpenFromUrl,
+  onOpenGallery,
   onOpenRecent,
   onSave,
   onSaveAs,
   onShare,
+  onExportHtml,
   onCollaborate,
   onPrintLayout,
   onDownloadOffline,
+  onManageOffline,
 }: ProjectMenuProps) {
   const { t } = useTranslation();
   const projectPath = useAppStore((s) => s.projectPath);
@@ -70,6 +77,20 @@ export function ProjectMenu({
   const forgetRecentProject = useAppStore((s) => s.forgetRecentProject);
   const clearRecentProjects = useAppStore((s) => s.clearRecentProjects);
   const setStorymapPanelOpen = useAppStore((s) => s.setStorymapPanelOpen);
+  const uiProfile = useDesktopSettingsStore((s) => s.desktopSettings.uiProfile);
+  const show = (id: string) => isMenuItemVisible(uiProfile, id);
+  // Group-visibility flags so the separators between groups aren't left orphaned
+  // when a whole group is hidden by the active profile.
+  const showSaveGroup =
+    show("project.save") ||
+    show("project.saveAs") ||
+    show("project.share") ||
+    show("project.exportHtml") ||
+    (collaborationEnabled && show("project.collaborate"));
+  const showPrintGroup =
+    show("project.printLayout") ||
+    show("project.offlineRegion") ||
+    show("project.offlineManager");
 
   return (
     <DropdownMenu>
@@ -87,26 +108,35 @@ export function ProjectMenu({
       <DropdownMenuContent align="start" className="w-64">
         <DropdownMenuLabel>{t("toolbar.menu.project")}</DropdownMenuLabel>
         <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={onNewProject}>
-          <FilePlus2 className="mr-2 h-3.5 w-3.5" />
-          {t("toolbar.item.newEllipsis")}
-        </DropdownMenuItem>
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger>
-            <FolderOpen className="mr-2 h-3.5 w-3.5" />
-            {t("toolbar.item.openFrom")}
-          </DropdownMenuSubTrigger>
-          <DropdownMenuSubContent>
-            <DropdownMenuItem onSelect={onOpenFromFile}>
-              <FileText className="mr-2 h-3.5 w-3.5" />
-              {t("toolbar.item.fileEllipsis")}
-            </DropdownMenuItem>
-            <DropdownMenuItem onSelect={onOpenFromUrl}>
-              <Link2 className="mr-2 h-3.5 w-3.5" />
-              {t("toolbar.item.urlEllipsis")}
-            </DropdownMenuItem>
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
+        {show("project.new") && (
+          <DropdownMenuItem onSelect={onNewProject}>
+            <FilePlus2 className="mr-2 h-3.5 w-3.5" />
+            {t("toolbar.item.newEllipsis")}
+          </DropdownMenuItem>
+        )}
+        {show("project.openFrom") && (
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>
+              <FolderOpen className="mr-2 h-3.5 w-3.5" />
+              {t("toolbar.item.openFrom")}
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent>
+              <DropdownMenuItem onSelect={onOpenFromFile}>
+                <FileText className="mr-2 h-3.5 w-3.5" />
+                {t("toolbar.item.fileEllipsis")}
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={onOpenFromUrl}>
+                <Link2 className="mr-2 h-3.5 w-3.5" />
+                {t("toolbar.item.urlEllipsis")}
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={onOpenGallery}>
+                <LayoutGrid className="mr-2 h-3.5 w-3.5" />
+                {t("toolbar.item.galleryEllipsis")}
+              </DropdownMenuItem>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+        )}
+        {show("project.openRecent") && (
         <DropdownMenuSub>
           <DropdownMenuSubTrigger disabled={recentProjects.length === 0}>
             <History className="mr-2 h-3.5 w-3.5" />
@@ -176,44 +206,66 @@ export function ProjectMenu({
             </DropdownMenuItem>
           </DropdownMenuSubContent>
         </DropdownMenuSub>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={onSave}>
-          <Save className="mr-2 h-3.5 w-3.5" />
-          {t("common.save")}
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={onSaveAs}>
-          <FilePen className="mr-2 h-3.5 w-3.5" />
-          {t("toolbar.item.saveAsEllipsis")}
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={onShare}>
-          <Share2 className="mr-2 h-3.5 w-3.5" />
-          {t("toolbar.item.shareEllipsis")}
-        </DropdownMenuItem>
-        {collaborationEnabled && (
+        )}
+        {showSaveGroup && <DropdownMenuSeparator />}
+        {show("project.save") && (
+          <DropdownMenuItem onSelect={onSave}>
+            <Save className="mr-2 h-3.5 w-3.5" />
+            {t("common.save")}
+          </DropdownMenuItem>
+        )}
+        {show("project.saveAs") && (
+          <DropdownMenuItem onSelect={onSaveAs}>
+            <FilePen className="mr-2 h-3.5 w-3.5" />
+            {t("toolbar.item.saveAsEllipsis")}
+          </DropdownMenuItem>
+        )}
+        {show("project.share") && (
+          <DropdownMenuItem onSelect={onShare}>
+            <Share2 className="mr-2 h-3.5 w-3.5" />
+            {t("toolbar.item.shareEllipsis")}
+          </DropdownMenuItem>
+        )}
+        {show("project.exportHtml") && (
+          <DropdownMenuItem onSelect={onExportHtml}>
+            <FileCode2 className="mr-2 h-3.5 w-3.5" />
+            {t("toolbar.item.exportHtmlEllipsis")}
+          </DropdownMenuItem>
+        )}
+        {collaborationEnabled && show("project.collaborate") && (
           <DropdownMenuItem onSelect={onCollaborate}>
             <Users className="mr-2 h-3.5 w-3.5" />
             {t("toolbar.item.collaborateEllipsis")}
           </DropdownMenuItem>
         )}
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={printPanel.toggle}>
-          <Printer className="mr-2 h-3.5 w-3.5" />
-          {t("toolbar.item.printEllipsis")}
-          {printPanel.visible ? " ✓" : ""}
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={onPrintLayout}>
-          <LayoutTemplate className="mr-2 h-3.5 w-3.5" />
-          {t("toolbar.item.printLayoutEllipsis")}
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={onDownloadOffline}>
-          <HardDriveDownload className="mr-2 h-3.5 w-3.5" />
-          {t("toolbar.item.offlineRegionEllipsis")}
-        </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => setStorymapPanelOpen(true)}>
-          <BookOpen className="mr-2 h-3.5 w-3.5" />
-          {t("toolbar.item.storymapEllipsis")}
-        </DropdownMenuItem>
+        {showPrintGroup && <DropdownMenuSeparator />}
+        {show("project.printLayout") && (
+          <DropdownMenuItem onSelect={onPrintLayout}>
+            <Printer className="mr-2 h-3.5 w-3.5" />
+            {t("toolbar.item.printLayoutEllipsis")}
+          </DropdownMenuItem>
+        )}
+        {show("project.offlineRegion") && (
+          <DropdownMenuItem onSelect={onDownloadOffline}>
+            <HardDriveDownload className="mr-2 h-3.5 w-3.5" />
+            {t("toolbar.item.offlineRegionEllipsis")}
+          </DropdownMenuItem>
+        )}
+        {show("project.offlineManager") && (
+          <DropdownMenuItem onSelect={onManageOffline}>
+            <HardDrive className="mr-2 h-3.5 w-3.5" />
+            {t("toolbar.item.offlineManagerEllipsis")}
+          </DropdownMenuItem>
+        )}
+        {show("project.storymap") && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={() => setStorymapPanelOpen(true)}>
+              <BookOpen className="mr-2 h-3.5 w-3.5" />
+              {t("toolbar.item.storymapEllipsis")}
+            </DropdownMenuItem>
+          </>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );

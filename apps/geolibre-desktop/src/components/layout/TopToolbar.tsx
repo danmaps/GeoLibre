@@ -22,40 +22,51 @@ import {
   openThreeDTilesLayerPanel,
   openVectorLayerPanel,
   openZarrLayerPanel,
+  setAnnotationLabels,
+  setBasemapControlLabels,
+  setGraticuleLabels,
   setReverseGeocodeLabels,
   DECK_VIZ_PLUGIN_ID,
   DIRECTIONS_PLUGIN_ID,
+  GRATICULE_PLUGIN_ID,
   REVERSE_GEOCODE_PLUGIN_ID,
   EFFECTS_PLUGIN_ID,
 } from "@geolibre/plugins";
 import { Button, cn, Input } from "@geolibre/ui";
 import {
+  ArrowLeft,
+  ArrowRight,
   Bug,
+  Compass,
+  Crosshair,
   Database,
   FilePen,
+  Mountain,
   Share2,
   Users,
   FilePlus2,
   Folder,
+  FolderGit2,
   FolderOpen,
+  Globe,
   Info,
   Keyboard,
-  Layers,
   Link2,
   Map,
   MapPin,
   MessageSquare,
   Moon,
   Printer,
-  LayoutTemplate,
   RefreshCw,
   Save,
   Sparkles,
   Sun,
   Workflow,
   Wrench,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   createAppAPI,
@@ -68,29 +79,42 @@ import { useProjectFileActions } from "../../hooks/useProjectFileActions";
 import { useToolbarPanels } from "../../hooks/useToolbarPanels";
 import type { ThemeMode } from "../../hooks/useThemeMode";
 import { isTauri } from "../../lib/tauri-io";
+import { useDesktopSettingsStore } from "../../hooks/useDesktopSettings";
+import {
+  MENU_MANAGED_PLUGIN_IDS,
+  isMenuVisible,
+  isPluginVisible,
+} from "../../lib/ui-profile";
 import { CommandPalette } from "../command/CommandPalette";
 import { KeyboardShortcutsDialog } from "../command/KeyboardShortcutsDialog";
 import { useGlobalShortcuts } from "../../hooks/useGlobalShortcuts";
+import { useViewportHistory } from "../../hooks/useViewportHistory";
 import type { Command } from "../../lib/commands";
 import { AddDataDialog, type AddDataKind } from "./AddDataDialog";
 import { AddNetcdfDialog } from "./AddNetcdfDialog";
 import { AboutDialog } from "./AboutDialog";
 import { NewProjectDialog } from "./NewProjectDialog";
 import { ManagePluginsDialog } from "./ManagePluginsDialog";
+import { ProjectGalleryDialog } from "./ProjectGalleryDialog";
 import { ShareProjectDialog } from "./ShareProjectDialog";
-import { CollaborateDialog } from "./CollaborateDialog";
-import { useCollaboration } from "../../hooks/useCollaboration";
+import type { CollaborationApi } from "../../hooks/useCollaboration";
 import { SettingsDialog } from "./SettingsDialog";
+import { SetViewDialog } from "./SetViewDialog";
 import { PrintLayoutDialog } from "./PrintLayoutDialog";
 import { FieldCollectionDialog } from "./FieldCollectionDialog";
+import { RecordTourDialog } from "./RecordTourDialog";
+import { GeoreferencerDialog } from "./GeoreferencerDialog";
 import { OfflineRegionDialog } from "./OfflineRegionDialog";
+import { OfflineManagerDialog } from "./OfflineManagerDialog";
 import { AddDataMenu } from "./toolbar/AddDataMenu";
 import { ConsentNoticeDialogs } from "./toolbar/ConsentNoticeDialogs";
 import { ControlsMenu } from "./toolbar/ControlsMenu";
 import { EditMenu } from "./toolbar/EditMenu";
+import { ViewMenu } from "./toolbar/ViewMenu";
 import { HelpMenu } from "./toolbar/HelpMenu";
 import { OsmPbfDialogs } from "./toolbar/OsmPbfDialogs";
 import { PluginsMenu } from "./toolbar/PluginsMenu";
+import { PluginToolbarMenus } from "./toolbar/PluginToolbarMenus";
 import { ProcessingMenu } from "./toolbar/ProcessingMenu";
 import { ProjectFileDialogs } from "./toolbar/ProjectFileDialogs";
 import { ProjectMenu } from "./toolbar/ProjectMenu";
@@ -100,6 +124,7 @@ import {
   type AddLayerHandlers,
   CONVERSION_COMMANDS,
   FEEDBACK_URL,
+  GITHUB_URL,
   MAP_CONTROL_ITEMS,
   NEW_PROJECT_VISIBLE_BUILT_IN_CONTROLS,
   newProjectToolbarControlVisibility,
@@ -108,15 +133,20 @@ import {
   type ToolbarChrome,
   type ToolbarMapControl,
   VECTOR_TOOL_COMMANDS,
+  WEBSITE_URL,
 } from "./toolbar/constants";
 
 interface TopToolbarProps {
   compact?: boolean;
   diagnosticsErrorCount: number;
   mapControllerRef: React.RefObject<MapController | null>;
+  mapReadyGeneration: number;
   showLabels?: boolean;
   showProjectInfo?: boolean;
   themeMode: ThemeMode;
+  // Lifted to DesktopShell so the on-canvas status badge can share one live
+  // session (calling useCollaboration twice would open two sockets).
+  collaboration: CollaborationApi;
   onOpenDiagnostics: () => void;
   onToggleThemeMode: () => void;
 }
@@ -125,9 +155,11 @@ export function TopToolbar({
   compact = false,
   diagnosticsErrorCount,
   mapControllerRef,
+  mapReadyGeneration,
   showLabels = true,
   showProjectInfo = true,
   themeMode,
+  collaboration,
   onOpenDiagnostics,
   onToggleThemeMode,
 }: TopToolbarProps) {
@@ -141,6 +173,52 @@ export function TopToolbar({
       noAddress: t("geocode.reverseNoAddress"),
       copyAddress: t("geocode.reverseCopyAddress"),
       failed: t("geocode.reverseFailed"),
+    });
+    setBasemapControlLabels({
+      confirmStyleReplace: (name, count) =>
+        t("basemaps.confirmStyleReplace", { name, count }),
+    });
+    setAnnotationLabels({
+      toolbar: t("annotations.toolbar"),
+      layerName: t("annotations.layerName"),
+      tools: {
+        text: t("annotations.tools.text"),
+        arrow: t("annotations.tools.arrow"),
+        rectangle: t("annotations.tools.rectangle"),
+        ellipse: t("annotations.tools.ellipse"),
+        freehand: t("annotations.tools.freehand"),
+      },
+      color: t("annotations.color"),
+      width: t("annotations.width"),
+      widthOptions: {
+        thin: t("annotations.widthOptions.thin"),
+        medium: t("annotations.widthOptions.medium"),
+        thick: t("annotations.widthOptions.thick"),
+      },
+      deleteLast: t("annotations.deleteLast"),
+      clearAll: t("annotations.clearAll"),
+      textPlaceholder: t("annotations.textPlaceholder"),
+    });
+    setGraticuleLabels({
+      title: t("graticule.title"),
+      controlTitle: t("graticule.controlTitle"),
+      spacing: t("graticule.spacing"),
+      spacingAuto: t("graticule.spacingAuto"),
+      spacingFixed: t("graticule.spacingFixed"),
+      interval: t("graticule.interval"),
+      lineColor: t("graticule.lineColor"),
+      lineWidth: t("graticule.lineWidth"),
+      lineOpacity: t("graticule.lineOpacity"),
+      dashedLines: t("graticule.dashedLines"),
+      showLabels: t("graticule.showLabels"),
+      labelFormat: t("graticule.labelFormat"),
+      formatDecimal: t("graticule.formatDecimal"),
+      formatDms: t("graticule.formatDms"),
+      labelEdges: t("graticule.labelEdges"),
+      edgesLeftBottom: t("graticule.edgesLeftBottom"),
+      edgesAll: t("graticule.edgesAll"),
+      labelColor: t("graticule.labelColor"),
+      labelSize: t("graticule.labelSize"),
     });
   }, [t]);
 
@@ -156,7 +234,15 @@ export function TopToolbar({
   const setAssistantOpen = useAppStore((s) => s.setAssistantOpen);
   const projectName = useAppStore((s) => s.projectName);
   const projectPath = useAppStore((s) => s.projectPath);
+  const projectGeneration = useAppStore((s) => s.projectGeneration);
   const setProjectName = useAppStore((s) => s.setProjectName);
+  // The Collaborate dialog's visibility lives in the store so the on-canvas
+  // session-status badge can reopen it from outside this component tree (#754).
+  // The dialog itself is rendered by DesktopShell (not here) so it survives
+  // toolbar-hidden layouts; the toolbar only triggers it via this setter.
+  const setCollaborateDialogOpen = useAppStore(
+    (s) => s.setCollaborateDialogOpen,
+  );
 
   const {
     plugins,
@@ -164,7 +250,35 @@ export function TopToolbar({
     getMapControlPosition,
     toggle,
     setMapControlPosition,
+    getEffectsSettings,
+    previewEffectsSettings,
+    commitEffectsSettings,
   } = usePluginRegistry();
+  // Plugin ids hidden by the active UI profile (issue #500). Recompute only when
+  // the profile changes so the Plugins menu can drop them.
+  const uiProfile = useDesktopSettingsStore(
+    (state) => state.desktopSettings.uiProfile,
+  );
+  const hiddenPluginIds = useMemo(
+    () =>
+      new Set(
+        plugins
+          .filter((plugin) => !isPluginVisible(uiProfile, plugin.id))
+          .map((plugin) => plugin.id),
+      ),
+    [plugins, uiProfile],
+  );
+  // Plugins the user can toggle from the Plugins menu, offered as visibility
+  // checkboxes in Settings → Interface. Excludes the four plugins that are
+  // toggled elsewhere (Effects/Directions/Reverse Geocode via Controls, deck.gl
+  // viz via Add Data), matching PluginsMenu's skip list.
+  const profilePlugins = useMemo(
+    () =>
+      plugins
+        .filter((plugin) => !MENU_MANAGED_PLUGIN_IDS.has(plugin.id))
+        .map((plugin) => ({ id: plugin.id, name: plugin.name })),
+    [plugins],
+  );
   // mapControllerRef is a stable ref object and createAppAPI dereferences
   // `.current` lazily, so memoizing on the ref keeps a single appApi identity
   // across renders without going stale.
@@ -174,17 +288,15 @@ export function TopToolbar({
   const projectFiles = useProjectFileActions(mapControllerRef);
   const osmPbf = useOsmPbfLoader(appApi, projectFiles.setActionError);
   const consent = useConsentGatedActions({ appApi, isActive, toggle });
-  const collaboration = useCollaboration(mapControllerRef);
+  const viewportHistory = useViewportHistory(
+    mapControllerRef,
+    mapReadyGeneration,
+    projectGeneration,
+  );
 
-  // When opened via a `?collab=<code>` share link, auto-open the Collaborate
-  // dialog (which prefills the code) so the recipient only picks a name and
-  // joins, instead of having to find the Project menu first.
-  useEffect(() => {
-    if (!collaboration.enabled) return;
-    if (new URLSearchParams(window.location.search).get("collab")) {
-      setCollaborateDialogOpen(true);
-    }
-  }, [collaboration.enabled]);
+  // Tracks an active IME composition so pressing Enter to confirm a CJK
+  // candidate doesn't blur the project-name field mid-composition.
+  const projectNameComposingRef = useRef(false);
 
   const [controlsVisible, setControlsVisible] = useState<
     Record<ToolbarMapControl, boolean>
@@ -207,11 +319,15 @@ export function TopToolbar({
   const [newProjectDialogOpen, setNewProjectDialogOpen] = useState(false);
   const [managePluginsOpen, setManagePluginsOpen] = useState(false);
   const [shareDialogOpen, setShareDialogOpen] = useState(false);
-  const [collaborateDialogOpen, setCollaborateDialogOpen] = useState(false);
+  const [galleryDialogOpen, setGalleryDialogOpen] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [printLayoutOpen, setPrintLayoutOpen] = useState(false);
   const [offlineRegionOpen, setOfflineRegionOpen] = useState(false);
+  const [offlineManagerOpen, setOfflineManagerOpen] = useState(false);
   const [fieldCollectionOpen, setFieldCollectionOpen] = useState(false);
+  const [recordTourOpen, setRecordTourOpen] = useState(false);
+  const [georeferencerOpen, setGeoreferencerOpen] = useState(false);
+  const [setViewOpen, setSetViewOpen] = useState(false);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [checkForUpdatesRequest, setCheckForUpdatesRequest] = useState(0);
@@ -336,17 +452,10 @@ export function TopToolbar({
         ]
       : []),
     {
-      id: "project.print",
-      title: t("toolbar.command.projectPrint"),
-      group: t("toolbar.commandGroup.project"),
-      icon: Printer,
-      run: panels.print.toggle,
-    },
-    {
       id: "project.print-layout",
       title: t("toolbar.item.printLayoutEllipsis"),
       group: t("toolbar.commandGroup.project"),
-      icon: LayoutTemplate,
+      icon: Printer,
       run: () => setPrintLayoutOpen(true),
     },
     // Add Data
@@ -596,6 +705,62 @@ export function TopToolbar({
     },
     // View
     {
+      id: "view.zoom-in",
+      title: t("toolbar.command.zoomIn"),
+      group: t("toolbar.commandGroup.view"),
+      keywords: "zoom in closer magnify scale",
+      icon: ZoomIn,
+      run: () => mapControllerRef.current?.zoomIn(),
+    },
+    {
+      id: "view.zoom-out",
+      title: t("toolbar.command.zoomOut"),
+      group: t("toolbar.commandGroup.view"),
+      keywords: "zoom out farther wider scale",
+      icon: ZoomOut,
+      run: () => mapControllerRef.current?.zoomOut(),
+    },
+    {
+      id: "view.previous",
+      title: t("toolbar.command.previousView"),
+      group: t("toolbar.commandGroup.view"),
+      keywords: "back history viewport extent previous undo pan zoom",
+      icon: ArrowLeft,
+      run: viewportHistory.goBack,
+    },
+    {
+      id: "view.next",
+      title: t("toolbar.command.nextView"),
+      group: t("toolbar.commandGroup.view"),
+      keywords: "forward history viewport extent next redo pan zoom",
+      icon: ArrowRight,
+      run: viewportHistory.goForward,
+    },
+    {
+      id: "view.reset-north",
+      title: t("toolbar.command.resetNorth"),
+      group: t("toolbar.commandGroup.view"),
+      keywords: "north bearing rotation rotate compass orientation",
+      icon: Compass,
+      run: () => mapControllerRef.current?.resetNorth(),
+    },
+    {
+      id: "view.reset-pitch-bearing",
+      title: t("toolbar.command.resetPitchBearing"),
+      group: t("toolbar.commandGroup.view"),
+      keywords: "pitch bearing tilt rotation north flat level 3d",
+      icon: Mountain,
+      run: () => mapControllerRef.current?.resetNorthPitch(),
+    },
+    {
+      id: "view.set-view",
+      title: t("toolbar.command.setView"),
+      group: t("toolbar.commandGroup.view"),
+      keywords: "set view go to coordinates center zoom pitch bearing camera location longitude latitude",
+      icon: Crosshair,
+      run: () => setSetViewOpen(true),
+    },
+    {
       id: "view.theme",
       title:
         themeMode === "dark"
@@ -614,6 +779,22 @@ export function TopToolbar({
       keywords: "hotkeys cheat sheet",
       icon: Keyboard,
       run: () => setShortcutsOpen(true),
+    },
+    {
+      id: "help.website",
+      title: t("toolbar.command.website"),
+      group: t("toolbar.commandGroup.help"),
+      keywords: "home page site geolibre.app",
+      icon: Globe,
+      run: () => void openExternalLink(WEBSITE_URL),
+    },
+    {
+      id: "help.github",
+      title: t("toolbar.command.githubRepository"),
+      group: t("toolbar.commandGroup.help"),
+      keywords: "source code repo git opengeos",
+      icon: FolderGit2,
+      run: () => void openExternalLink(GITHUB_URL),
     },
     {
       id: "help.diagnostics",
@@ -646,9 +827,9 @@ export function TopToolbar({
       icon: Info,
       run: () => setAboutOpen(true),
     },
-    // Plugins — one toggle per registered plugin. Atmosphere Effects,
-    // Directions, Reverse Geocode, and the deck.gl viz renderer are excluded
-    // here because they are surfaced under Controls / Add Data instead
+    // Plugins — one toggle per registered plugin. Atmospheric Effects,
+    // Directions, Reverse Geocode, Gridlines, and the deck.gl viz renderer are
+    // excluded here because they are surfaced under Controls / Add Data instead
     // (matching the menus).
     ...plugins
       .filter(
@@ -656,6 +837,7 @@ export function TopToolbar({
           plugin.id !== EFFECTS_PLUGIN_ID &&
           plugin.id !== DIRECTIONS_PLUGIN_ID &&
           plugin.id !== REVERSE_GEOCODE_PLUGIN_ID &&
+          plugin.id !== GRATICULE_PLUGIN_ID &&
           plugin.id !== DECK_VIZ_PLUGIN_ID,
       )
       .map((plugin) => ({
@@ -709,7 +891,8 @@ export function TopToolbar({
         "flex min-h-11 min-w-0 shrink-0 items-center gap-1 border-b bg-card py-1",
         compact
           ? "flex-nowrap overflow-x-auto px-1.5"
-          : "flex-wrap px-2 md:flex-nowrap",
+          : // Wrap below md; scroll a single row at md+ so tablets reach every menu (#871).
+            "flex-wrap px-2 md:flex-nowrap md:overflow-x-auto",
       )}
     >
       <span className="mr-1 flex shrink-0 items-center gap-1.5 text-sm font-semibold text-primary md:mr-2">
@@ -718,67 +901,116 @@ export function TopToolbar({
           <span className="hidden sm:inline">{appTitle}</span>
         ) : null}
       </span>
-      <ProjectMenu
-        chrome={chrome}
-        collaborationEnabled={collaboration.enabled}
-        printPanel={panels.print}
-        onNewProject={() => setNewProjectDialogOpen(true)}
-        onOpenFromFile={() => void projectFiles.handleOpenFromFile()}
-        onOpenFromUrl={() => projectFiles.setProjectUrlDialogOpen(true)}
-        onOpenRecent={(path) => void projectFiles.handleOpenRecent(path)}
-        onSave={() => void projectFiles.handleSave()}
-        onSaveAs={() => void projectFiles.handleSaveAs()}
-        onShare={() => setShareDialogOpen(true)}
-        onCollaborate={() => setCollaborateDialogOpen(true)}
-        onPrintLayout={() => setPrintLayoutOpen(true)}
-        onDownloadOffline={() => setOfflineRegionOpen(true)}
-      />
-      <EditMenu chrome={chrome} />
+      {isMenuVisible(uiProfile, "project") && (
+        <ProjectMenu
+          chrome={chrome}
+          collaborationEnabled={collaboration.enabled}
+          onNewProject={() => setNewProjectDialogOpen(true)}
+          onOpenFromFile={() => void projectFiles.handleOpenFromFile()}
+          onOpenFromUrl={() => projectFiles.setProjectUrlDialogOpen(true)}
+          onOpenGallery={() => setGalleryDialogOpen(true)}
+          onOpenRecent={(path) => void projectFiles.handleOpenRecent(path)}
+          onSave={() => void projectFiles.handleSave()}
+          onSaveAs={() => void projectFiles.handleSaveAs()}
+          onShare={() => setShareDialogOpen(true)}
+          onExportHtml={() => void projectFiles.handleExportHtml()}
+          onCollaborate={() => setCollaborateDialogOpen(true)}
+          onPrintLayout={() => setPrintLayoutOpen(true)}
+          onDownloadOffline={() => setOfflineRegionOpen(true)}
+          onManageOffline={() => setOfflineManagerOpen(true)}
+        />
+      )}
+      {isMenuVisible(uiProfile, "edit") && <EditMenu chrome={chrome} />}
+      {isMenuVisible(uiProfile, "view") && (
+        <ViewMenu
+          chrome={chrome}
+          history={viewportHistory}
+          getCamera={() => {
+            const map = mapControllerRef.current?.getMap();
+            if (!map) return null;
+            return {
+              zoom: map.getZoom(),
+              bearing: map.getBearing(),
+              pitch: map.getPitch(),
+              minZoom: map.getMinZoom(),
+              maxZoom: map.getMaxZoom(),
+            };
+          }}
+          onResetNorth={() => mapControllerRef.current?.resetNorth()}
+          onResetPitch={() => mapControllerRef.current?.resetPitch()}
+          onResetPitchBearing={() =>
+            mapControllerRef.current?.resetNorthPitch()
+          }
+          onSetView={() => setSetViewOpen(true)}
+          onZoomIn={() => mapControllerRef.current?.zoomIn()}
+          onZoomOut={() => mapControllerRef.current?.zoomOut()}
+        />
+      )}
       <NewProjectDialog
         open={newProjectDialogOpen}
         onOpenChange={setNewProjectDialogOpen}
         onSaveCurrentProject={projectFiles.handleSave}
         onProjectCreated={resetRuntimeControlsForNewProject}
       />
-      <AddDataMenu
-        chrome={chrome}
-        addLayer={addLayer}
-        osmPbfBusy={osmPbf.busy}
-        onSetAddDataKind={setAddDataKind}
-        onAddGltfModel={() => {
-          setAddDataDeckVizKind("scenegraph");
-          setAddDataKind("deckgl-viz");
-        }}
-        onOpenOsmPbfDialog={() => osmPbf.setDialogOpen(true)}
-      />
-      <ProcessingMenu
-        chrome={chrome}
-        earthEnginePanel={panels.earthEngine}
-        onOpenNetworkTool={consent.openNetworkTool}
-        onOpenPlanetaryComputer={handleOpenPlanetaryComputer}
-      />
-      <ControlsMenu
-        chrome={chrome}
-        controlsVisible={controlsVisible}
-        panels={panels}
-        effectsActive={isActive(EFFECTS_PLUGIN_ID)}
-        directionsActive={isActive(DIRECTIONS_PLUGIN_ID)}
-        reverseGeocodeActive={isActive(REVERSE_GEOCODE_PLUGIN_ID)}
-        onToggleMapControl={toggleMapControl}
-        onToggleEffects={() => toggle(EFFECTS_PLUGIN_ID, appApi)}
-        onToggleDirections={consent.handleToggleDirections}
-        onToggleReverseGeocode={consent.handleToggleReverseGeocode}
-        onOpenFieldCollection={() => setFieldCollectionOpen(true)}
-      />
-      <PluginsMenu
-        chrome={chrome}
-        appApi={appApi}
-        plugins={plugins}
-        isActive={isActive}
-        toggle={toggle}
-        getMapControlPosition={getMapControlPosition}
-        setMapControlPosition={setMapControlPosition}
-      />
+      {isMenuVisible(uiProfile, "addData") && (
+        <AddDataMenu
+          chrome={chrome}
+          addLayer={addLayer}
+          osmPbfBusy={osmPbf.busy}
+          onSetAddDataKind={setAddDataKind}
+          onAddGltfModel={() => {
+            setAddDataDeckVizKind("scenegraph");
+            setAddDataKind("deckgl-viz");
+          }}
+          onOpenOsmPbfDialog={() => osmPbf.setDialogOpen(true)}
+        />
+      )}
+      {isMenuVisible(uiProfile, "processing") && (
+        <ProcessingMenu
+          chrome={chrome}
+          earthEnginePanel={panels.earthEngine}
+          onOpenNetworkTool={consent.openNetworkTool}
+          onOpenPlanetaryComputer={handleOpenPlanetaryComputer}
+          onOpenGeoreferencer={() => setGeoreferencerOpen(true)}
+        />
+      )}
+      {isMenuVisible(uiProfile, "controls") && (
+        <ControlsMenu
+          chrome={chrome}
+          controlsVisible={controlsVisible}
+          panels={panels}
+          effectsActive={isActive(EFFECTS_PLUGIN_ID)}
+          directionsActive={isActive(DIRECTIONS_PLUGIN_ID)}
+          reverseGeocodeActive={isActive(REVERSE_GEOCODE_PLUGIN_ID)}
+          graticuleActive={isActive(GRATICULE_PLUGIN_ID)}
+          onToggleMapControl={toggleMapControl}
+          onToggleEffects={() => toggle(EFFECTS_PLUGIN_ID, appApi)}
+          getEffectsSettings={getEffectsSettings}
+          onPreviewEffectsSettings={previewEffectsSettings}
+          onCommitEffectsSettings={commitEffectsSettings}
+          onToggleDirections={consent.handleToggleDirections}
+          onToggleReverseGeocode={consent.handleToggleReverseGeocode}
+          onToggleGraticule={() => toggle(GRATICULE_PLUGIN_ID, appApi)}
+          onOpenFieldCollection={() => setFieldCollectionOpen(true)}
+          onOpenRecordTour={() => setRecordTourOpen(true)}
+        />
+      )}
+      {isMenuVisible(uiProfile, "plugins") && (
+        <PluginsMenu
+          chrome={chrome}
+          appApi={appApi}
+          plugins={plugins}
+          isActive={isActive}
+          toggle={toggle}
+          getMapControlPosition={getMapControlPosition}
+          setMapControlPosition={setMapControlPosition}
+          hiddenPluginIds={hiddenPluginIds}
+        />
+      )}
+      {/* Top-level toolbar menus registered by built-in plugins via
+          app.registerToolbarMenu(); external plugin menus render after Help
+          (below). Renders nothing when none exist. */}
+      <PluginToolbarMenus chrome={chrome} placement="builtin" />
       <SettingsDialog
         buttonClassName={toolbarButtonClass}
         buttonSize={toolbarButtonSize}
@@ -786,6 +1018,9 @@ export function TopToolbar({
         mapControllerRef={mapControllerRef}
         showLabels={showLabels}
         onOpenManagePlugins={() => setManagePluginsOpen(true)}
+        profilePlugins={profilePlugins}
+        themeMode={themeMode}
+        onToggleThemeMode={onToggleThemeMode}
       />
       <ManagePluginsDialog
         open={managePluginsOpen}
@@ -802,18 +1037,39 @@ export function TopToolbar({
         onOpenChange={setOfflineRegionOpen}
         mapControllerRef={mapControllerRef}
       />
+      <OfflineManagerDialog
+        open={offlineManagerOpen}
+        onOpenChange={setOfflineManagerOpen}
+      />
       <FieldCollectionDialog
         open={fieldCollectionOpen}
         onOpenChange={setFieldCollectionOpen}
+        mapControllerRef={mapControllerRef}
+      />
+      <RecordTourDialog
+        open={recordTourOpen}
+        onOpenChange={setRecordTourOpen}
+        mapControllerRef={mapControllerRef}
+      />
+      <GeoreferencerDialog
+        open={georeferencerOpen}
+        onOpenChange={setGeoreferencerOpen}
+        mapControllerRef={mapControllerRef}
+      />
+      <SetViewDialog
+        open={setViewOpen}
+        onOpenChange={setSetViewOpen}
         mapControllerRef={mapControllerRef}
       />
       <ShareProjectDialog
         open={shareDialogOpen}
         onOpenChange={setShareDialogOpen}
         currentTitle={projectName}
-        getProject={(title) => {
+        getProject={async (title) => {
+          // Shared projects are opened on another machine where the local files
+          // don't exist, so always embed the vector data (never file references).
           const { content, defaultProjectName } =
-            projectFiles.buildCurrentProject(title);
+            await projectFiles.buildEmbeddedProject(title);
           // Strip path separators, control chars, and other characters that are
           // illegal in filenames so the server gets a predictable name.
           const safeName = defaultProjectName.replace(
@@ -826,25 +1082,30 @@ export function TopToolbar({
           return { content, filename: `${safeName}.geolibre.json` };
         }}
       />
-      {collaboration.enabled && (
-        <CollaborateDialog
-          open={collaborateDialogOpen}
-          onOpenChange={setCollaborateDialogOpen}
-          api={collaboration}
+      <ProjectGalleryDialog
+        open={galleryDialogOpen}
+        onOpenChange={setGalleryDialogOpen}
+        onOpenProject={(url, authToken) =>
+          projectFiles.openProjectFromShareUrl(url, { authToken })
+        }
+      />
+      {isMenuVisible(uiProfile, "help") && (
+        <HelpMenu
+          chrome={chrome}
+          diagnosticsErrorCount={diagnosticsErrorCount}
+          onOpenCommandPalette={() => setCommandPaletteOpen(true)}
+          onOpenShortcuts={() => setShortcutsOpen(true)}
+          onOpenDiagnostics={onOpenDiagnostics}
+          onCheckForUpdates={() => {
+            setAboutOpen(true);
+            setCheckForUpdatesRequest((value) => value + 1);
+          }}
+          onAbout={() => setAboutOpen(true)}
         />
       )}
-      <HelpMenu
-        chrome={chrome}
-        diagnosticsErrorCount={diagnosticsErrorCount}
-        onOpenCommandPalette={() => setCommandPaletteOpen(true)}
-        onOpenShortcuts={() => setShortcutsOpen(true)}
-        onOpenDiagnostics={onOpenDiagnostics}
-        onCheckForUpdates={() => {
-          setAboutOpen(true);
-          setCheckForUpdatesRequest((value) => value + 1);
-        }}
-        onAbout={() => setAboutOpen(true)}
-      />
+      {/* External plugin toolbar menus render after Help so third-party menus
+          sit at the end of the banner, past the built-in menus. */}
+      <PluginToolbarMenus chrome={chrome} placement="external" />
       <AddDataDialog
         kind={addDataKind}
         mapControllerRef={mapControllerRef}
@@ -905,12 +1166,26 @@ export function TopToolbar({
         </Button>
         {showProjectInfo ? (
           <>
-            <Layers className="mr-1 hidden h-3 w-3 md:inline" />
             <Input
               aria-label={t("toolbar.item.projectName")}
               className="hidden h-7 w-44 border-transparent px-2 text-xs shadow-none focus-visible:border-input md:block"
               value={projectName}
               onChange={(event) => setProjectName(event.target.value)}
+              onKeyDown={(event) => {
+                if (
+                  event.key === "Enter" &&
+                  !projectNameComposingRef.current &&
+                  !event.nativeEvent.isComposing
+                ) {
+                  event.currentTarget.blur();
+                }
+              }}
+              onCompositionStart={() => {
+                projectNameComposingRef.current = true;
+              }}
+              onCompositionEnd={() => {
+                projectNameComposingRef.current = false;
+              }}
               onBlur={(event) => {
                 const nextName = event.target.value.trim();
                 // Persist the canonical, locale-independent default name; a

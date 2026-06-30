@@ -1,5 +1,7 @@
 import {
   DEFAULT_LAYER_STYLE,
+  extrusionColorValue,
+  extrusionHeightValue,
   isVectorColorExpression,
   vectorCircleColorValue,
   vectorFillColorValue,
@@ -58,6 +60,26 @@ export function isVectorControlStoreLayer(layer: GeoLibreLayer): boolean {
   );
 }
 
+function hasRestorableVectorUrl(layer: GeoLibreLayer): boolean {
+  return typeof layer.source.url === "string" && layer.source.url.trim() !== "";
+}
+
+/**
+ * Detects an Add Vector Layer layer whose data is local (no fetchable URL) and
+ * so *can* be embedded in a saved project — covering a browser-picked file, a
+ * desktop path-backed file, and a layer restored from previously embedded
+ * GeoJSON. Used to materialize features for both the Embed choice and a Share
+ * upload. A desktop path-backed layer is included on purpose: on the same
+ * machine it can reload from its path, but a shared/embedded copy still needs
+ * its data so it survives on a machine that lacks the file.
+ *
+ * @param layer - A store layer.
+ * @returns True when the layer's data can be embedded.
+ */
+export function isEmbeddableLocalVectorLayer(layer: GeoLibreLayer): boolean {
+  return isVectorControlStoreLayer(layer) && !hasRestorableVectorUrl(layer);
+}
+
 /**
  * Builds the store layer mirroring a control vector layer snapshot.
  *
@@ -76,8 +98,15 @@ export function createVectorStoreLayer(
   panelCollapsed = true,
 ): GeoLibreLayer {
   const url = info.source.kind === "url" ? info.source.url : undefined;
+  // A desktop host echoes the absolute path a local file was read from, so the
+  // layer can be re-read from disk on reopen; the browser only knows the file
+  // name. Prefer the path, so it (not the bare name) is what gets persisted.
+  const localFilePath =
+    info.source.kind === "file" ? info.source.path : undefined;
   const sourcePath =
-    url ?? (info.source.kind === "file" ? info.source.fileName : undefined);
+    url ??
+    localFilePath ??
+    (info.source.kind === "file" ? info.source.fileName : undefined);
   return {
     id: info.id,
     name: info.name,
@@ -113,12 +142,22 @@ export function createVectorStoreLayer(
       // restoreVectorLayers can replay URL-backed layers when a saved
       // project is reopened.
       vectorSource: info.source.kind,
+      // Marks a local file the host gave an absolute path for (desktop), so
+      // restoreVectorLayers re-reads it from `sourcePath` rather than dropping
+      // it. A browser-picked file has no path and so no flag.
+      ...(localFilePath ? { localFileReloadable: true } : {}),
       vectorState: serializableVectorState(info),
       ...(info.geometryType !== "unknown"
         ? { geometryType: info.geometryType }
         : {}),
       ...(typeof info.featureCount === "number"
         ? { featureCount: info.featureCount }
+        : {}),
+      // Attribute field names, so the Style panel can populate the label field
+      // (and other attribute-driven) dropdowns for a control-managed layer,
+      // which has no layer.geojson to read property keys from.
+      ...(info.fields && info.fields.length > 0
+        ? { fields: [...info.fields] }
         : {}),
       ...(info.bbox ? { bounds: [...info.bbox] } : {}),
     },
@@ -171,8 +210,12 @@ export function syncVectorLayersToStore(control: VectorSyncableControl): void {
         !recordsEqual(existing.metadata, layer.metadata)
       ) {
         useAppStore.getState().updateLayer(layer.id, {
-          // Replace metadata wholesale so stale keys (bounds, featureCount)
-          // cannot survive a layer being swapped out under the same id.
+          // Replace metadata wholesale so stale keys (bounds, featureCount,
+          // and any embeddedGeoJSON loaded from the project) cannot survive a
+          // layer being swapped out under the same id. embeddedGeoJSON is not
+          // kept live: the web Save flow re-materializes it fresh from the
+          // control (getLayerGeoJSON), so a reopened layer drops its loaded
+          // blob here and re-embeds current data on the next save.
           metadata: layer.metadata,
           opacity: layer.opacity,
           source: layer.source,
@@ -416,6 +459,12 @@ export function savedVectorState(
   return state;
 }
 
+// Upper bound on a restored color expression's serialized size. Generous for a
+// real categorized/graduated style (hundreds of stops are well under this) but
+// blocks a hand-edited project file from smuggling a large blob into a paint
+// property, matching the length caps on restored color strings.
+const MAX_COLOR_EXPRESSION_CHARS = 20_000;
+
 function savedVectorStyle(raw: unknown): Partial<VectorLayerStyle> | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const candidate = raw as Record<string, unknown>;
@@ -442,6 +491,109 @@ function savedVectorStyle(raw: unknown): Partial<VectorLayerStyle> | null {
   }
   if (fraction(candidate.circleOpacity)) {
     style.circleOpacity = candidate.circleOpacity;
+  }
+
+  // Restore the data-driven color expressions so a saved categorized/graduated/
+  // expression style renders on reload: restoreVectorLayers seeds the control's
+  // addData from this style, and the post-load sync does not re-push (the
+  // recomputed expression matches the persisted one). Bounded like the color
+  // strings above: an array passes only when its serialized form stays small,
+  // so a hand-edited project file cannot smuggle a multi-kilobyte (or deeply
+  // nested) blob into a paint property. Real categorized/graduated expressions
+  // are far under this cap, and MapLibre validates the expression contents.
+  const colorExpression = (
+    value: unknown,
+  ): value is PropertyValueSpecification<string> => {
+    if (!Array.isArray(value) || value.length === 0) return false;
+    try {
+      return JSON.stringify(value).length <= MAX_COLOR_EXPRESSION_CHARS;
+    } catch {
+      // A circular or pathologically deep array makes JSON.stringify throw;
+      // reject it so a hand-edited project file cannot break restore.
+      return false;
+    }
+  };
+  if (colorExpression(candidate.fillColorExpression)) {
+    style.fillColorExpression = candidate.fillColorExpression;
+  }
+  if (colorExpression(candidate.lineColorExpression)) {
+    style.lineColorExpression = candidate.lineColorExpression;
+  }
+  if (colorExpression(candidate.circleColorExpression)) {
+    style.circleColorExpression = candidate.circleColorExpression;
+  }
+
+  // 3D extrusion. Restored so a saved extruded polygon layer renders as an
+  // extrusion immediately on reopen (the control is seeded from this style),
+  // before the store sync re-pushes. The height can be a flat number or a
+  // MapLibre expression array, validated with the same bounded checks as the
+  // color expressions so a hand-edited project file cannot smuggle a blob in.
+  if (typeof candidate.extrusionEnabled === "boolean") {
+    style.extrusionEnabled = candidate.extrusionEnabled;
+  }
+  if (color(candidate.extrusionColor)) {
+    style.extrusionColor = candidate.extrusionColor;
+  }
+  if (colorExpression(candidate.extrusionColorExpression)) {
+    style.extrusionColorExpression = candidate.extrusionColorExpression;
+  }
+  if (fraction(candidate.extrusionOpacity)) {
+    style.extrusionOpacity = candidate.extrusionOpacity;
+  }
+  // Height and base are meters; MapLibre clamps a negative
+  // fill-extrusion-height/base to 0, so reject negatives here (matching the
+  // >= 0 dimension guards) rather than restoring a value that renders flat.
+  if (
+    typeof candidate.extrusionBase === "number" &&
+    Number.isFinite(candidate.extrusionBase) &&
+    candidate.extrusionBase >= 0
+  ) {
+    style.extrusionBase = candidate.extrusionBase;
+  }
+  if (
+    typeof candidate.extrusionHeight === "number" &&
+    Number.isFinite(candidate.extrusionHeight) &&
+    candidate.extrusionHeight >= 0
+  ) {
+    style.extrusionHeight = candidate.extrusionHeight;
+  } else if (colorExpression(candidate.extrusionHeight)) {
+    // colorExpression only enforces "a small, well-formed JSON array", which is
+    // exactly the bound wanted for a height expression too; the name refers to
+    // its first use, not a color-only constraint.
+    style.extrusionHeight =
+      candidate.extrusionHeight as VectorLayerStyle["extrusionHeight"];
+  }
+
+  // Attribute labels. The field name is length-capped like the color strings
+  // (a real attribute name is short); the rest reuse the same color/number
+  // guards so a hand-edited project file cannot smuggle blobs into the symbol
+  // layer's paint/layout. Only the field-based label fields are persisted —
+  // LabelStyle.expression/.minZoom/.maxZoom are not mapped to the control (see
+  // layerStyleToVectorStyle), so persisting them here would have no effect.
+  if (
+    typeof candidate.labelField === "string" &&
+    candidate.labelField &&
+    candidate.labelField.length <= 200
+  ) {
+    style.labelField = candidate.labelField;
+  }
+  if (positive(candidate.labelSize)) style.labelSize = candidate.labelSize;
+  if (color(candidate.labelColor)) style.labelColor = candidate.labelColor;
+  if (color(candidate.labelHaloColor)) {
+    style.labelHaloColor = candidate.labelHaloColor;
+  }
+  if (
+    typeof candidate.labelHaloWidth === "number" &&
+    Number.isFinite(candidate.labelHaloWidth) &&
+    candidate.labelHaloWidth >= 0
+  ) {
+    style.labelHaloWidth = candidate.labelHaloWidth;
+  }
+  if (candidate.labelPlacement === "point" || candidate.labelPlacement === "line") {
+    style.labelPlacement = candidate.labelPlacement;
+  }
+  if (typeof candidate.labelAllowOverlap === "boolean") {
+    style.labelAllowOverlap = candidate.labelAllowOverlap;
   }
 
   return Object.keys(style).length > 0 ? style : null;
@@ -489,6 +641,19 @@ function layerStyleToVectorStyle(style: LayerStyle): VectorLayerStyle {
     fillColorExpression: colorExpressionField(vectorFillColorValue(style)),
     lineColorExpression: colorExpressionField(vectorLineColorValue(style)),
     circleColorExpression: colorExpressionField(vectorCircleColorValue(style)),
+    // 3D extrusion. The control renders a fill-extrusion layer for polygons
+    // when extrusionEnabled; height and color reuse GeoLibre's shared resolvers
+    // so a control-managed layer extrudes identically to the core fill-extrusion
+    // path. extrusionColorExpression carries the data-driven color (the flat
+    // extrusionColor is the fallback), matching the fill color contract above.
+    extrusionEnabled: style.extrusionEnabled,
+    extrusionColor: style.extrusionColor,
+    extrusionColorExpression: colorExpressionField(extrusionColorValue(style)),
+    extrusionOpacity: style.extrusionOpacity,
+    extrusionHeight: extrusionHeightValue(
+      style,
+    ) as VectorLayerStyle["extrusionHeight"],
+    extrusionBase: style.extrusionBase,
     // Point renderer: GeoLibre's "single" maps to the control's "circle".
     pointMode:
       (style.pointRenderer ?? "single") === "single"
@@ -498,6 +663,27 @@ function layerStyleToVectorStyle(style: LayerStyle): VectorLayerStyle {
     heatmapIntensity: style.heatmapIntensity,
     clusterRadius: style.clusterRadius,
     clusterMaxZoom: style.clusterMaxZoom,
+    // Attribute labels: GeoLibre's LabelStyle maps onto the control's flat
+    // label fields. The control renders the field's value as a symbol layer;
+    // an empty labelField clears it.
+    //
+    // Only field-based labeling is wired here. LabelStyle.expression,
+    // .minZoom, and .maxZoom have no maplibre-gl-vector@0.8.0 equivalent, so
+    // they are intentionally left out of this mapping, out of vectorStylesEqual,
+    // and out of savedVectorStyle. The shared Style panel still shows those
+    // controls, but for a control-managed layer they are no-ops; adding them
+    // here later means also wiring the equality check, persistence, and the
+    // upstream control option.
+    labelField:
+      style.labels.enabled && style.labels.field.trim() !== ""
+        ? style.labels.field
+        : "",
+    labelSize: style.labels.size,
+    labelColor: style.labels.color,
+    labelHaloColor: style.labels.haloColor,
+    labelHaloWidth: style.labels.haloWidth,
+    labelPlacement: style.labels.placement,
+    labelAllowOverlap: style.labels.allowOverlap,
   };
 }
 
@@ -541,6 +727,33 @@ function vectorStyleToLayerStyle(info: VectorLayerInfo): Partial<LayerStyle> {
     seed.clusterMaxZoom = style.clusterMaxZoom;
   }
 
+  // Reflect the control's attribute labels in the panel, so a restored project
+  // (whose label state was seeded into the control via savedVectorState) shows
+  // the Show-labels controls populated rather than reset to the defaults.
+  if (typeof style.labelField === "string" && style.labelField.trim() !== "") {
+    const defaults = DEFAULT_LAYER_STYLE.labels;
+    seed.labels = {
+      ...defaults,
+      enabled: true,
+      field: style.labelField,
+      // Guard with > 0 to match savedVectorStyle's positive() check, so a
+      // (never expected) labelSize of 0 from the control does not round-trip
+      // to an invisible-then-reset size.
+      size:
+        typeof style.labelSize === "number" && style.labelSize > 0
+          ? style.labelSize
+          : defaults.size,
+      color: style.labelColor ?? defaults.color,
+      haloColor: style.labelHaloColor ?? defaults.haloColor,
+      haloWidth:
+        typeof style.labelHaloWidth === "number"
+          ? style.labelHaloWidth
+          : defaults.haloWidth,
+      placement: style.labelPlacement === "line" ? "line" : "point",
+      allowOverlap: style.labelAllowOverlap ?? defaults.allowOverlap,
+    };
+  }
+
   return seed;
 }
 
@@ -570,13 +783,32 @@ function vectorStylesEqual(
     valuesEqual(left.fillColorExpression, right.fillColorExpression) &&
     valuesEqual(left.lineColorExpression, right.lineColorExpression) &&
     valuesEqual(left.circleColorExpression, right.circleColorExpression) &&
+    // Extrusion: a toggle, an opacity/base change, or a height/color change
+    // (the height is an array expression, so compare it deeply) must register
+    // so it is pushed to the control, which rebuilds or repaints accordingly.
+    left.extrusionEnabled === right.extrusionEnabled &&
+    left.extrusionColor === right.extrusionColor &&
+    left.extrusionOpacity === right.extrusionOpacity &&
+    left.extrusionBase === right.extrusionBase &&
+    valuesEqual(left.extrusionHeight, right.extrusionHeight) &&
+    valuesEqual(left.extrusionColorExpression, right.extrusionColorExpression) &&
     // Point renderer fields: a pointMode/heatmap/cluster change must register so
     // it is pushed to the control (which rebuilds the layers structurally).
     left.pointMode === right.pointMode &&
     left.heatmapRadius === right.heatmapRadius &&
     left.heatmapIntensity === right.heatmapIntensity &&
     left.clusterRadius === right.clusterRadius &&
-    left.clusterMaxZoom === right.clusterMaxZoom
+    left.clusterMaxZoom === right.clusterMaxZoom &&
+    // Label fields: a Show-labels toggle or any label restyle must register as
+    // a change so it is pushed to the control (which adds/updates/removes the
+    // symbol layer).
+    left.labelField === right.labelField &&
+    left.labelSize === right.labelSize &&
+    left.labelColor === right.labelColor &&
+    left.labelHaloColor === right.labelHaloColor &&
+    left.labelHaloWidth === right.labelHaloWidth &&
+    left.labelPlacement === right.labelPlacement &&
+    left.labelAllowOverlap === right.labelAllowOverlap
   );
 }
 

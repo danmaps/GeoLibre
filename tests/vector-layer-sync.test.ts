@@ -8,6 +8,7 @@ import {
 import type { VectorLayerInfo, VectorLayerStyle } from "maplibre-gl-vector";
 import {
   createVectorStoreLayer,
+  isEmbeddableLocalVectorLayer,
   isVectorControlStoreLayer,
   removeVectorStoreLayers,
   resetVectorStoreSyncSuspension,
@@ -92,6 +93,43 @@ function otherStoreLayer(id = "unrelated"): GeoLibreLayer {
   };
 }
 
+describe("isEmbeddableLocalVectorLayer", () => {
+  it("flags a browser-picked local file (no URL, no reload path)", () => {
+    const layer = createVectorStoreLayer(
+      vectorInfo({ source: { kind: "file", fileName: "local.gpkg" } }),
+    );
+    assert.equal(isEmbeddableLocalVectorLayer(layer), true);
+  });
+
+  it("excludes a URL-backed layer", () => {
+    const layer = createVectorStoreLayer(vectorInfo());
+    assert.equal(isEmbeddableLocalVectorLayer(layer), false);
+  });
+
+  it("includes a desktop path-backed layer (so a shared copy keeps its data)", () => {
+    const layer = createVectorStoreLayer(
+      vectorInfo({
+        source: {
+          kind: "file",
+          fileName: "countries.gpkg",
+          path: "/home/user/countries.gpkg",
+        },
+      }),
+    );
+    // It can reload from its path on the same machine, but an embedded/shared
+    // copy still needs its data for a machine that lacks the file.
+    assert.equal(isEmbeddableLocalVectorLayer(layer), true);
+  });
+
+  it("excludes a non-vector-control layer", () => {
+    const layer = createVectorStoreLayer(
+      vectorInfo({ source: { kind: "file", fileName: "local.gpkg" } }),
+    );
+    const plainLayer = { ...layer, metadata: {} };
+    assert.equal(isEmbeddableLocalVectorLayer(plainLayer), false);
+  });
+});
+
 describe("createVectorStoreLayer", () => {
   it("mirrors a URL layer as an external custom layer", () => {
     const layer = createVectorStoreLayer(
@@ -149,8 +187,27 @@ describe("createVectorStoreLayer", () => {
     assert.equal(layer.source.url, undefined);
     assert.equal(layer.sourcePath, "local.gpkg");
     assert.equal(layer.metadata.vectorSource, "file");
+    assert.equal("localFileReloadable" in layer.metadata, false);
     assert.equal("bounds" in layer.metadata, false);
     assert.equal("featureCount" in layer.metadata, false);
+  });
+
+  it("persists a desktop file's absolute path and marks it reloadable", () => {
+    const layer = createVectorStoreLayer(
+      vectorInfo({
+        source: {
+          kind: "file",
+          fileName: "countries.gpkg",
+          path: "/home/user/data/countries.gpkg",
+        },
+      }),
+    );
+
+    // The absolute path (not the bare name) is persisted so restore can
+    // re-read the file from disk, and the flag tells restore it can.
+    assert.equal(layer.sourcePath, "/home/user/data/countries.gpkg");
+    assert.equal(layer.metadata.localFileReloadable, true);
+    assert.equal(layer.metadata.vectorSource, "file");
   });
 
   it("marks tile-rendered layers as vector-tiles", () => {
@@ -158,6 +215,44 @@ describe("createVectorStoreLayer", () => {
 
     assert.equal(layer.type, "vector-tiles");
     assert.equal(layer.source.type, "vector");
+  });
+
+  it("exposes attribute field names in metadata for the Style panel", () => {
+    const layer = createVectorStoreLayer(
+      vectorInfo({ fields: ["name", "continent", "pop_est"] }),
+    );
+
+    assert.deepEqual(layer.metadata.fields, ["name", "continent", "pop_est"]);
+  });
+
+  it("omits metadata.fields when the control reports none", () => {
+    const layer = createVectorStoreLayer(vectorInfo({ fields: undefined }));
+    assert.equal("fields" in layer.metadata, false);
+  });
+
+  it("seeds the panel labels from the control's label style", () => {
+    const layer = createVectorStoreLayer(
+      vectorInfo({
+        style: vectorStyle({
+          labelField: "name",
+          labelSize: 18,
+          labelColor: "#ff0000",
+          labelPlacement: "line",
+        }),
+      }),
+    );
+
+    assert.equal(layer.style.labels.enabled, true);
+    assert.equal(layer.style.labels.field, "name");
+    assert.equal(layer.style.labels.size, 18);
+    assert.equal(layer.style.labels.color, "#ff0000");
+    assert.equal(layer.style.labels.placement, "line");
+  });
+
+  it("leaves labels disabled when the control has no label field", () => {
+    const layer = createVectorStoreLayer(vectorInfo());
+    assert.equal(layer.style.labels.enabled, false);
+    assert.equal(layer.style.labels.field, "");
   });
 
   it("persists the load and style state", () => {
@@ -387,6 +482,31 @@ describe("syncVectorLayersToStore", () => {
     assert.equal(useAppStore.getState().layers[0], before);
   });
 
+  it("drops a loaded embeddedGeoJSON blob on sync (re-materialized at save)", () => {
+    // embeddedGeoJSON is not kept live in the store: a project loads it, restore
+    // replays it into the control, and this sync then replaces the layer's
+    // metadata without it. The web Save flow re-materializes it from the control
+    // (getLayerGeoJSON), so the stale loaded blob must not survive here.
+    const info = vectorInfo({
+      source: { kind: "file", fileName: "local.geojson" },
+    });
+    const { control } = fakeControl([info]);
+    syncVectorLayersToStore(control);
+    useAppStore.getState().updateLayer("vector-1", {
+      metadata: {
+        ...useAppStore.getState().layers[0].metadata,
+        embeddedGeoJSON: { type: "FeatureCollection" as const, features: [] },
+      },
+    });
+
+    syncVectorLayersToStore(fakeControl([info]).control);
+
+    assert.equal(
+      "embeddedGeoJSON" in useAppStore.getState().layers[0].metadata,
+      false,
+    );
+  });
+
   it("does nothing while sync is suspended", () => {
     const { control } = fakeControl([vectorInfo()]);
     runWithVectorStoreSyncSuspended(() => {
@@ -470,6 +590,24 @@ describe("wireVectorStoreSync", () => {
       heatmapIntensity: 1,
       clusterRadius: 50,
       clusterMaxZoom: 14,
+      // Label fields default through from DEFAULT_LAYER_STYLE.labels; labelField
+      // is empty because labels start disabled.
+      labelField: "",
+      labelSize: 13,
+      labelColor: "#111827",
+      labelHaloColor: "#ffffff",
+      labelHaloWidth: 1.5,
+      labelPlacement: "point",
+      labelAllowOverlap: false,
+      // Extrusion fields default through from DEFAULT_LAYER_STYLE; the height is
+      // the chosen property scaled (default property "height", scale 1) and the
+      // color resolves to a flat value so its expression field is undefined.
+      extrusionEnabled: false,
+      extrusionColor: "#3b82f6",
+      extrusionColorExpression: undefined,
+      extrusionOpacity: 0.8,
+      extrusionHeight: ["*", ["to-number", ["get", "height"], 0], 1],
+      extrusionBase: 0,
     };
     assert.deepEqual(calls, [
       { method: "setLayerStyle", args: ["vector-1", expectedStyle] },
@@ -562,6 +700,44 @@ describe("wireVectorStoreSync", () => {
     assert.equal(reverted.fillColorExpression, undefined);
     assert.equal(reverted.lineColorExpression, undefined);
     assert.equal(reverted.circleColorExpression, undefined);
+  });
+
+  it("pushes a Show-labels toggle through the control", () => {
+    const { control, calls } = fakeControl([vectorInfo()]);
+    syncVectorLayersToStore(control);
+    wireVectorStoreSync(control);
+
+    useAppStore.getState().setLayerStyle("vector-1", {
+      labels: {
+        ...DEFAULT_LAYER_STYLE.labels,
+        enabled: true,
+        field: "name",
+        size: 18,
+      },
+    });
+
+    assert.equal(calls.length, 1);
+    const pushed = calls[0].args[1] as VectorLayerStyle;
+    assert.equal(pushed.labelField, "name");
+    assert.equal(pushed.labelSize, 18);
+  });
+
+  it("clears the control label field when labels are disabled", () => {
+    const { control, calls } = fakeControl([
+      vectorInfo({ style: vectorStyle({ labelField: "name" }) }),
+    ]);
+    syncVectorLayersToStore(control);
+    wireVectorStoreSync(control);
+
+    // The layer was seeded with labels on; turning the checkbox off must push an
+    // empty labelField so the control removes its symbol layer.
+    useAppStore.getState().setLayerStyle("vector-1", {
+      labels: { ...DEFAULT_LAYER_STYLE.labels, enabled: false, field: "name" },
+    });
+
+    assert.equal(calls.length, 1);
+    const pushed = calls[0].args[1] as VectorLayerStyle;
+    assert.equal(pushed.labelField, "");
   });
 
   it("does not touch the control for GeoLibre-only style fields", () => {
@@ -685,6 +861,47 @@ describe("savedVectorState", () => {
     assert.equal("lineColorExpression" in restored, false);
   });
 
+  it("restores attribute label fields from the persisted style", () => {
+    const layer = createVectorStoreLayer(vectorInfo());
+    (layer.metadata.vectorState as Record<string, unknown>).style = {
+      ...vectorStyle(),
+      labelField: "name",
+      labelSize: 18,
+      labelColor: "#ff0000",
+      labelHaloColor: "#000000",
+      labelHaloWidth: 2,
+      labelPlacement: "line",
+      labelAllowOverlap: true,
+    };
+
+    const restored = savedVectorState(layer).style;
+    assert.ok(restored != null);
+    assert.equal(restored.labelField, "name");
+    assert.equal(restored.labelSize, 18);
+    assert.equal(restored.labelColor, "#ff0000");
+    assert.equal(restored.labelHaloColor, "#000000");
+    assert.equal(restored.labelHaloWidth, 2);
+    assert.equal(restored.labelPlacement, "line");
+    assert.equal(restored.labelAllowOverlap, true);
+  });
+
+  it("drops a malformed label field from a hand-edited project file", () => {
+    const layer = createVectorStoreLayer(vectorInfo());
+    (layer.metadata.vectorState as Record<string, unknown>).style = {
+      fillColor: "#123456",
+      labelField: "x".repeat(201),
+      labelPlacement: "diagonal",
+      labelHaloWidth: -3,
+    };
+
+    const restored = savedVectorState(layer).style;
+    assert.ok(restored != null);
+    assert.equal(restored.fillColor, "#123456");
+    assert.equal("labelField" in restored, false);
+    assert.equal("labelPlacement" in restored, false);
+    assert.equal("labelHaloWidth" in restored, false);
+  });
+
   it("drops a malformed color expression without throwing", () => {
     // A circular (or pathologically deep) array from a hand-edited project file
     // would make JSON.stringify throw; the guard must reject it and keep the
@@ -746,5 +963,74 @@ describe("savedVectorState", () => {
     const layer = createVectorStoreLayer(vectorInfo());
     delete layer.metadata.vectorState;
     assert.deepEqual(savedVectorState(layer), {});
+  });
+
+  it("restores 3D extrusion fields from the persisted style", () => {
+    const heightExpr = ["*", ["to-number", ["get", "height"], 0], 2];
+    const colorExpr = [
+      "match",
+      ["to-string", ["get", "kind"]],
+      "tower",
+      "#ff0000",
+      "#3388ff",
+    ];
+    const layer = createVectorStoreLayer(vectorInfo());
+    (layer.metadata.vectorState as Record<string, unknown>).style = {
+      ...vectorStyle(),
+      extrusionEnabled: true,
+      extrusionColor: "#abcdef",
+      extrusionColorExpression: colorExpr,
+      extrusionOpacity: 0.6,
+      extrusionBase: 3,
+      extrusionHeight: heightExpr,
+    };
+
+    const restored = savedVectorState(layer).style;
+    assert.ok(restored != null);
+    assert.equal(restored.extrusionEnabled, true);
+    assert.equal(restored.extrusionColor, "#abcdef");
+    assert.deepEqual(restored.extrusionColorExpression, colorExpr);
+    assert.equal(restored.extrusionOpacity, 0.6);
+    assert.equal(restored.extrusionBase, 3);
+    assert.deepEqual(restored.extrusionHeight, heightExpr);
+  });
+
+  it("restores a flat numeric extrusion height", () => {
+    const layer = createVectorStoreLayer(vectorInfo());
+    (layer.metadata.vectorState as Record<string, unknown>).style = {
+      ...vectorStyle(),
+      extrusionEnabled: true,
+      extrusionHeight: 12,
+    };
+
+    const restored = savedVectorState(layer).style;
+    assert.ok(restored != null);
+    assert.equal(restored.extrusionHeight, 12);
+  });
+
+  it("drops malformed extrusion fields from a hand-edited project file", () => {
+    const circular: unknown[] = [];
+    circular.push(circular);
+    const layer = createVectorStoreLayer(vectorInfo());
+    (layer.metadata.vectorState as Record<string, unknown>).style = {
+      fillColor: "#123456",
+      // MapLibre clamps a negative height/base to 0, so both are rejected.
+      extrusionHeight: -50,
+      extrusionBase: -10,
+      // Opacity must be a 0-1 fraction.
+      extrusionOpacity: 5,
+      // A circular array cannot serialize, so the height expression is dropped.
+      extrusionColorExpression: circular,
+      extrusionColor: `#${"f".repeat(200)}`,
+    };
+
+    const restored = savedVectorState(layer).style;
+    assert.ok(restored != null);
+    assert.equal(restored.fillColor, "#123456");
+    assert.equal("extrusionHeight" in restored, false);
+    assert.equal("extrusionBase" in restored, false);
+    assert.equal("extrusionOpacity" in restored, false);
+    assert.equal("extrusionColorExpression" in restored, false);
+    assert.equal("extrusionColor" in restored, false);
   });
 });

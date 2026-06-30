@@ -20,26 +20,24 @@
       "map": "मानचित्र",
       "layout": "लेआउट",
       "environment": "परिवेश",
-      "project": "प्रोजेक्ट",
       "account": "खाता"
     },
     "menu": {
       "mapPreferences": "मानचित्र प्राथमिकताएं",
       "layoutSettings": "लेआउट सेटिंग्स",
       "environmentVariables": "परिवेश चर",
-      "projectSettings": "प्रोजेक्ट सेटिंग्स",
       "managePlugins": "प्लगइन प्रबंधित करें",
       "urlOverrideNote": "URL लेआउट पैरामीटर सहेजी गई सेटिंग्स को ओवरराइड करते हैं।"
     },
     "map": {
       "constraintsTitle": "मानचित्र सीमाएं",
-      "constraintsDescription": "प्रोजेक्ट खुला रहने के दौरान सीमाएं लागू होती हैं।",
       "restrictBounds": "मानचित्र सीमा प्रतिबंधित करें",
       "west": "पश्चिम",
       "south": "दक्षिण",
       "east": "पूर्व",
       "north": "उत्तर",
       "useCurrentView": "वर्तमान दृश्य उपयोग करें",
+      "useCurrentViewGlobeHint": "इसका उपयोग करने से पहले मर्केटर प्रक्षेपण पर स्विच करें। ग्लोब प्रक्षेपण में मानचित्र अभी भी कैप्चर की गई सीमाओं से थोड़ा आगे खिसक सकता है।",
       "minZoom": "न्यूनतम ज़ूम",
       "maxZoom": "अधिकतम ज़ूम",
       "maxPitch": "अधिकतम झुकाव",
@@ -80,14 +78,6 @@
       "removeAria": "{{name}} हटाएं",
       "errorNamePattern": "परिवेश चर के नाम किसी अक्षर या अंडरस्कोर से शुरू होने चाहिए और केवल अक्षर, संख्याएं और अंडरस्कोर हो सकते हैं।",
       "errorDuplicate": "परिवेश चर \"{{name}}\" दोहराया गया है।"
-    },
-    "project": {
-      "title": "प्रोजेक्ट",
-      "description": "सेटिंग्स `.geolibre.json` प्रोजेक्ट के साथ सहेजी जाती हैं।",
-      "name": "नाम",
-      "file": "प्रोजेक्ट फ़ाइल",
-      "notSaved": "सहेजा नहीं गया",
-      "format": "प्रोजेक्ट प्रारूप"
     }
   },
   "toolbar": {
@@ -287,7 +277,7 @@
       "webServices": "वेब सेवाएं",
       "commandPalette": "कमांड पैलेट",
       "openProjectFromUrl": "URL से प्रोजेक्ट खोलें",
-      "openProjectFromUrlDesc": "एक सार्वजनिक `.geolibre.json` प्रोजेक्ट लोड करें और इसे हालिया प्रोजेक्ट में जोड़ें।",
+      "openProjectFromUrlDesc": "एक `.geolibre.json` प्रोजेक्ट लोड करें और इसे हालिया प्रोजेक्ट में जोड़ें।",
       "projectUrl": "प्रोजेक्ट URL",
       "opening": "खुल रहा है...",
       "open": "खोलें",

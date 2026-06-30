@@ -1,4 +1,4 @@
-import { useAppStore } from "@geolibre/core";
+import { type NetworkToolKind, useAppStore } from "@geolibre/core";
 import {
   Button,
   DropdownMenu,
@@ -16,13 +16,17 @@ import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import type { ToolbarPanel } from "../../../hooks/useToolbarPanels";
 import { isMobile } from "../../../lib/is-mobile";
+import { useDesktopSettingsStore } from "../../../hooks/useDesktopSettings";
+import { isMenuItemVisible } from "../../../lib/ui-profile";
+import { WHITEBOX_MENU_CATALOG } from "../../../lib/whitebox-menu-catalog";
 import type { ToolbarChrome } from "./constants";
 
 interface ProcessingMenuProps {
   chrome: ToolbarChrome;
   earthEnginePanel: ToolbarPanel;
-  onOpenNetworkTool: (kind: "isochrone" | "od-matrix") => void;
+  onOpenNetworkTool: (kind: NetworkToolKind) => void;
   onOpenPlanetaryComputer: () => void;
+  onOpenGeoreferencer: () => void;
 }
 
 /** The Processing menu: assistant, toolboxes, conversion/vector/network/statistics/raster submenus. */
@@ -31,9 +35,13 @@ export function ProcessingMenu({
   earthEnginePanel,
   onOpenNetworkTool,
   onOpenPlanetaryComputer,
+  onOpenGeoreferencer,
 }: ProcessingMenuProps) {
   const { t } = useTranslation();
   const setProcessingOpen = useAppStore((s) => s.setProcessingOpen);
+  const setProcessingInitialTool = useAppStore(
+    (s) => s.setProcessingInitialTool,
+  );
   const setConversionOpen = useAppStore((s) => s.setConversionOpen);
   const setVectorToolOpen = useAppStore((s) => s.setVectorToolOpen);
   const setStatisticsToolOpen = useAppStore((s) => s.setStatisticsToolOpen);
@@ -43,7 +51,9 @@ export function ProcessingMenu({
   const setSegmentationOpen = useAppStore((s) => s.setSegmentationOpen);
   const setSqlWorkspaceOpen = useAppStore((s) => s.setSqlWorkspaceOpen);
   const setPythonConsoleOpen = useAppStore((s) => s.setPythonConsoleOpen);
+  const setNotebookOpen = useAppStore((s) => s.setNotebookOpen);
   const setAssistantOpen = useAppStore((s) => s.setAssistantOpen);
+  const setDashboardOpen = useAppStore((s) => s.setDashboardOpen);
 
   // Whitebox, format Conversion, Raster tools, and AI Segmentation all require
   // the Python sidecar, which cannot run on Android/iOS — hide them on mobile so
@@ -51,6 +61,38 @@ export function ProcessingMenu({
   // (Pyodide), geocode, statistics, and the assistant run client-side and stay.
   // The user agent is stable for the session, so evaluate once.
   const mobile = useMemo(() => isMobile(), []);
+  const uiProfile = useDesktopSettingsStore((s) => s.desktopSettings.uiProfile);
+  const show = (id: string) => isMenuItemVisible(uiProfile, id);
+
+  // Open the Whitebox toolbox dialog preselected to a specific tool, used by the
+  // per-category submenus below. Two store writes: queue the tool, then open.
+  const openWhiteboxTool = (toolId: string) => {
+    setProcessingInitialTool(toolId);
+    setProcessingOpen(true);
+  };
+
+  // Section visibility, so dividers never render with nothing on one side when a
+  // UI profile (or mobile) hides whole sections. `showGeolibreTools` are the
+  // client tool submenus; `showGeolibreActions` are geocode/model-builder/
+  // segmentation below the in-submenu divider.
+  const showGeolibreTools =
+    (!mobile && show("processing.conversion")) ||
+    show("processing.vector") ||
+    show("processing.network") ||
+    show("processing.statistics") ||
+    (!mobile && show("processing.raster"));
+  const showGeolibreActions =
+    show("processing.geocode") ||
+    show("processing.modelBuilder") ||
+    (!mobile && show("processing.segmentation"));
+  const showGeolibre = showGeolibreTools || showGeolibreActions;
+  const showWorkspacesOrServices =
+    show("processing.sqlWorkspace") ||
+    show("processing.pythonConsole") ||
+    show("processing.notebook") ||
+    show("processing.dashboard") ||
+    show("processing.planetaryComputer") ||
+    show("processing.earthEngine");
 
   return (
     <DropdownMenu>
@@ -68,33 +110,81 @@ export function ProcessingMenu({
       <DropdownMenuContent align="start">
         <DropdownMenuLabel>{t("toolbar.menu.processing")}</DropdownMenuLabel>
         <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => setAssistantOpen(true)}>
-          {t("toolbar.command.assistant")}
-        </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        {!mobile && (
+        {show("processing.assistant") && (
+          <>
+            <DropdownMenuItem onSelect={() => setAssistantOpen(true)}>
+              {t("toolbar.command.assistant")}
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+          </>
+        )}
+        {!mobile && show("processing.whitebox") && (
           <DropdownMenuItem onSelect={() => setProcessingOpen(true)}>
             {t("toolbar.item.whitebox")}
           </DropdownMenuItem>
         )}
-        <DropdownMenuItem onSelect={() => setSqlWorkspaceOpen(true)}>
-          {t("toolbar.command.sqlWorkspace")}
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => setPythonConsoleOpen(true)}>
-          {t("toolbar.command.pythonConsole")}
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => setGeocodeOpen(true)}>
-          {t("toolbar.item.geocode")}
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => setModelBuilderOpen(true)}>
-          {t("toolbar.item.modelBuilder")}
-        </DropdownMenuItem>
-        {!mobile && (
+        {/* Whitebox tools grouped by category/subcategory. Each leaf opens the
+            Whitebox toolbox dialog preselected to that tool. Catalog data lives
+            in lib/whitebox-menu-catalog.ts; gated with the Whitebox item since
+            they share the same sidecar/WASM backend (hidden on mobile). */}
+        {!mobile &&
+          show("processing.whitebox") &&
+          WHITEBOX_MENU_CATALOG.map((cat) => (
+            <DropdownMenuSub key={cat.key}>
+              <DropdownMenuSubTrigger>{t(cat.labelKey)}</DropdownMenuSubTrigger>
+              <DropdownMenuSubContent>
+                {cat.subcategories.length === 1
+                  ? cat.subcategories[0].tools.map((tool) => (
+                      <DropdownMenuItem
+                        key={tool.id}
+                        onSelect={() => openWhiteboxTool(tool.id)}
+                      >
+                        {tool.name}
+                      </DropdownMenuItem>
+                    ))
+                  : cat.subcategories.map((sub) => (
+                      <DropdownMenuSub key={sub.label}>
+                        <DropdownMenuSubTrigger>
+                          {sub.label}
+                        </DropdownMenuSubTrigger>
+                        <DropdownMenuSubContent>
+                          {sub.tools.map((tool) => (
+                            <DropdownMenuItem
+                              key={tool.id}
+                              onSelect={() => openWhiteboxTool(tool.id)}
+                            >
+                              {tool.name}
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuSubContent>
+                      </DropdownMenuSub>
+                    ))}
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+          ))}
+        {/* GeoLibre's own tools (Turf vector, rasterio raster, format
+            conversion, routing, spatial statistics) plus geocoding, batch &
+            models, and AI segmentation. Grouped under a single "GeoLibre"
+            submenu so their category names don't collide with the Whitebox
+            category submenus above. Each child keeps its own visibility gate;
+            the parent shows when any child does. */}
+        {showGeolibre && (
+        <DropdownMenuSub>
+          <DropdownMenuSubTrigger>
+            {t("toolbar.item.geolibre")}
+          </DropdownMenuSubTrigger>
+          <DropdownMenuSubContent>
+        {!mobile && show("processing.conversion") && (
         <DropdownMenuSub>
           <DropdownMenuSubTrigger>
             {t("toolbar.item.conversion")}
           </DropdownMenuSubTrigger>
           <DropdownMenuSubContent>
+            <DropdownMenuItem
+              onSelect={() => setConversionOpen("vector-to-vector")}
+            >
+              {t("toolbar.conversion.vectorToVector")}
+            </DropdownMenuItem>
             <DropdownMenuItem
               onSelect={() => setConversionOpen("vector-to-geoparquet")}
             >
@@ -133,6 +223,7 @@ export function ProcessingMenu({
           </DropdownMenuSubContent>
         </DropdownMenuSub>
         )}
+        {show("processing.vector") && (
         <DropdownMenuSub>
           <DropdownMenuSubTrigger>
             {t("toolbar.item.vector")}
@@ -178,6 +269,11 @@ export function ProcessingMenu({
             </DropdownMenuItem>
             <DropdownMenuItem onSelect={() => setVectorToolOpen("voronoi")}>
               {t("toolbar.vectorTool.voronoi")}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              onSelect={() => setVectorToolOpen("cell-sectors")}
+            >
+              {t("toolbar.vectorTool.cellSectors")}
             </DropdownMenuItem>
             <DropdownMenuSeparator />
             <DropdownMenuLabel className="text-xs text-muted-foreground">
@@ -233,8 +329,29 @@ export function ProcessingMenu({
             >
               {t("toolbar.vectorTool.h3BinPoints")}
             </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuLabel className="text-xs text-muted-foreground">
+              {t("toolbar.item.subGroupMovement")}
+            </DropdownMenuLabel>
+            <DropdownMenuItem
+              onSelect={() => setVectorToolOpen("trajectory-speed")}
+            >
+              {t("toolbar.vectorTool.trajectorySpeed")}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              onSelect={() => setVectorToolOpen("detect-stops")}
+            >
+              {t("toolbar.vectorTool.detectStops")}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              onSelect={() => setVectorToolOpen("space-time-proximity")}
+            >
+              {t("toolbar.vectorTool.spaceTimeProximity")}
+            </DropdownMenuItem>
           </DropdownMenuSubContent>
         </DropdownMenuSub>
+        )}
+        {show("processing.network") && (
         <DropdownMenuSub>
           <DropdownMenuSubTrigger>
             {t("toolbar.item.network")}
@@ -246,8 +363,15 @@ export function ProcessingMenu({
             <DropdownMenuItem onSelect={() => onOpenNetworkTool("od-matrix")}>
               {t("toolbar.networkTool.odMatrix")}
             </DropdownMenuItem>
+            <DropdownMenuItem
+              onSelect={() => onOpenNetworkTool("sequential-route")}
+            >
+              {t("toolbar.networkTool.sequentialRoute")}
+            </DropdownMenuItem>
           </DropdownMenuSubContent>
         </DropdownMenuSub>
+        )}
+        {show("processing.statistics") && (
         <DropdownMenuSub>
           <DropdownMenuSubTrigger>
             {t("toolbar.item.statistics")}
@@ -282,7 +406,8 @@ export function ProcessingMenu({
             </DropdownMenuItem>
           </DropdownMenuSubContent>
         </DropdownMenuSub>
-        {!mobile && (
+        )}
+        {!mobile && show("processing.raster") && (
         <DropdownMenuSub>
           <DropdownMenuSubTrigger>
             {t("toolbar.item.raster")}
@@ -347,6 +472,9 @@ export function ProcessingMenu({
             <DropdownMenuItem onSelect={() => setRasterToolOpen("raster-calc")}>
               {t("toolbar.rasterTool.rasterCalc")}
             </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => setRasterToolOpen("spectral-index")}>
+              {t("toolbar.rasterTool.spectralIndex")}
+            </DropdownMenuItem>
             <DropdownMenuItem onSelect={() => setRasterToolOpen("reclassify")}>
               {t("toolbar.rasterTool.reclassify")}
             </DropdownMenuItem>
@@ -356,21 +484,67 @@ export function ProcessingMenu({
             <DropdownMenuItem onSelect={() => setRasterToolOpen("focal")}>
               {t("toolbar.rasterTool.focal")}
             </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={onOpenGeoreferencer}>
+              {t("toolbar.item.georeferencing")}
+            </DropdownMenuItem>
           </DropdownMenuSubContent>
         </DropdownMenuSub>
         )}
-        {!mobile && (
+        {showGeolibreTools && showGeolibreActions && <DropdownMenuSeparator />}
+        {show("processing.geocode") && (
+          <DropdownMenuItem onSelect={() => setGeocodeOpen(true)}>
+            {t("toolbar.item.geocode")}
+          </DropdownMenuItem>
+        )}
+        {show("processing.modelBuilder") && (
+          <DropdownMenuItem onSelect={() => setModelBuilderOpen(true)}>
+            {t("toolbar.item.modelBuilder")}
+          </DropdownMenuItem>
+        )}
+        {!mobile && show("processing.segmentation") && (
           <DropdownMenuItem onSelect={() => setSegmentationOpen(true)}>
             {t("toolbar.command.segmentation")}
           </DropdownMenuItem>
         )}
-        <DropdownMenuItem onSelect={onOpenPlanetaryComputer}>
-          {t("toolbar.command.planetaryComputer")}
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={earthEnginePanel.toggle}>
-          {t("toolbar.command.earthEngine")}
-          {earthEnginePanel.visible ? " ✓" : ""}
-        </DropdownMenuItem>
+          </DropdownMenuSubContent>
+        </DropdownMenuSub>
+        )}
+        {/* Divide the tool-category submenus (Whitebox, GeoLibre) from the
+            workspaces and consoles below. Only when both sides are present. */}
+        {((!mobile && show("processing.whitebox")) || showGeolibre) &&
+          showWorkspacesOrServices && <DropdownMenuSeparator />}
+        {show("processing.sqlWorkspace") && (
+          <DropdownMenuItem onSelect={() => setSqlWorkspaceOpen(true)}>
+            {t("toolbar.command.sqlWorkspace")}
+          </DropdownMenuItem>
+        )}
+        {show("processing.pythonConsole") && (
+          <DropdownMenuItem onSelect={() => setPythonConsoleOpen(true)}>
+            {t("toolbar.command.pythonConsole")}
+          </DropdownMenuItem>
+        )}
+        {show("processing.notebook") && (
+          <DropdownMenuItem onSelect={() => setNotebookOpen(true)}>
+            {t("toolbar.command.notebook")}
+          </DropdownMenuItem>
+        )}
+        {show("processing.dashboard") && (
+          <DropdownMenuItem onSelect={() => setDashboardOpen(true)}>
+            {t("toolbar.command.dashboard")}
+          </DropdownMenuItem>
+        )}
+        {show("processing.planetaryComputer") && (
+          <DropdownMenuItem onSelect={onOpenPlanetaryComputer}>
+            {t("toolbar.command.planetaryComputer")}
+          </DropdownMenuItem>
+        )}
+        {show("processing.earthEngine") && (
+          <DropdownMenuItem onSelect={earthEnginePanel.toggle}>
+            {t("toolbar.command.earthEngine")}
+            {earthEnginePanel.visible ? " ✓" : ""}
+          </DropdownMenuItem>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );

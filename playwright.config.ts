@@ -1,4 +1,5 @@
 import { defineConfig, devices } from "@playwright/test";
+import { DESKTOP_SETTINGS_STORAGE_KEY } from "./apps/geolibre-desktop/src/lib/storage-keys";
 
 const PORT = 4173;
 const BASE_URL = `http://localhost:${PORT}`;
@@ -20,6 +21,24 @@ export default defineConfig({
     : [["list"]],
   use: {
     baseURL: BASE_URL,
+    // Seed the first-launch UI-profile onboarding (issue #500) as already
+    // completed. Otherwise its modal wizard opens on every fresh context and its
+    // overlay intercepts pointer events, timing out any spec that clicks through
+    // the UI. The partial blob is merged with defaults by the settings loader.
+    storageState: {
+      cookies: [],
+      origins: [
+        {
+          origin: BASE_URL,
+          localStorage: [
+            {
+              name: DESKTOP_SETTINGS_STORAGE_KEY,
+              value: JSON.stringify({ uiProfile: { onboarded: true } }),
+            },
+          ],
+        },
+      ],
+    },
     trace: "on-first-retry",
     screenshot: "only-on-failure",
     video: "off",

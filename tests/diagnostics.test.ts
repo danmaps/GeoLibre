@@ -14,6 +14,11 @@ const storage = new Map<string, string>();
       storage.delete(key);
     },
   },
+  // Stubs so installDiagnosticsCapture (which patches window.fetch and adds
+  // window error listeners) can run under node --test.
+  fetch: (() => Promise.resolve(new Response())) as typeof fetch,
+  addEventListener: () => {},
+  removeEventListener: () => {},
 };
 
 type DiagnosticsModule =
@@ -22,6 +27,8 @@ let appendDiagnostic: DiagnosticsModule["appendDiagnostic"];
 let clearDiagnostics: DiagnosticsModule["clearDiagnostics"];
 let getDiagnosticsSnapshot: DiagnosticsModule["getDiagnosticsSnapshot"];
 let setCaptureNetworkInfo: DiagnosticsModule["setCaptureNetworkInfo"];
+let installDiagnosticsCapture: DiagnosticsModule["installDiagnosticsCapture"];
+let OPTIONAL_RESOURCE_HEADER: DiagnosticsModule["OPTIONAL_RESOURCE_HEADER"];
 
 before(async () => {
   ({
@@ -29,6 +36,8 @@ before(async () => {
     clearDiagnostics,
     getDiagnosticsSnapshot,
     setCaptureNetworkInfo,
+    installDiagnosticsCapture,
+    OPTIONAL_RESOURCE_HEADER,
   } = await import("../apps/geolibre-desktop/src/lib/diagnostics"));
 });
 
@@ -259,5 +268,142 @@ describe("diagnostics startup transient suppression", () => {
     install();
     console.warn("a normal warning");
     assert.deepEqual(echoed, ["a normal warning"]);
+  });
+
+  it("keeps the benign globe easing warning out of diagnostics but echoes it", () => {
+    let echoed: unknown[] | null = null;
+    console.warn = (...args: unknown[]) => {
+      echoed = args;
+    };
+    install();
+    const message =
+      "Easing around a point is not supported under globe projection.";
+    console.warn(message);
+    // Echoed to the console for contributors, but not recorded in the panel.
+    assert.deepEqual(echoed, [message]);
+    assert.equal(getDiagnosticsSnapshot().totalCount, 0);
+  });
+
+  it("flags an unmarked non-ok response as an error", async () => {
+    win.fetch = (() =>
+      Promise.resolve(
+        new Response(null, { status: 404, statusText: "Not Found" }),
+      )) as unknown as typeof fetch;
+    install();
+    await (win.fetch as typeof fetch)("/missing.json");
+    const [record] = getDiagnosticsSnapshot().records;
+    assert.equal(record.category, "network");
+    assert.equal(record.level, "error");
+    assert.equal(getDiagnosticsSnapshot().errorCount, 1);
+  });
+
+  it("downgrades a non-ok response on an optional-resource request", async () => {
+    setCaptureNetworkInfo(true);
+    try {
+      win.fetch = (() =>
+        Promise.resolve(
+          new Response(null, { status: 404, statusText: "Not Found" }),
+        )) as unknown as typeof fetch;
+      install();
+      await (win.fetch as typeof fetch)("/admin-profile.json", {
+        headers: { [OPTIONAL_RESOURCE_HEADER]: "1" },
+      });
+      const [record] = getDiagnosticsSnapshot().records;
+      assert.equal(record.category, "network");
+      // Marked optional, so the 404 is informational rather than an error.
+      assert.equal(record.level, "info");
+      assert.equal(getDiagnosticsSnapshot().errorCount, 0);
+    } finally {
+      setCaptureNetworkInfo(false);
+    }
+  });
+
+  it("treats init.headers as replacing a Request's optional marker", async () => {
+    win.fetch = (() =>
+      Promise.resolve(
+        new Response(null, { status: 404, statusText: "Not Found" }),
+      )) as unknown as typeof fetch;
+    install();
+    // The Request carries the optional marker, but init.headers replaces the
+    // Request's headers entirely (fetch spec), dropping it — so the 404 is a
+    // real error.
+    await (win.fetch as typeof fetch)(
+      new Request("http://localhost/admin-profile.json", {
+        headers: { [OPTIONAL_RESOURCE_HEADER]: "1" },
+      }),
+      { headers: {} },
+    );
+    const [record] = getDiagnosticsSnapshot().records;
+    assert.equal(record.category, "network");
+    assert.equal(record.level, "error");
+    assert.equal(getDiagnosticsSnapshot().errorCount, 1);
+  });
+
+  it("downgrades a thrown network error on an optional-resource request", async () => {
+    setCaptureNetworkInfo(true);
+    try {
+      win.fetch = (() =>
+        Promise.reject(new TypeError("Failed to fetch"))) as unknown as typeof fetch;
+      install();
+      await (win.fetch as typeof fetch)("/admin-profile.json", {
+        headers: { [OPTIONAL_RESOURCE_HEADER]: "1" },
+      }).catch(() => {});
+      const [record] = getDiagnosticsSnapshot().records;
+      assert.equal(record.category, "network");
+      // Optional, so even a thrown failure is informational rather than an error.
+      assert.equal(record.level, "info");
+      assert.equal(getDiagnosticsSnapshot().errorCount, 0);
+    } finally {
+      setCaptureNetworkInfo(false);
+    }
+  });
+
+  it("downgrades a benign startup fetch failure under Tauri to a warning", async () => {
+    win.__TAURI_INTERNALS__ = {};
+    win.fetch = (() =>
+      Promise.reject(new TypeError("Load failed"))) as unknown as typeof fetch;
+    install();
+    // The URL is illustrative of the real warm-up failure (a call to the Tauri
+    // IPC endpoint); the benign-startup downgrade keys off the error message,
+    // not the URL, so any URL would produce the same result here.
+    await (win.fetch as typeof fetch)("http://ipc.localhost/main").catch(
+      () => {},
+    );
+    const [record] = getDiagnosticsSnapshot().records;
+    assert.equal(record.category, "network");
+    // The Tauri custom-protocol warm-up at launch retries over postMessage, so
+    // it is a benign transient rather than a critical error (issue #657).
+    assert.equal(record.level, "warning");
+    assert.equal(getDiagnosticsSnapshot().errorCount, 0);
+    // The panel badge reads warningCount, so assert it tracks the downgrade.
+    assert.equal(getDiagnosticsSnapshot().warningCount, 1);
+  });
+
+  it("keeps a startup fetch failure outside the Tauri runtime as an error", async () => {
+    win.fetch = (() =>
+      Promise.reject(new TypeError("Failed to fetch"))) as unknown as typeof fetch;
+    install();
+    await (win.fetch as typeof fetch)("https://example.com/data").catch(
+      () => {},
+    );
+    const [record] = getDiagnosticsSnapshot().records;
+    assert.equal(record.category, "network");
+    assert.equal(record.level, "error");
+    assert.equal(getDiagnosticsSnapshot().errorCount, 1);
+  });
+
+  it("flags a fetch failure after the startup window as an error under Tauri", async () => {
+    win.__TAURI_INTERNALS__ = {};
+    win.fetch = (() =>
+      Promise.reject(new TypeError("Load failed"))) as unknown as typeof fetch;
+    install();
+    // Jump past the grace window so the failure is no longer a startup transient.
+    Date.now = () => realDateNow() + 60_000;
+    await (win.fetch as typeof fetch)("http://ipc.localhost/main").catch(
+      () => {},
+    );
+    const [record] = getDiagnosticsSnapshot().records;
+    assert.equal(record.level, "error");
+    assert.equal(getDiagnosticsSnapshot().errorCount, 1);
   });
 });

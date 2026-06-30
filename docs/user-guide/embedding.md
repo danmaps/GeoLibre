@@ -4,12 +4,12 @@ GeoLibre's browser build can be embedded in any web page and configured through 
 
 ## The live viewer
 
-The browser build is hosted at `https://viewer.geolibre.app/`. It is a static site deployed on GitHub Pages that runs entirely in your browser: it has no analytics and no server account, and the data you load is processed client-side. Data leaves your browser only when you add a remote URL or explicitly share a project.
+The browser build is hosted at `https://web.geolibre.app/`. It is a static site deployed on GitHub Pages that runs entirely in your browser: it has no analytics and no server account, and the data you load is processed client-side. Data leaves your browser only when you add a remote URL or explicitly share a project.
 
 Open a public project by passing its `.geolibre.json` URL with the `url` parameter:
 
 ```text
-https://viewer.geolibre.app/?url=https://share.geolibre.app/giswqs/3d-tiles.geolibre.json
+https://web.geolibre.app/?url=https://share.geolibre.app/giswqs/3d-tiles.geolibre.json
 ```
 
 A project URL like this comes from **Project → Share**. See [Projects](projects.md#share).
@@ -28,12 +28,13 @@ A chrome-free `maponly` embed shows only the map, as in this shared 3D Tiles pro
 | `panels` | `panels=none` | Hides the Layers, Style, and Attribute table panels. `hidden`, `hide`, and `off` are aliases. |
 | `hidePanels` | `hidePanels=true` | Alternative way to hide those panels. |
 | `maponly` | `maponly` | Hides all chrome (toolbar, panels, and status bar), leaving only the map. The bare flag or `true`, `1`, `yes`, `on` enable it. |
+| `welcome` | `welcome=0` | Hides the first-launch welcome wizard. Accepts `0`, `false`, `off`, or `no`. A `url=` deep link already suppresses it automatically. |
 | `theme` | `theme=dark` | Sets the initial color theme, overriding the OS preference. Accepts `dark` or `light`; the in-app toggle still works afterward. |
 
 Parameters combine. For a narrow, chrome-free, dark embed of a shared project:
 
 ```text
-https://viewer.geolibre.app/?url=https://share.geolibre.app/you/project.geolibre.json&maponly&theme=dark
+https://web.geolibre.app/?url=https://share.geolibre.app/you/project.geolibre.json&maponly&theme=dark
 ```
 
 ## Embedding in a page
@@ -42,7 +43,7 @@ Drop the viewer into an `<iframe>`:
 
 ```html
 <iframe
-  src="https://viewer.geolibre.app/?url=https://share.geolibre.app/you/project.geolibre.json&amp;maponly"
+  src="https://web.geolibre.app/?url=https://share.geolibre.app/you/project.geolibre.json&amp;maponly"
   title="GeoLibre map"
   width="100%"
   height="600"

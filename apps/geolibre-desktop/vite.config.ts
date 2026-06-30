@@ -1,5 +1,5 @@
 import react from "@vitejs/plugin-react";
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -11,6 +11,7 @@ import type {
 import { defineConfig, type Plugin } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
 import { bundledPlugins } from "./vite-plugins/bundled-plugins";
+import { copyRtlText } from "./vite-plugins/copy-rtl-text";
 import { copyVectorOps } from "./vite-plugins/copy-vector-ops";
 
 const GEOAGENT_BROWSER_BUNDLE = "maplibre-gl-geoagent/dist/browser-";
@@ -134,6 +135,28 @@ function cereusWasmCdnUrl(): string | null {
   return `https://cdn.jsdelivr.net/npm/${pkg}@${manifest.version}/${rel}`;
 }
 const CEREUS_WASM_CDN_URL = cereusWasmCdnUrl();
+
+// gdal3.js (GDAL compiled to WASM) powers the Georeferencer's client-side
+// GeoTIFF/COG export. Its wasm (~28 MB) + data (~12 MB) are huge, so — like
+// PGlite/Cereus above — fetch them from jsDelivr at runtime (version-pinned to
+// the lockfile) so they never inflate any build; the small JS glue stays
+// bundled and lazy-chunked, loaded only when the user exports. jsDelivr is
+// already an allowed connect-src in both CSPs. Set GEOLIBRE_GDAL_CDN=0 to force
+// network-free use (then the loader has no paths and export is unavailable).
+const GDAL_CDN = process.env.GEOLIBRE_GDAL_CDN !== "0";
+function gdal3CdnPaths(): { wasm: string; data: string } | null {
+  if (!GDAL_CDN) return null;
+  const { manifest } = findPackageManifest(
+    pgliteCdnRequire.resolve("gdal3.js"),
+    "gdal3.js",
+  );
+  const base = `https://cdn.jsdelivr.net/npm/gdal3.js@${manifest.version}/dist/package`;
+  return {
+    wasm: `${base}/gdal3WebAssembly.wasm`,
+    data: `${base}/gdal3WebAssembly.data`,
+  };
+}
+const GDAL3_CDN_PATHS = gdal3CdnPaths();
 const WMS_PROXY_PATH = "/__geolibre_wms_proxy";
 const WFS_PROXY_PATH = "/__geolibre_wfs_proxy";
 const GPX_PROXY_PATH = "/__geolibre_gpx_proxy";
@@ -186,6 +209,8 @@ function manualChunks(id: string): string | undefined {
   if (id.includes("@google/earthengine")) return "earth-engine-browser";
   if (id.includes("mapillary-js")) return "mapillary";
   if (id.includes("@geoman-io/maplibre-geoman-free")) return "maplibre-geoman";
+  // gdal3.js JS glue (the big wasm/data load from the CDN); lazy on export only.
+  if (id.includes("gdal3.js")) return "gdal3";
   // maplibre-gl-duckdb pulls in @duckdb/duckdb-wasm + apache-arrow and is only
   // loaded on demand (the DuckDB map control). It must NOT fall through to the
   // generic `maplibre-gl` rule below, which would fold it into the eager
@@ -444,6 +469,38 @@ function cereusCdnLoaderPlugin(): Plugin {
   };
 }
 
+function duckdbWasmBundlesPlugin(): Plugin {
+  const modulePath = path.resolve(
+    __dirname,
+    IS_TAURI_BUILD
+      ? "src/lib/duckdb-wasm-bundles.tauri.ts"
+      : "src/lib/duckdb-wasm-bundles.ts",
+  );
+  return {
+    name: "geolibre-duckdb-wasm-bundles",
+    enforce: "pre",
+    resolveId(source) {
+      return /(?:^|\/)duckdb-wasm-bundles(?:\.ts)?$/.test(source)
+        ? modulePath
+        : null;
+    },
+  };
+}
+
+function removeJupyterLiteFromTauriDistPlugin(): Plugin {
+  return {
+    name: "geolibre-remove-jupyterlite-from-tauri-dist",
+    apply: "build",
+    closeBundle() {
+      if (!IS_TAURI_BUILD) return;
+      rmSync(path.resolve(__dirname, "dist/jupyterlite"), {
+        recursive: true,
+        force: true,
+      });
+    },
+  };
+}
+
 function projectUrlQueryPlugin(): Plugin {
   return {
     name: "geolibre-project-url-query",
@@ -521,10 +578,16 @@ async function proxyBinaryRequest(
   res.setHeader("access-control-allow-origin", "*");
   res.setHeader("cache-control", "public, max-age=3600");
   res.setHeader("content-type", contentType);
-  for (const header of ["accept-ranges", "content-length", "content-range"]) {
+  for (const header of ["accept-ranges", "content-range"]) {
     const value = response.headers.get(header);
     if (value) res.setHeader(header, value);
   }
+  // Derive content-length from the buffered body, never the upstream header:
+  // fetch() transparently decompresses gzip/br responses, so the upstream
+  // content-length (the compressed size) would be smaller than the body we
+  // send and truncate it in the browser. The buffer length is correct for both
+  // full (200) and partial (206 + content-range) responses.
+  res.setHeader("content-length", String(body.byteLength));
   res.end(body);
 }
 
@@ -554,6 +617,11 @@ function pwaPlugin(): Plugin[] {
     "**/mapillary-*",
     "**/*.wasm",
     "**/*.data",
+    // The self-hosted JupyterLite site (apps/.../public/jupyterlite/, ~70 MB of
+    // JS/HTML) is loaded on demand inside the Notebook panel's iframe and has
+    // its own service worker scoped to /jupyterlite/. Keep it entirely out of
+    // the app shell precache, or first visit would balloon by thousands of files.
+    "**/jupyterlite/**",
   ];
   // Note: the 4 KB public/pyodide/pyodide-worker.js shim is intentionally left
   // in the precache (revisioned, so no stale-after-deploy risk). The heavy
@@ -580,7 +648,7 @@ function pwaPlugin(): Plugin[] {
       name: "GeoLibre",
       short_name: "GeoLibre",
       description:
-        "A lightweight, cloud-native GIS platform for visualizing, exploring, and analyzing geospatial data.",
+        "A free and open-source, lightweight, cloud-native GIS platform for visualizing, exploring, and analyzing geospatial data, running in the browser, on the desktop, on mobile, and inside Jupyter notebooks while keeping your data local and private.",
       theme_color: "#2f8f85",
       background_color: "#ffffff",
       display: "standalone",
@@ -652,7 +720,8 @@ function pwaPlugin(): Plugin[] {
             url.hostname === "cdn.jsdelivr.net" &&
             (url.pathname.startsWith("/pyodide/") ||
               url.pathname.startsWith("/npm/@electric-sql/") ||
-              url.pathname.startsWith("/npm/@cereusdb/")),
+              url.pathname.startsWith("/npm/@cereusdb/") ||
+              url.pathname.startsWith("/npm/gdal3.js")),
           handler: "CacheFirst",
           options: {
             cacheName: "geolibre-cdn-engines",
@@ -691,6 +760,7 @@ export default defineConfig({
   plugins: [
     ...(PGLITE_CDN ? [pgliteCdnLoaderPlugin()] : []),
     ...(CEREUS_CDN ? [cereusCdnLoaderPlugin()] : []),
+    duckdbWasmBundlesPlugin(),
     stripDuckDbWorkerSourcemapPlugin(),
     projectUrlQueryPlugin(),
     bundledPlugins(path.resolve(__dirname, "public/plugins")),
@@ -701,9 +771,13 @@ export default defineConfig({
       ),
       path.resolve(__dirname, "src/lib/pyodide/vector_ops.generated.py"),
     ),
+    copyRtlText(
+      path.resolve(__dirname, "src/lib/vendor/mapbox-gl-rtl-text.generated.js"),
+    ),
     react(),
     wmsProxyPlugin(),
     selectiveJsMinifyPlugin(),
+    removeJupyterLiteFromTauriDistPlugin(),
     ...pwaPlugin(),
   ],
   clearScreen: false,
@@ -712,6 +786,7 @@ export default defineConfig({
     __PGLITE_CDN_URL__: JSON.stringify(PGLITE_CDN_URL),
     __PGLITE_POSTGIS_CDN_URL__: JSON.stringify(PGLITE_POSTGIS_CDN_URL),
     __CEREUS_WASM_CDN_URL__: JSON.stringify(CEREUS_WASM_CDN_URL),
+    __GDAL3_CDN_PATHS__: JSON.stringify(GDAL3_CDN_PATHS),
   },
   server: {
     port: 5173,
@@ -741,6 +816,13 @@ export default defineConfig({
       "@google/genai",
       "openai",
       "zod",
+      // cog-tiler-wasm's plain-JS deps (the wasm tiler itself is excluded below
+      // so its asset URL survives). These are only reached through that lazy
+      // engine, so without pre-bundling Vite discovers them on first use and
+      // triggers a full-page reload to re-optimize. (geotiff is already
+      // pre-bundled via the deck.gl-geotiff static import.)
+      "proj4",
+      "geotiff-geokeys-to-proj4",
     ],
     // PGlite ships its own WASM + filesystem bundles and must not be pre-bundled
     // by esbuild, which mangles those asset references (per PGlite's Vite guide).
@@ -753,6 +835,18 @@ export default defineConfig({
       "@electric-sql/pglite",
       "@electric-sql/pglite-postgis",
       "@cereusdb/standard",
+      // geolibre-wasm/tools loads its bundled geolibre-cli.wasm via
+      // `new URL("./geolibre-cli.wasm", import.meta.url)`; esbuild pre-bundling
+      // mangles that asset reference, so serve it as-is. whitebox-wasm is still
+      // pulled in transitively (cog-tiler-wasm's peer dependency) and loads its
+      // wasm-bindgen asset the same way, so keep it excluded too.
+      "geolibre-wasm",
+      "whitebox-wasm",
+      // cog-tiler-wasm (the lazy CPU/WASM raster tiler) loads its
+      // cog_tiler_wasm_bg.wasm the same wasm-bindgen way; esbuild pre-bundling
+      // breaks that asset reference so the tiler stops rendering. Serve it
+      // as-is. (Its plain-JS deps are pre-bundled via optimizeDeps.include.)
+      "cog-tiler-wasm",
     ],
   },
   build: {

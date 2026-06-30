@@ -10,8 +10,10 @@ import { Globe2, Map as MapIcon } from "lucide-react";
 import {
   type FormEvent,
   type ReactNode,
+  useId,
   useState,
 } from "react";
+import { useTranslation } from "react-i18next";
 import { useAddDataShell } from "./context";
 import { errorMessage } from "./helpers";
 
@@ -23,6 +25,7 @@ import { errorMessage } from "./helpers";
  * @param defaultLayerName - The initial layer name for this source.
  */
 export function useAddDataSource(defaultLayerName: string) {
+  const { t } = useTranslation();
   const shell = useAddDataShell();
   const [layerName, setLayerName] = useState(defaultLayerName);
   const [beforeLayerId, setBeforeLayerId] = useState("");
@@ -52,7 +55,7 @@ export function useAddDataSource(defaultLayerName: string) {
       try {
         await action();
       } catch (err) {
-        setError(errorMessage(err, "Could not add layer."));
+        setError(errorMessage(err, t("addData.shared.addError")));
       } finally {
         shell.setIsSubmitting(false);
       }
@@ -73,6 +76,60 @@ export function useAddDataSource(defaultLayerName: string) {
   };
 }
 
+/**
+ * A "Load sample data" dropdown for the Add Data sources. Each entry is a
+ * named preset that fills the source's fields, so a source can ship an empty
+ * input (placeholder only) instead of a prefilled sample URL. Renders nothing
+ * when no samples are supplied, and snaps back to the placeholder after a pick
+ * so it reads as an action menu rather than a sticky selection.
+ *
+ * Sits at the bottom of each source form as a secondary, low-frequency action,
+ * with a faint top divider so it reads as separate from the production fields
+ * above it (and is less likely to be triggered by accident — picking a sample
+ * overwrites the fields, including any access token typed for the prior entry).
+ *
+ * @param samples - The named presets to offer.
+ * @param onSelect - Applies the chosen preset's value to the source's fields.
+ */
+export function SampleDataSelect<T>({
+  samples,
+  onSelect,
+}: {
+  samples: readonly { label: string; value: T }[];
+  onSelect: (value: T) => void;
+}) {
+  const { t } = useTranslation();
+  const selectId = useId();
+  if (samples.length === 0) return null;
+  return (
+    <div className="space-y-1.5 border-t border-border/60 pt-3">
+      <Label htmlFor={selectId}>{t("addData.shared.sampleData")}</Label>
+      <Select
+        id={selectId}
+        value=""
+        onChange={(event) => {
+          // Safety net: the disabled placeholder ("") should never reach here
+          // through real interaction, but ignore an empty value anyway so it
+          // can't coerce (Number("") === 0) to the first sample.
+          const raw = event.target.value;
+          if (!raw) return;
+          const sample = samples[Number(raw)];
+          if (sample) onSelect(sample.value);
+        }}
+      >
+        <option value="" disabled>
+          {t("addData.shared.loadSampleData")}
+        </option>
+        {samples.map((sample, index) => (
+          <option key={sample.label} value={String(index)}>
+            {sample.label}
+          </option>
+        ))}
+      </Select>
+    </div>
+  );
+}
+
 export function LayerNameField({
   value,
   onChange,
@@ -80,9 +137,10 @@ export function LayerNameField({
   value: string;
   onChange: (value: string) => void;
 }) {
+  const { t } = useTranslation();
   return (
     <div className="space-y-1.5">
-      <Label htmlFor="add-data-layer-name">Layer name</Label>
+      <Label htmlFor="add-data-layer-name">{t("addData.shared.layerName")}</Label>
       <Input
         id="add-data-layer-name"
         value={value}
@@ -99,22 +157,32 @@ export function InsertBeforeField({
   value: string;
   onChange: (value: string) => void;
 }) {
+  const { t } = useTranslation();
   const { existingLayers, mapControllerRef } = useAddDataShell();
   // Computed during render (not memoized) so the list picks up the map
   // controller once it finishes initialising; the call is a cheap filter.
   const basemapStyleLayerIds =
     mapControllerRef.current?.getBasemapStyleLayerIds() ?? [];
+  // The basemap style exposes dozens of internal layer ids that overwhelm the
+  // dropdown for standard users (issue #453). Keep them behind an opt-in
+  // "advanced" toggle so the default list only shows the user's own layers —
+  // but reveal them automatically if the current value is one of them.
+  const valueIsBasemapLayer = basemapStyleLayerIds.includes(value);
+  const [showBasemapLayers, setShowBasemapLayers] = useState(valueIsBasemapLayer);
+  const basemapLayersVisible = showBasemapLayers || valueIsBasemapLayer;
   return (
     <div className="space-y-1.5">
-      <Label htmlFor="add-data-before-id">Insert before</Label>
+      <Label htmlFor="add-data-before-id">
+        {t("addData.shared.insertBelow")}
+      </Label>
       <Select
         id="add-data-before-id"
         value={value}
         onChange={(event) => onChange(event.target.value)}
       >
-        <option value="">Top of layer list (default)</option>
+        <option value="">{t("addData.shared.insertTop")}</option>
         {existingLayers.length > 0 && (
-          <optgroup label="Layers">
+          <optgroup label={t("addData.shared.layersGroup")}>
             {[...existingLayers].reverse().map((existingLayer) => (
               <option key={existingLayer.id} value={existingLayer.id}>
                 {existingLayer.name}
@@ -122,8 +190,8 @@ export function InsertBeforeField({
             ))}
           </optgroup>
         )}
-        {basemapStyleLayerIds.length > 0 && (
-          <optgroup label="Basemap layers">
+        {basemapStyleLayerIds.length > 0 && basemapLayersVisible && (
+          <optgroup label={t("addData.shared.basemapLayersGroup")}>
             {basemapStyleLayerIds.map((styleLayerId) => (
               <option key={styleLayerId} value={styleLayerId}>
                 {styleLayerId}
@@ -132,6 +200,17 @@ export function InsertBeforeField({
           </optgroup>
         )}
       </Select>
+      {basemapStyleLayerIds.length > 0 && !valueIsBasemapLayer && (
+        <label className="flex items-center gap-2 text-xs text-muted-foreground">
+          <input
+            type="checkbox"
+            aria-controls="add-data-before-id"
+            checked={showBasemapLayers}
+            onChange={(event) => setShowBasemapLayers(event.target.checked)}
+          />
+          {t("addData.shared.showBasemapLayers")}
+        </label>
+      )}
     </div>
   );
 }
@@ -146,6 +225,7 @@ export function AddDataFooter({
   submitDisabled: boolean;
   useServiceIcon?: boolean;
 }) {
+  const { t } = useTranslation();
   const { isSubmitting, closeDialog } = useAddDataShell();
   return (
     <>
@@ -154,11 +234,11 @@ export function AddDataFooter({
       <div className="flex justify-end gap-2">
         <Button
           type="button"
-          variant="ghost"
+          variant="outline"
           onClick={closeDialog}
           disabled={isSubmitting}
         >
-          Cancel
+          {t("common.cancel")}
         </Button>
         <Button type="submit" disabled={submitDisabled}>
           {!isSubmitting ? (
@@ -168,7 +248,7 @@ export function AddDataFooter({
               <MapIcon className="mr-2 h-3.5 w-3.5" />
             )
           ) : null}
-          {isSubmitting ? "Adding…" : "Add layer"}
+          {isSubmitting ? t("addData.shared.adding") : t("addData.shared.addLayer")}
         </Button>
       </div>
     </>

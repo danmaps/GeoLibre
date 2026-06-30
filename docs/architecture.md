@@ -2,7 +2,7 @@
 
 ## Overview
 
-GeoLibre is a lightweight, cloud-native GIS platform that runs across desktop and web environments, with a responsive layout for mobile screens, all from a single npm workspaces monorepo. The UI is a React app that ships as a native desktop app hosted by Tauri v2 and as a browser-based web app, adapting responsively to mobile and small screens. Map rendering uses MapLibre GL JS in the browser webview, with deck.gl used for advanced raster, point cloud, and 3D overlays. Application state lives in a Zustand store (`@geolibre/core`).
+GeoLibre is a free and open-source, lightweight, cloud-native GIS platform that runs in the web browser, on the desktop, on mobile, and inside Jupyter notebooks, all from a single npm workspaces monorepo. The UI is a React app that ships as a native desktop app hosted by Tauri v2 and as a browser-based web app, adapting responsively to mobile and small screens. Map rendering uses MapLibre GL JS in the browser webview, with deck.gl used for advanced raster, point cloud, and 3D overlays. Application state lives in a Zustand store (`@geolibre/core`).
 
 ```mermaid
 flowchart LR
@@ -47,7 +47,7 @@ INSTALL spatial;
 LOAD spatial;
 ```
 
-GeoParquet is read with DuckDB's Parquet reader after loading Spatial. Other local vector formats are passed to Spatial `ST_Read` when the WebAssembly extension can load the GDAL-backed reader. Zipped Shapefiles are parsed with `shpjs` first, then DuckDB Spatial is tried if that parser cannot read the file. KMZ archives are unzipped in the browser and their KML files are passed through the same DuckDB Spatial KML reader.
+GeoParquet is read with DuckDB's Parquet reader after loading Spatial. Other local vector formats are passed to Spatial `ST_Read` when the WebAssembly extension can load the GDAL-backed reader. Zipped Shapefiles are parsed with `shpjs` first, then DuckDB Spatial is tried if that parser cannot read the file. KML files (and the KML inside unzipped KMZ archives) are read by an in-house parser that preserves embedded symbology, emitting [simplestyle-spec](https://github.com/mapbox/simplestyle-spec) properties (`fill`, `stroke`, `stroke-width`, and so on) so styled KML renders the way it does in Google Earth; KML the parser cannot handle falls back to the DuckDB Spatial reader, which loads the geometry without the styling. A vector layer whose features carry simplestyle properties is rendered per-feature: paint expressions read the per-feature color/width and fall back to the flat layer style.
 
 ## Advanced Add Data workflows
 
@@ -93,3 +93,47 @@ The container does not run the Tauri desktop shell or the optional Python sideca
 
 - Tauri CSP allowlists tile and style hosts (OpenFreeMap, CARTO).
 - File access uses dialog-selected paths only.
+
+## Performance: map rendering on Linux (WebKitGTK)
+
+The desktop app uses the system WebView. On Linux that is **WebKitGTK**, whose
+WebGL/JavaScript pipeline is materially slower than the Chromium engine the
+browser build runs in. The most visible effect is **map panning at low zoom**:
+
+- A blank map (no tile layer) pans at a steady 60 FPS at any zoom.
+- With any tile layer (vector **or** raster XYZ), FPS collapses to single
+  digits **while tiles are loading**, then snaps back to 60 once loading stops,
+  at the same zoom. Low zoom only makes it constant because panning across the
+  whole world loads tiles continuously and the cache never settles.
+
+The cost is WebKitGTK processing each newly-loaded tile on the main thread: the
+GPU upload of its texture (raster) or vertex buffers (vector) via synchronous
+WebGL calls, plus the subsequent fade-in repaint frames. Vector tile parsing and
+bucket building run in MapLibre's Web Workers, so they are not the bottleneck
+here. Each tile-integration render cycle measured ~125 ms wall-clock in
+WebKitGTK versus a few ms in Chromium. The gap is in WebKitGTK's WebGL
+implementation and compositor pipeline (driver command-stream flush, TextureMapper
+GL surface composition), not solely its JavaScriptCore JS engine. This is a
+WebView-engine limitation, not a bug in GeoLibre, and it does not affect the
+browser build or (untested) the macOS/Windows WebViews.
+
+Ruled out during diagnosis (so future investigation does not repeat them):
+software rendering (the GPU is used, Intel i915 confirmed), GPU saturation (the
+render engine stays ~20% idle), the Tauri IPC file read (~126 ms for a 22 MB
+GeoJSON), `JSON.parse` (~36 ms), KWin compositor latency, `renderWorldCopies`,
+the globe vs. mercator projection, and `preserveDrawingBuffer`.
+
+To reproduce the measurement: temporarily log MapLibre `render` events,
+`dataloading` (tile) events, and a `requestAnimationFrame` counter once per
+second; FPS tracks tile-load count inversely. The quickest check is this
+frame-rate meter pasted into the WebView devtools console, then pan while
+watching the logged FPS:
+
+```js
+let f=0,t=performance.now();(function loop(n){f++;if(n-t>=1000){console.log('FPS',f);f=0;t=n;}requestAnimationFrame(loop);})(t);
+```
+
+Mitigations (reduce *how many* tiles load during a pan, since per-tile cost is
+fixed by the engine) are not yet implemented: a larger `maxTileCacheSize`,
+512px raster tiles instead of 256px, and `fadeDuration: 0`, ideally gated to
+WebKitGTK so the Chromium-based builds keep full fidelity.

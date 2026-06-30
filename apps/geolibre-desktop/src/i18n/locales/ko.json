@@ -20,26 +20,24 @@
       "map": "지도",
       "layout": "레이아웃",
       "environment": "환경",
-      "project": "프로젝트",
       "account": "계정"
     },
     "menu": {
       "mapPreferences": "지도 기본 설정",
       "layoutSettings": "레이아웃 설정",
       "environmentVariables": "환경 변수",
-      "projectSettings": "프로젝트 설정",
       "managePlugins": "플러그인 관리",
       "urlOverrideNote": "URL 레이아웃 매개변수는 저장된 설정보다 우선합니다."
     },
     "map": {
       "constraintsTitle": "지도 제약 조건",
-      "constraintsDescription": "프로젝트가 열려 있는 동안 제한이 적용됩니다.",
       "restrictBounds": "지도 범위 제한",
       "west": "서쪽",
       "south": "남쪽",
       "east": "동쪽",
       "north": "북쪽",
       "useCurrentView": "현재 뷰 사용",
+      "useCurrentViewGlobeHint": "이 기능을 사용하기 전에 메르카토르 투영으로 전환하세요. 지구본 투영에서는 지도가 캡처된 경계를 약간 벗어나 이동할 수 있습니다.",
       "minZoom": "최소 확대/축소",
       "maxZoom": "최대 확대/축소",
       "maxPitch": "최대 피치",
@@ -79,14 +77,6 @@
       "removeAria": "{{name}} 제거",
       "errorNamePattern": "환경 변수 이름은 문자 또는 밑줄로 시작해야 하며 문자, 숫자, 밑줄만 포함해야 합니다.",
       "errorDuplicate": "환경 변수 \"{{name}}\"이(가) 중복되었습니다."
-    },
-    "project": {
-      "title": "프로젝트",
-      "description": "설정은 `.geolibre.json` 프로젝트와 함께 저장됩니다.",
-      "name": "이름",
-      "file": "프로젝트 파일",
-      "notSaved": "저장되지 않음",
-      "format": "프로젝트 형식"
     }
   },
   "toolbar": {
@@ -286,7 +276,7 @@
       "webServices": "웹 서비스",
       "commandPalette": "명령 팔레트",
       "openProjectFromUrl": "URL에서 프로젝트 열기",
-      "openProjectFromUrlDesc": "공개 `.geolibre.json` 프로젝트를 로드하고 최근 프로젝트에 추가합니다.",
+      "openProjectFromUrlDesc": "`.geolibre.json` 프로젝트를 로드하고 최근 프로젝트에 추가합니다.",
       "projectUrl": "프로젝트 URL",
       "opening": "여는 중...",
       "open": "열기",

@@ -61,6 +61,96 @@ const FETCH_FAILURE_MESSAGES = ["Failed to fetch", "Load failed"];
 const TAURI_IPC_FALLBACK_WARNING =
   "IPC custom protocol failed, Tauri will now use the postMessage interface instead";
 
+// MapLibre warns this every time a camera animation eases around a point (the
+// inertia of a rotate/tilt gesture, double-click zoom, etc.) while the globe
+// projection is active — globe simply ignores the around-point and the camera
+// still moves correctly. It is harmless but fires on routine interaction, so it
+// is kept out of the diagnostics panel (still echoed to the console for devs).
+const BENIGN_CONSOLE_WARNINGS = [
+  "Easing around a point is not supported under globe projection.",
+];
+
+/** Whether a console.warn message is a known-benign warning to drop entirely. */
+function isBenignConsoleWarning(args: unknown[]): boolean {
+  return (
+    typeof args[0] === "string" &&
+    BENIGN_CONSOLE_WARNINGS.some((needle) =>
+      (args[0] as string).includes(needle),
+    )
+  );
+}
+
+// Request header that flags a fetch whose failure (typically a 404) is expected
+// and harmless — e.g. an optional config file that may simply be absent. A
+// non-ok response to such a request is recorded at info level instead of error,
+// so it does not surface as a problem in the diagnostics panel (issue follow-up
+// to #500: the optional admin-profile.json 404 on every load).
+export const OPTIONAL_RESOURCE_HEADER = "x-geolibre-optional-resource";
+
+/** Read a single header value across the Headers/array/record init shapes. */
+function readHeader(headers: HeadersInit | undefined, name: string): string | null {
+  if (!headers) return null;
+  const target = name.toLowerCase();
+  if (headers instanceof Headers) return headers.get(target);
+  if (Array.isArray(headers)) {
+    for (const [key, value] of headers) {
+      if (key.toLowerCase() === target) return value;
+    }
+    return null;
+  }
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === target) return value;
+  }
+  return null;
+}
+
+/** Whether a request opted out of error-level logging for benign failures. */
+function isOptionalResourceRequest(
+  input: Parameters<typeof fetch>[0],
+  init: Parameters<typeof fetch>[1],
+): boolean {
+  // Per the fetch spec, when init.headers is provided it replaces a Request
+  // input's headers entirely, so only fall back to the Request's own headers
+  // when init omits them — otherwise an init that drops the marker would still
+  // be treated as optional.
+  if (init?.headers !== undefined) {
+    return readHeader(init.headers, OPTIONAL_RESOURCE_HEADER) != null;
+  }
+  return (
+    input instanceof Request &&
+    input.headers.get(OPTIONAL_RESOURCE_HEADER) != null
+  );
+}
+
+/**
+ * Remove the optional-resource marker before the request leaves the app. It is a
+ * client-side diagnostics hint with no meaning to any server; forwarding it
+ * would, on a cross-origin request, turn it into a non-simple header that forces
+ * a CORS preflight the server would have to allow.
+ */
+function stripOptionalResourceHeader(
+  input: Parameters<typeof fetch>[0],
+  init: Parameters<typeof fetch>[1],
+): { input: Parameters<typeof fetch>[0]; init: Parameters<typeof fetch>[1] } {
+  // init.headers, when present, is what actually gets sent (it replaces a
+  // Request input's headers), so strip it there.
+  if (init?.headers !== undefined) {
+    if (readHeader(init.headers, OPTIONAL_RESOURCE_HEADER) == null) {
+      return { input, init };
+    }
+    const headers = new Headers(init.headers);
+    headers.delete(OPTIONAL_RESOURCE_HEADER);
+    return { input, init: { ...init, headers } };
+  }
+  // Otherwise a Request input may carry it; rebuild without the marker.
+  if (input instanceof Request && input.headers.has(OPTIONAL_RESOURCE_HEADER)) {
+    const headers = new Headers(input.headers);
+    headers.delete(OPTIONAL_RESOURCE_HEADER);
+    return { input: new Request(input, { headers }), init };
+  }
+  return { input, init };
+}
+
 function looksLikeFetchFailure(reason: unknown): boolean {
   const message =
     reason instanceof Error
@@ -310,11 +400,18 @@ export function installDiagnosticsCapture(): () => void {
     const method = requestMethod(input, init);
     const url = requestUrl(input);
 
+    // A request may declare that a failure (a non-ok response such as a 404, or
+    // a thrown network error) is expected — e.g. an optional config file that
+    // may be absent — so it is logged as info rather than flagged an error. The
+    // marker is read here, then stripped so it never reaches the server.
+    const optional = isOptionalResourceRequest(input, init);
+    const forwarded = stripOptionalResourceHeader(input, init);
+
     try {
-      const response = await originalFetch(input, init);
+      const response = await originalFetch(forwarded.input, forwarded.init);
       appendDiagnostic({
         category: "network",
-        level: response.ok ? "info" : "error",
+        level: response.ok || optional ? "info" : "error",
         message: `${method} ${response.status} ${response.statusText}`.trim(),
         durationMs: Math.round(performance.now() - startedAt),
         method,
@@ -326,10 +423,23 @@ export function installDiagnosticsCapture(): () => void {
       const isAbort =
         (error instanceof DOMException || error instanceof Error) &&
         error.name === "AbortError";
+      // A "Failed to fetch"/"Load failed" thrown during the desktop startup
+      // window is the Tauri custom-protocol IPC warming up: the call is retried
+      // over postMessage and the app recovers. Record it as a benign warning
+      // rather than a critical network error so it does not surface as an
+      // alarming failure to a user inspecting the panel at launch (issue #657).
+      // It mirrors the unhandled-rejection downgrade below; genuine failures
+      // outside the window are still flagged as errors.
+      const benignStartup = !isAbort && !optional && isBenignStartupFetch(error);
       appendDiagnostic({
         category: "network",
-        level: isAbort ? "info" : "error",
-        message: isAbort ? `${method} aborted` : `${method} request failed`,
+        level:
+          isAbort || optional ? "info" : benignStartup ? "warning" : "error",
+        message: isAbort
+          ? `${method} aborted`
+          : benignStartup
+            ? `${method} request failed (benign Tauri custom-protocol warm-up)`
+            : `${method} request failed`,
         detail: isAbort ? undefined : formatUnknown(error),
         durationMs: Math.round(performance.now() - startedAt),
         method,
@@ -352,6 +462,14 @@ export function installDiagnosticsCapture(): () => void {
   };
 
   console.warn = (...args: unknown[]) => {
+    // Known-benign third-party warnings (e.g. MapLibre's globe easing notice on
+    // every rotate/tilt gesture) are echoed to the console so a contributor
+    // debugging map animations still sees them, but kept out of the diagnostics
+    // panel, where they would clutter the log on routine interaction.
+    if (isBenignConsoleWarning(args)) {
+      originalConsoleWarn(...args);
+      return;
+    }
     const isTauriIpcFallback =
       inStartupWindow() &&
       typeof args[0] === "string" &&

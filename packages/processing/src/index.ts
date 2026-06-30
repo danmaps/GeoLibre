@@ -13,7 +13,11 @@ export {
   type ModelStepResult,
   type RunModelOptions,
 } from "./runner";
-export { NETWORK_TOOLS, getNetworkTool } from "./network-tools";
+export {
+  NETWORK_TOOLS,
+  getNetworkTool,
+  layerToSequencedPoints,
+} from "./network-tools";
 export {
   STATISTICS_TOOLS,
   getStatisticsTool,
@@ -36,6 +40,17 @@ export {
   type RasterToolId,
   type FileFilter,
 } from "./raster-tools";
+export {
+  SPECTRAL_INDICES,
+  SENSOR_IDS,
+  SENSOR_PRESETS,
+  getSpectralIndex,
+  buildSpectralIndexExpression,
+  type SpectralIndex,
+  type BandName,
+  type BandLayout,
+  type BuiltSpectralIndex,
+} from "./spectral-indices";
 export {
   CLIENT_RASTER_TOOL_IDS,
   TERRAIN_NODATA,
@@ -87,6 +102,7 @@ export {
   runVectorToGeoParquet,
   runVectorToPmtiles,
   runVectorToShapefile,
+  runVectorToVector,
   runVectorTool,
   fetchVectorStatus,
   runWhiteboxTool,
@@ -110,6 +126,7 @@ export {
   type VectorToGeoParquetRequest,
   type VectorToPmtilesRequest,
   type VectorToShapefileRequest,
+  type VectorToVectorRequest,
   type VectorStatus,
   type VectorToolRequest,
   type VectorToolResult,
@@ -120,3 +137,18 @@ export {
   type WhiteboxTool,
   type WhiteboxToolParameter,
 } from "./sidecar-client";
+export {
+  runWhiteboxToolWasm,
+  whiteboxWasmAvailable,
+  listWhiteboxWasmTools,
+  listGeolibreWasmTools,
+  outputBaseName,
+  isTiff,
+} from "./wasm-client";
+export {
+  initCogWasm,
+  readGeoTiffInfo,
+  isTiledGeoTiff,
+  convertGeoTiffToCog,
+  type GeoTiffInfo,
+} from "./cog-convert";

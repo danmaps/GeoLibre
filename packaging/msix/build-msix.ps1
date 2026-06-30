@@ -4,7 +4,18 @@ param(
   [ValidateSet("x64", "x86", "arm64", "arm", "neutral")]
   [string] $Architecture = "x64",
   [string] $Publisher = "CN=GeoLibre",
-  [string] $PublisherDisplayName = "GeoLibre"
+  [string] $PublisherDisplayName = "GeoLibre",
+  # Identity Name. Defaults to the Tauri identifier; override with the reserved
+  # package name from Partner Center (Product Identity) for a Microsoft Store
+  # submission.
+  [string] $Name = "",
+  # Package display name (Properties/DisplayName). Defaults to the Tauri
+  # productName; for a Microsoft Store submission it must be a name you reserved
+  # in Partner Center (e.g. "GeoLibre"), which may differ from the product name.
+  [string] $DisplayName = "",
+  # Default package language. Required by the Store; every MSIX must declare one.
+  [ValidatePattern('^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{1,8})*$')]
+  [string] $Language = "en-us"
 )
 
 $ErrorActionPreference = "Stop"
@@ -45,7 +56,7 @@ function ConvertTo-XmlText([string] $Value) {
   return [System.Security.SecurityElement]::Escape($Value)
 }
 
-$repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+$repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $appRoot = Resolve-Path (Join-Path $repoRoot $AppDir)
 $tauriDir = Join-Path $appRoot "src-tauri"
 $targetDir = Join-Path $tauriDir "target\$Configuration"
@@ -58,7 +69,9 @@ $iconsDir = Join-Path $tauriDir "icons"
 
 $config = Get-Content -Raw $configPath | ConvertFrom-Json
 $productName = [string] $config.productName
+if ([string]::IsNullOrWhiteSpace($DisplayName)) { $DisplayName = $productName }
 $identifier = [string] $config.identifier
+if ([string]::IsNullOrWhiteSpace($Name)) { $Name = $identifier }
 $version = ConvertTo-MsixVersion ([string] $config.version)
 
 $cargo = Get-Content -Raw $cargoPath
@@ -106,15 +119,18 @@ $manifest = @"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   IgnorableNamespaces="uap rescap">
   <Identity
-    Name="$(ConvertTo-XmlText $identifier)"
+    Name="$(ConvertTo-XmlText $Name)"
     Publisher="$(ConvertTo-XmlText $Publisher)"
     Version="$(ConvertTo-XmlText $version)"
     ProcessorArchitecture="$(ConvertTo-XmlText $Architecture)" />
   <Properties>
-    <DisplayName>$(ConvertTo-XmlText $productName)</DisplayName>
+    <DisplayName>$(ConvertTo-XmlText $DisplayName)</DisplayName>
     <PublisherDisplayName>$(ConvertTo-XmlText $PublisherDisplayName)</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
+  <Resources>
+    <Resource Language="$(ConvertTo-XmlText $Language)" />
+  </Resources>
   <Dependencies>
     <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
   </Dependencies>

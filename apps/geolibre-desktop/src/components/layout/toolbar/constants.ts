@@ -56,6 +56,7 @@ export const MAP_CONTROL_ITEMS: Array<{
 }> = [
   { id: "navigation", labelKey: "toolbar.mapControl.navigation" },
   { id: "fullscreen", labelKey: "toolbar.mapControl.fullscreen" },
+  { id: "compass", labelKey: "toolbar.mapControl.compass" },
   { id: "geolocate", labelKey: "toolbar.mapControl.geolocate" },
   { id: "globe", labelKey: "toolbar.mapControl.globe" },
   { id: "terrain", labelKey: "toolbar.mapControl.terrain" },
@@ -65,8 +66,8 @@ export const MAP_CONTROL_ITEMS: Array<{
 ];
 
 export const NEW_PROJECT_VISIBLE_BUILT_IN_CONTROLS = new Set<BuiltInMapControl>([
-  "navigation",
   "fullscreen",
+  "compass",
   "globe",
   "layer-control",
 ]);
@@ -87,6 +88,8 @@ export const PLUGIN_POSITION_ITEMS: Array<{
 ];
 
 export const FEEDBACK_URL = "https://github.com/opengeos/GeoLibre/issues";
+export const WEBSITE_URL = "https://geolibre.app";
+export const GITHUB_URL = "https://github.com/opengeos/GeoLibre";
 // A small (~350 KB) CORS-enabled Las Vegas Strip sample, so the URL field works
 // out of the box on both the desktop and web builds.
 export const DEFAULT_OSM_PBF_URL =
@@ -101,6 +104,7 @@ export const ADD_DATA_KIND_COMMANDS: Array<{
   titleKey: ParseKeys;
 }> = [
   { kind: "delimited-text", titleKey: "toolbar.layerType.delimitedText" },
+  { kind: "cad", titleKey: "toolbar.item.cadLayer" },
   { kind: "gpx", titleKey: "toolbar.layerType.gpx" },
   { kind: "mbtiles", titleKey: "toolbar.layerType.mbtiles" },
   { kind: "xyz", titleKey: "toolbar.layerType.xyz" },
@@ -185,6 +189,7 @@ export const RASTER_TOOL_COMMANDS: Array<{
   { kind: "interpolate", titleKey: "toolbar.rasterTool.interpolate" },
   { kind: "zonal", titleKey: "toolbar.rasterTool.zonal" },
   { kind: "raster-calc", titleKey: "toolbar.rasterTool.rasterCalc" },
+  { kind: "spectral-index", titleKey: "toolbar.rasterTool.spectralIndex" },
   { kind: "reclassify", titleKey: "toolbar.rasterTool.reclassify" },
   { kind: "mosaic", titleKey: "toolbar.rasterTool.mosaic" },
   { kind: "focal", titleKey: "toolbar.rasterTool.focal" },

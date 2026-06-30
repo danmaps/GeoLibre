@@ -63,7 +63,7 @@
 
 ## v0.8: Viewer, desktop packaging, plugins, and dynamic layers
 
-- [x] Cloudflare Worker viewer served from `viewer.geolibre.app`
+- [x] Cloudflare Worker viewer served from `web.geolibre.app`
 - [x] Browser demo links updated to the production viewer
 - [x] GPX drag-and-drop split into named waypoint, track, and route layers
 - [x] Vector layers reprojected to EPSG:4326 on load
@@ -135,7 +135,7 @@
 - [x] Open attribute table and Export actions added to the layer actions menu
 - [x] Manual and automatic (timed) refresh extended to Add Vector Layer URL layers
 - [x] Attribute table column management: rename, delete, hide/show, and reorder fields, persisted with the project
-- [x] Atmosphere Effects plugin: deep-space backdrop, parallax starfield, comets, and a globe atmosphere halo at low zoom (toggled from the Controls menu)
+- [x] Atmospheric Effects plugin: deep-space backdrop, parallax starfield, comets, and a globe atmosphere halo at low zoom (toggled from the Controls menu)
 - [x] conda-forge install instructions and a video tutorial in the documentation
 - [x] MIT license
 - [x] CSP allowance for `cdn.jsdelivr.net` so DuckDB-WASM loads its bundles in the browser build
@@ -166,9 +166,7 @@
 - [x] Expanded Python `Map` API covering more Add Data layer types
 - [x] CDN-loaded PGlite/PostGIS to shrink the Jupyter wheel and the desktop binary
 
-## v1.3: Analysis depth, real-time collaboration, story maps, scripting, and an AI assistant (current)
-
-### Processing and analysis
+## v1.3: Analysis depth, real-time collaboration, story maps, scripting, and an AI assistant
 
 - [x] Spatial Statistics toolbox under Processing
 - [x] Vector tools: Smooth, Regular grid, and Voronoi/Delaunay
@@ -179,9 +177,6 @@
 - [x] Single-band pseudocolor with classification and RGB band combination for raster styling
 - [x] Batch run and model/pipeline chaining for processing tools
 - [x] Network analysis: isochrones, service areas, and origin–destination cost matrices
-
-### Data, layers, and export
-
 - [x] Collapsible layer groups/folders in the layer panel
 - [x] glTF/GLB 3D model layers placed at coordinates
 - [x] Client-side vector tiling for large local vector layers
@@ -190,32 +185,99 @@
 - [x] Shapefile and GeoPackage export
 - [x] Apache Sedona as an additional SQL Workspace engine
 - [x] Batch geocoding and reverse geocoding tools, with a multi-provider geocoding abstraction
-
-### Collaboration, story maps, and sharing
-
 - [x] Real-time multi-user collaboration (MVP) backed by a Cloudflare Worker
 - [x] Scroll-driven story map builder, presenter, and standalone HTML export
 - [x] User-editable legend for the print layout
 - [x] Field statistics summary panel in the attribute table
-
-### AI and scripting
-
 - [x] AI Segmentation toolbox via [segment-geospatial](https://github.com/opengeos/segment-geospatial) (SamGeo) and Meta's SAM 3, proxied through the sidecar to a separate `samgeo-api` model server
 - [x] Natural-language GIS assistant (Strands agent) that turns plain-English requests into auditable, undoable GeoLibre operations
 - [x] Python automation API and an in-app Python Console
 - [x] Python package: local raster, marker/cluster, and choropleth APIs; `split_map`, `add_legend`, and `add_colorbar` helpers; typed read-back of selected/drawn features; and `to_html` export
-
-### Mobile, offline, and Android
-
+- [x] Homebrew Cask packaging for macOS
 - [x] Native Android app from the same codebase via Tauri v2 mobile, with a CI workflow that builds signed, per-ABI release APKs (~40 MB) — see [Android](android.md)
 - [x] `isMobile()` feature-gating that hides desktop-process tools (Whitebox, Raster, Conversion, AI Segmentation, PostgreSQL/Martin) on Android so nothing is shown that cannot run
 - [x] Responsive, touch-friendly mobile layout: Layers/Style panels overlay the map as slide-over sheets on phones, pointer-event (touch) panel resizing, and safe-area insets so the toolbar clears the system status bar
 - [x] Download Offline Area tool that pre-caches the current map view's basemap tiles into the service-worker cache
 - [x] Service-worker caching of the CDN-loaded Pyodide and PGlite/PostGIS engines so browser SQL and Python keep working offline after first use
 
-### Packaging
+## v1.4: Jupyter beside the map, spectral indices, georeferencing, and field collection
 
-- [x] Homebrew Cask packaging for macOS
+- [x] Resizable, collapsible Notebook panel docked beside the map: the web build embeds a self-hosted JupyterLite site (in-browser Pyodide kernel) and the desktop build launches a uv-managed JupyterLab server, both seeded with a runnable Welcome tour. Notebook cells drive the live map through the shared scripting bridge via an auto-loaded `geolibre` client, and the JupyterLite theme follows the app theme — see [Notebook Panel](notebook.md)
+- [x] Spectral Index toolbox under Processing → Raster (NDVI, GNDVI, NDWI, NDMI, NDBI, NBR, EVI, and SAVI) with Sentinel-2, Landsat 8-9, NAIP, and custom band layouts and a reflectance-scale knob, evaluated client-side via geotiff.js or on the rasterio sidecar through the existing raster calculator
+- [x] Raster Georeferencer (Processing → Georeferencing): pin a non-georeferenced image to the map with ground control points, using a least-squares affine fit and per-GCP and RMS residuals, added as a corner-pinned overlay that persists in the project and works offline
+- [x] Field Collection tool (Controls menu) for capturing point, line, and polygon observations with a per-layer custom form (text/number/date/choice fields and an optional inline photo), placed by device GPS or by tapping the map, with a floating quick-open control; captures are written to a tagged GeoJSON layer that flows into the attribute table, export, and offline use
+- [x] Runtime overrides for `VITE_PYODIDE_INDEX_URL` and `VITE_DUCKDB_SPATIAL_EXTENSION_PATH` through the existing runtime-environment system, so air-gapped or corporate deployments can point Pyodide and the DuckDB Spatial extension at internal mirrors without rebuilding the app
+
+## v1.5: Dashboards, in-browser Whitebox, map navigation history, and signed macOS installers
+
+- [x] Dashboard panel of chart widgets that summarizes the loaded layers at a glance, with configurable charts and a collapsible layout that docks alongside the map
+- [x] Whitebox toolbox now runs entirely in the browser through a WebAssembly runtime with raster I/O, so its tools (and GeoLibre's own WASM raster tools, now surfaced in the same toolbox) work with no Python sidecar
+- [x] Print layout composer gained an explicit map-scale input, a title block with editable title and footer, page-size controls, and a custom print extent, with more reliable preview rendering for production-quality PNG and PDF map exports
+- [x] Time Slider can bind existing vector layers already on the map to the timeline, animating their time-series attributes without re-importing the data
+- [x] New View menu with viewport history navigation (step back and forward through previous map extents), a reset pitch and bearing control with a rotation indicator, a distinct north arrow in place of the ambiguous compass, a lock indicator when map bounds are restricted, and a refined default set of top-right map controls
+- [x] Saved service library for web-service layers, so frequently used WMS, WFS, XYZ, and ArcGIS endpoints can be stored once and re-added with a click rather than re-entered each session
+- [x] Add Data dialog is now fully internationalized and accepts comma decimal separators and drag-and-dropped CSV files for coordinate data
+- [x] Inspect COG pixel values directly from the Identify icon, plus reversed and custom raster color ramps, the full colormap list, and a styling panel you can reopen from the layer actions menu
+- [x] Customizable UI profiles that tailor which menus, panels, and data sources are visible, so a deployment can present a focused subset of the app to its users (see [UI Profiles](ui-profiles.md))
+- [x] Bookmarks now capture the active layers alongside the camera, with selectable export, a resizable and reorderable panel, and a save-as name prompt
+- [x] Sequential route (directions) network tool under Processing for computing routes through an ordered set of waypoints
+- [x] Protomaps basemaps in the New map dialog, support for stacking multiple raster basemaps, and basemap element visibility presets in the layer control
+- [x] Spinning Globe panel under Atmospheric Effects and customizable atmosphere halo and deep-space colors for the globe view
+- [x] Notebook panel can split the workspace 50/50 with the map and auto-collapse the Style panel for more room, and the attribute table gains a column explorer for finding and toggling fields in wide tables
+- [x] USGS LiDAR plugin replaces the previous LiDAR Viewer for browsing and loading USGS 3DEP point-cloud data, imported KML and KMZ layers honor their embedded symbology, and vector strokes can be sized in scale-proportional meters
+- [x] macOS desktop installers are now signed with an Apple Developer ID certificate and notarized by Apple, so they open without a Gatekeeper workaround, with a generator for submitting GeoLibre to the official Homebrew cask (see [Downloads](downloads.md))
+
+## v1.6: Multi-map layouts, advanced symbology and labeling, and plugin zip install
+
+- [x] Multi-map grid that splits the workspace into a grid of map views with synchronized camera movement, so you can compare basemaps, layers, or time steps side by side
+- [x] Advanced vector symbology with a rule-based renderer (filter-driven style rules), proportional symbols, fill patterns, and a built-in marker library for richer point and polygon styling
+- [x] Label engine that labels vector features by any attribute, with placement and styling controls
+- [x] Install external plugins from an uploaded zip on both desktop and web, alongside the existing manifest-URL and bundled drop-in paths, with the Manage Plugins list now sorted alphabetically
+- [x] New vector analysis tools under Processing → Vector for movement, space-time, and cell-coverage analysis
+- [x] Sample-data dropdowns standardized across every Add Data dialog, so each upstream-backed panel offers ready-to-load example datasets
+- [x] Search places box in the Layers panel footer for geocoding to a location without leaving the panel
+- [x] Accent color schemes beyond light and dark, so the UI theme can be tinted to a chosen accent color
+- [x] Swap the core basemap by double-clicking it in the layer panel
+- [x] Story map presenter gained a Reset button and auto-collapses the side panels while presenting for a cleaner full-screen story
+- [x] Progressive Share setup that separates the website and local token steps for a clearer first-time configuration
+- [x] Interactive sidecar help banners for the Whitebox toolbox and AI Segmentation that guide you when the Python sidecar is not running or fails to start
+- [x] Guided update workflow with a startup update check, update preferences, and clearer status colors
+- [x] Time Slider defaults an unspecified end date to the current date
+- [x] Windows Package Manager (winget) packaging as `OpenGeos.GeoLibre`, so the app can be installed and updated through winget
+- [x] [Microsoft Store](https://apps.microsoft.com/detail/9nwt67rv531x) listing, so Windows users can install the signed, auto-updating build directly from the Store (see [Downloads](downloads.md))
+
+## v1.7: Plugin UI host API, color ramp previews, and category-browsed Whitebox tools
+
+- [x] Plugin UI host API that lets plugins register first-class right-sidebar panels, toolbar menus, and floating panels that dock beside the built-in Style panel instead of emulating an overlay, with external plugin toolbar menus now placed after the Help menu (see [Plugin API](plugin-api.md))
+- [x] Color ramp gradient swatches in both the vector Style panel and the raster Color ramp picker, so you can see each colormap's gradient inline (on the trigger and beside every option) while choosing rather than picking from a plain list of names
+- [x] Richer vector labeling with ArcGIS-style controls (anchor, X/Y offset, rotation, wrap width, and letter case), a Duplicate labels option, and unique/concatenate modes that collapse points stacked at the same coordinate into a single deduplicated label
+- [x] Whitebox toolbox is now browsable by category directly in the Processing menu, with nested subcategory submenus, GeoLibre's own WASM tools grouped under their own subheading, an offline-bundled tool catalog for restricted environments, and tools that open the dialog preselected and scrolled into view
+- [x] On-canvas collaboration session-status badge and roster (a pulsing live dot, connected-participant count, and an expandable client list that announces joins and leaves), plus a clear "Go to map and collaborate" button so the host has a non-destructive way back to the map
+- [x] Welcome wizard is suppressed for embeds: project deep links (`?url=`) skip onboarding automatically, and a new `?welcome=0` parameter lets any embed opt out
+
+## v1.8: Camera tours, live story maps, standalone HTML export, and map annotations (current)
+
+- [x] Record an animated camera tour to video straight from the Controls menu, with a clearer keyframe layout, per-keyframe recapture, a two-step save, and the ability to save and reload the entire tour setup as a JSON file
+- [x] Story Map plugin can now compose its chapters directly on the live map instead of a separate editor, and generates a printable PDF handout of the finished story
+- [x] Export a project to a single standalone interactive HTML file that runs offline with no server, plus a project gallery for browsing and opening shared projects with one click
+- [x] Map annotation layer for drawing text, arrows, and highlights directly on the map, persisted with the project
+- [x] Gridlines overlay (renamed from Graticule) draws a coordinate grid with edge labels across the map
+- [x] Import geotagged photos as a point layer from their EXIF GPS, with manual placement and drag-to-position for photos that have no embedded coordinates
+- [x] GeoRSS feed support in Add Data, loaded from a URL or a local file
+- [x] EOX Sentinel-2 cloudless satellite imagery and Openbasiskaart added to the basemap library (Openbasiskaart via basemap-control 0.7.0)
+- [x] Right-click context menu on the map for reading coordinates and reaching quick actions without leaving the canvas
+- [x] Per-participant permissions and an in-app chat panel for real-time collaboration sessions
+- [x] Organize bookmarks into folders for tidier, grouped saved views
+- [x] Dedicated AI Providers section in Settings with per-feature provider dropdowns for choosing and configuring AI backends
+- [x] Plugin API can now register native raster and tile layers, and offers a shared-rail (replace-style) right-panel dock mode for plugin panels (see [Plugin API](plugin-api.md))
+- [x] Time Slider draws a pixel time-series chart for raster stacks, plotting a sampled pixel's value across the timeline
+- [x] Colorbar panel gains a stacking direction control, a resizable panel, and a stack-order fix for multiple colorbars
+- [x] Persistent mode banner for the Directions and Reverse Geocode tools so the active interaction mode stays visible
+- [x] Copy to Clipboard added to the Print Layout composer for pasting the rendered map straight into other apps
+- [x] Clearer Set view coordinate input workflow with support for degrees-decimal-minutes (DDM) entry
+- [x] Raster paint controls gain a greyscale toggle, a reset action, and numeric inputs, plus info icons explaining layer zoom-visibility controls
+- [x] Inline numeric opacity input in the layer control, with a fixed-name notice on the Background layer
+- [x] Windows portable zip build, so the desktop app can run without installation
 
 ## Plugin marketplace and registry (design)
 

@@ -19,7 +19,13 @@ export const DropdownMenuSubTrigger = React.forwardRef<
   <DropdownMenuPrimitive.SubTrigger
     ref={ref}
     className={cn(
-      "flex min-w-0 cursor-default select-none items-center gap-2 overflow-hidden rounded-sm px-2 py-1.5 text-sm outline-none focus:bg-accent data-[state=open]:bg-accent",
+      // Grey out when disabled, like DropdownMenuItem, but intentionally NOT
+      // `data-[disabled]:pointer-events-none`: pointer events must stay active
+      // so a disabled trigger's native `title` tooltip still fires on hover
+      // (Radix already blocks the submenu from opening while disabled). Unlike
+      // DropdownMenuItem, a disabled SubTrigger therefore still receives pointer
+      // events; callers that need clicks suppressed must handle that themselves.
+      "flex min-w-0 cursor-default select-none items-center gap-2 overflow-hidden rounded-sm px-2 py-1.5 text-sm outline-none focus:bg-accent data-[disabled]:opacity-50 data-[state=open]:bg-accent",
       inset && "pl-8",
       className,
     )}
@@ -36,24 +42,31 @@ export const DropdownMenuSubContent = React.forwardRef<
   React.ElementRef<typeof DropdownMenuPrimitive.SubContent>,
   React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.SubContent>
 >(({ className, style, ...props }, ref) => (
-  <DropdownMenuPrimitive.SubContent
-    ref={ref}
-    className={cn(
-      "z-50 max-w-[calc(100vw-1rem)] min-w-[8rem] overflow-x-hidden overflow-y-auto rounded-md border bg-popover p-1 text-popover-foreground shadow-lg",
-      className,
-    )}
-    style={{
-      // Cap to the visible viewport on mobile: dvh tracks the dynamic viewport
-      // and subtracting the safe-area insets keeps the menu (and its scrollable
-      // overflow) within the area not covered by the system status/navigation
-      // bars, so long menus scroll instead of clipping under them. On desktop/web
-      // dvh == vh and the insets are 0, so behavior is unchanged.
-      maxHeight:
-        "min(var(--radix-dropdown-menu-content-available-height, 100dvh), calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 1rem))",
-      ...style,
-    }}
-    {...props}
-  />
+  // Portal to the body so a nested submenu is not a DOM descendant of its parent
+  // submenu's scroll box. Without this, the parent's `overflow-y-auto` becomes a
+  // clipping ancestor and Radix's collision detection treats the parent's narrow
+  // width as the available space, flipping a 3rd-level submenu to the left (over
+  // its grandparent) even when there is room on the right.
+  <DropdownMenuPrimitive.Portal>
+    <DropdownMenuPrimitive.SubContent
+      ref={ref}
+      className={cn(
+        "z-50 max-w-[calc(100vw-1rem)] min-w-[8rem] overflow-x-hidden overflow-y-auto rounded-md border bg-popover p-1 text-popover-foreground shadow-lg",
+        className,
+      )}
+      style={{
+        // Cap to the visible viewport on mobile: dvh tracks the dynamic viewport
+        // and subtracting the safe-area insets keeps the menu (and its scrollable
+        // overflow) within the area not covered by the system status/navigation
+        // bars, so long menus scroll instead of clipping under them. On desktop/web
+        // dvh == vh and the insets are 0, so behavior is unchanged.
+        maxHeight:
+          "min(var(--radix-dropdown-menu-content-available-height, 100dvh), calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 1rem))",
+        ...style,
+      }}
+      {...props}
+    />
+  </DropdownMenuPrimitive.Portal>
 ));
 DropdownMenuSubContent.displayName =
   DropdownMenuPrimitive.SubContent.displayName;
@@ -101,8 +114,11 @@ DropdownMenuItem.displayName = DropdownMenuPrimitive.Item.displayName;
 
 export const DropdownMenuCheckboxItem = React.forwardRef<
   React.ElementRef<typeof DropdownMenuPrimitive.CheckboxItem>,
-  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.CheckboxItem>
->(({ className, children, checked, ...props }, ref) => (
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.CheckboxItem> & {
+    /** `"check"` (default): bare checkmark when checked. `"box"`: always-visible bordered square that fills on check. */
+    indicator?: "check" | "box";
+  }
+>(({ className, children, checked, indicator = "check", ...props }, ref) => (
   <DropdownMenuPrimitive.CheckboxItem
     ref={ref}
     className={cn(
@@ -112,11 +128,30 @@ export const DropdownMenuCheckboxItem = React.forwardRef<
     checked={checked}
     {...props}
   >
-    <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
-      <DropdownMenuPrimitive.ItemIndicator>
-        <Check className="h-4 w-4" />
-      </DropdownMenuPrimitive.ItemIndicator>
-    </span>
+    {indicator === "box" ? (
+      <span
+        className={cn(
+          "absolute left-2 flex h-4 w-4 items-center justify-center rounded-[4px] border transition-colors",
+          checked === true
+            ? "border-primary bg-primary text-primary-foreground"
+            : checked === "indeterminate"
+              ? "border-primary bg-primary/40 text-primary-foreground"
+              : "border-input",
+        )}
+      >
+        {checked === true ? (
+          <Check className="h-3 w-3" />
+        ) : checked === "indeterminate" ? (
+          <span className="h-0.5 w-2 rounded-full bg-current" />
+        ) : null}
+      </span>
+    ) : (
+      <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
+        <DropdownMenuPrimitive.ItemIndicator>
+          <Check className="h-4 w-4" />
+        </DropdownMenuPrimitive.ItemIndicator>
+      </span>
+    )}
     {children}
   </DropdownMenuPrimitive.CheckboxItem>
 ));
@@ -176,3 +211,17 @@ export const DropdownMenuSeparator = React.forwardRef<
 ));
 DropdownMenuSeparator.displayName =
   DropdownMenuPrimitive.Separator.displayName;
+
+export const DropdownMenuShortcut = ({
+  className,
+  ...props
+}: React.HTMLAttributes<HTMLSpanElement>) => (
+  <span
+    className={cn(
+      "ml-auto shrink-0 whitespace-nowrap pl-4 text-xs text-muted-foreground",
+      className,
+    )}
+    {...props}
+  />
+);
+DropdownMenuShortcut.displayName = "DropdownMenuShortcut";

@@ -1,5 +1,6 @@
 import { Input, Label } from "@geolibre/ui";
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   createXyzTileUrlTemplate,
   registerXyzTileProtocol,
@@ -7,17 +8,36 @@ import {
 } from "../../../../lib/xyz-url";
 import { DEFAULT_XYZ_URL } from "../constants";
 import { createBaseLayer } from "../helpers";
-import { AddDataSourceForm, useAddDataSource } from "../shared";
+import { ServiceLibrarySection } from "../ServiceLibrarySection";
+import {
+  serviceFieldBoolean,
+  serviceFieldString,
+  type ServiceFields,
+} from "../service-library";
+import { AddDataSourceForm, SampleDataSelect, useAddDataSource } from "../shared";
 
 export function XyzSource() {
-  const source = useAddDataSource("XYZ Layer");
-  const [xyzUrl, setXyzUrl] = useState(DEFAULT_XYZ_URL);
+  const { t } = useTranslation();
+  const source = useAddDataSource(t("addData.xyz.defaultName"));
+  const [xyzUrl, setXyzUrl] = useState("");
   const [xyzTileSize, setXyzTileSize] = useState("256");
   const [xyzShortUrl, setXyzShortUrl] = useState(false);
 
+  const getFields = (): ServiceFields => ({
+    url: xyzUrl,
+    tileSize: xyzTileSize,
+    shortUrl: xyzShortUrl,
+  });
+
+  const applyFields = (fields: ServiceFields) => {
+    setXyzUrl(serviceFieldString(fields, "url"));
+    setXyzTileSize(serviceFieldString(fields, "tileSize", "256"));
+    setXyzShortUrl(serviceFieldBoolean(fields, "shortUrl", false));
+  };
+
   const handleSubmit = source.runSubmit(async () => {
-    const name = source.layerName.trim() || "XYZ Layer";
-    if (!xyzUrl.trim()) throw new Error("Enter an XYZ tile URL template.");
+    const name = source.layerName.trim() || t("addData.xyz.defaultName");
+    if (!xyzUrl.trim()) throw new Error(t("addData.xyz.errorUrl"));
     if (xyzShortUrl) registerXyzTileProtocol();
     const tileUrl = xyzShortUrl
       ? await resolveXyzTileUrlTemplate(xyzUrl)
@@ -52,22 +72,31 @@ export function XyzSource() {
       submitDisabled={source.isSubmitting}
     >
       <div className="space-y-3">
+        <ServiceLibrarySection
+          kind="xyz"
+          layerName={source.layerName}
+          getFields={getFields}
+          onApply={(entry) => {
+            source.setLayerName(entry.name);
+            applyFields(entry.fields);
+          }}
+        />
         <div className="grid gap-3 sm:grid-cols-[1fr_7rem]">
           <div className="space-y-1.5">
-            <Label htmlFor="xyz-url">Tile URL template</Label>
+            <Label htmlFor="xyz-url">{t("addData.common.tileUrlTemplate")}</Label>
             <Input
               id="xyz-url"
               placeholder={
                 xyzShortUrl
-                  ? "https://go.example.com/layer"
-                  : "https://example.com/{z}/{x}/{y}.png"
+                  ? t("addData.xyz.shortUrlPlaceholder")
+                  : t("addData.xyz.urlPlaceholder")
               }
               value={xyzUrl}
               onChange={(event) => setXyzUrl(event.target.value)}
             />
           </div>
           <div className="space-y-1.5">
-            <Label htmlFor="xyz-tile-size">Tile size</Label>
+            <Label htmlFor="xyz-tile-size">{t("addData.common.tileSize")}</Label>
             <Input
               id="xyz-tile-size"
               inputMode="numeric"
@@ -82,8 +111,14 @@ export function XyzSource() {
             checked={xyzShortUrl}
             onChange={(event) => setXyzShortUrl(event.target.checked)}
           />
-          Short URL
+          {t("addData.xyz.shortUrl")}
         </label>
+        <SampleDataSelect
+          samples={[
+            { label: t("addData.xyz.sampleLabel"), value: { url: DEFAULT_XYZ_URL } },
+          ]}
+          onSelect={applyFields}
+        />
       </div>
     </AddDataSourceForm>
   );

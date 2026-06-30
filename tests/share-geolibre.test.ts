@@ -6,6 +6,7 @@ import {
   isShareableTitle,
   MAX_PROJECT_TITLE_LENGTH,
   resolveShareBaseUrl,
+  ShareUploadError,
   uploadProjectToShare,
 } from "../apps/geolibre-desktop/src/lib/share-geolibre";
 
@@ -13,7 +14,7 @@ const PROJECT_DTO = {
   username: "giswqs",
   slug: "my-map",
   projectUrl: "https://share.geolibre.app/giswqs/my-map",
-  viewerUrl: "https://viewer.geolibre.app/?url=https://share.geolibre.app/giswqs/my-map.geolibre.json",
+  viewerUrl: "https://web.geolibre.app/?url=https://share.geolibre.app/giswqs/my-map.geolibre.json",
   rawJsonUrl: "https://share.geolibre.app/giswqs/my-map.geolibre.json",
 };
 
@@ -158,7 +159,23 @@ describe("uploadProjectToShare", () => {
     const { fn } = fakeFetch(400, { error: "Project schema is invalid." });
     await assert.rejects(
       () => uploadProjectToShare({ ...baseArgs, fetchImpl: fn }),
-      /Project schema is invalid\./,
+      (err: ShareUploadError) =>
+        err instanceof ShareUploadError &&
+        err.code === undefined &&
+        /Project schema is invalid\./.test(err.message),
+    );
+  });
+
+  it("flags the missing-username 400 with a username-required code", async () => {
+    const { fn } = fakeFetch(400, {
+      error: "Username required before uploading projects",
+    });
+    await assert.rejects(
+      () => uploadProjectToShare({ ...baseArgs, fetchImpl: fn }),
+      (err: ShareUploadError) =>
+        err instanceof ShareUploadError &&
+        err.code === "username-required" &&
+        /username required/i.test(err.message),
     );
   });
 

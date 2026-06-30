@@ -20,26 +20,24 @@
       "map": "Mappa",
       "layout": "Layout",
       "environment": "Ambiente",
-      "project": "Progetto",
       "account": "Account"
     },
     "menu": {
       "mapPreferences": "Preferenze mappa",
       "layoutSettings": "Impostazioni layout",
       "environmentVariables": "Variabili d'ambiente",
-      "projectSettings": "Impostazioni progetto",
       "managePlugins": "Gestisci plugin",
       "urlOverrideNote": "I parametri di layout URL sovrascrivono le impostazioni salvate."
     },
     "map": {
       "constraintsTitle": "Vincoli mappa",
-      "constraintsDescription": "I limiti si applicano mentre il progetto è aperto.",
       "restrictBounds": "Limita l'estensione della mappa",
       "west": "Ovest",
       "south": "Sud",
       "east": "Est",
       "north": "Nord",
       "useCurrentView": "Usa vista corrente",
+      "useCurrentViewGlobeHint": "Passa alla proiezione di Mercatore prima di usare questa opzione. Nella proiezione Globo la mappa può ancora spostarsi leggermente oltre i limiti acquisiti.",
       "minZoom": "Zoom minimo",
       "maxZoom": "Zoom massimo",
       "maxPitch": "Inclinazione massima",
@@ -80,14 +78,6 @@
       "removeAria": "Rimuovi {{name}}",
       "errorNamePattern": "I nomi delle variabili d'ambiente devono iniziare con una lettera o un underscore e contenere solo lettere, numeri e underscore.",
       "errorDuplicate": "La variabile d'ambiente \"{{name}}\" è duplicata."
-    },
-    "project": {
-      "title": "Progetto",
-      "description": "Le impostazioni vengono salvate con il progetto `.geolibre.json`.",
-      "name": "Nome",
-      "file": "File di progetto",
-      "notSaved": "Non salvato",
-      "format": "Formato progetto"
     }
   },
   "toolbar": {
@@ -287,7 +277,7 @@
       "webServices": "Servizi web",
       "commandPalette": "Riquadro comandi",
       "openProjectFromUrl": "Apri progetto da URL",
-      "openProjectFromUrlDesc": "Carica un progetto pubblico `.geolibre.json` e aggiungilo ai progetti recenti.",
+      "openProjectFromUrlDesc": "Carica un progetto `.geolibre.json` e aggiungilo ai progetti recenti.",
       "projectUrl": "URL progetto",
       "opening": "Apertura in corso...",
       "open": "Apri",

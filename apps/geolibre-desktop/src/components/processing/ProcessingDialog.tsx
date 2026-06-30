@@ -7,7 +7,10 @@ import {
   fetchRemoteWhiteboxCatalogSnapshot,
   fetchWhiteboxStatus,
   fetchWhiteboxTools,
+  listGeolibreWasmTools,
   runWhiteboxTool,
+  runWhiteboxToolWasm,
+  outputBaseName,
   type WhiteboxJob,
   type WhiteboxLayerInput,
   type WhiteboxTool,
@@ -49,15 +52,28 @@ import {
   useRef,
   useState,
 } from "react";
+import { useTranslation } from "react-i18next";
 import {
+  isTauri,
+  openLocalDataFileWithFallback,
   pickLocalPathWithFallback,
   pickSavePathWithFallback,
   type FileDialogFilter,
 } from "../../lib/tauri-io";
+import { fetchableUrl } from "../../lib/url-utils";
 import { startGeoLibreSidecar, stopGeoLibreSidecar } from "../../lib/sidecar";
+import { SidecarHelpBanner } from "./SidecarHelpBanner";
 
 interface ProcessingDialogProps {
   mapControllerRef: React.RefObject<MapController | null>;
+  // Renders a raster tool output (a Cloud Optimized GeoTIFF, from the WASM
+  // runner) as a new map layer. Wired by the desktop shell, which owns the
+  // raster control / app API.
+  onAddRaster?: (
+    bytes: Uint8Array,
+    name: string,
+    fileName?: string,
+  ) => Promise<void> | void;
 }
 
 type ParameterValues = Record<string, unknown>;
@@ -118,6 +134,37 @@ function datasetParameterKind(dataKind: string, suffix: "in" | "out"): string {
 
 function isOutputParameter(param: WhiteboxToolParameter): boolean {
   return parameterKind(param).endsWith("_out");
+}
+
+/**
+ * Best-effort extension for a `file_out` blob, sniffed from its magic bytes.
+ * Covers the formats GeoLibre `file_out` tools emit today (GeoParquet, PNG,
+ * PMTiles); a genuinely opaque output falls back to `.bin`. Extend the sniff
+ * here if a future tool writes a recognizable text format.
+ */
+function fileOutputExtension(bytes: Uint8Array): string {
+  const matches = (sig: number[]) => sig.every((b, i) => bytes[i] === b);
+  if (matches([0x50, 0x41, 0x52, 0x31])) return "parquet"; // "PAR1"
+  if (matches([0x89, 0x50, 0x4e, 0x47])) return "png";
+  // "PMTiles"
+  if (matches([0x50, 0x4d, 0x54, 0x69, 0x6c, 0x65, 0x73])) return "pmtiles";
+  return "bin";
+}
+
+/** Save bytes to the user's downloads via a transient object URL. */
+function downloadBytes(bytes: Uint8Array, filename: string): void {
+  // Cast required: TS types Uint8Array as Uint8Array<ArrayBufferLike>, which is
+  // not directly assignable to BlobPart under this lib (mirrors DesktopShell).
+  const url = URL.createObjectURL(new Blob([bytes as BlobPart]));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  // Defer revoke so the browser can fetch the blob first (Firefox races and
+  // silently drops the download if the URL is revoked synchronously).
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 function isDataInputParameter(param: WhiteboxToolParameter): boolean {
@@ -230,6 +277,37 @@ function layerPath(layer: GeoLibreLayer): string {
   return "";
 }
 
+// Fetch a raster/LiDAR layer's underlying bytes for the in-browser WASM runner.
+// Returns null when the data is not directly fetchable (e.g. a desktop file
+// path or a tile template), in which case the caller falls back to the sidecar.
+async function fetchLayerBytes(layer: GeoLibreLayer): Promise<Uint8Array | null> {
+  const src = layer.source as Record<string, unknown>;
+  const tiles = Array.isArray(src.tiles) ? src.tiles : [];
+  // localBytesUrl is a blob URL retaining a File-loaded raster's bytes (the
+  // raster control's source.objectUrl, surfaced by the raster store sync);
+  // prefer it so locally loaded rasters are WASM-runnable.
+  const candidates = [
+    layer.metadata.localBytesUrl,
+    src.url,
+    tiles[0],
+    layer.sourcePath,
+  ];
+  for (const candidate of candidates) {
+    const url = fetchableUrl(candidate);
+    if (!url) continue;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      if (bytes.length === 0 || bytes[0] === 0x3c) continue; // 0x3c '<' = HTML
+      return bytes;
+    } catch {
+      // try the next candidate
+    }
+  }
+  return null;
+}
+
 function canUseLayerForParameter(
   layer: GeoLibreLayer,
   param: WhiteboxToolParameter,
@@ -309,9 +387,15 @@ function jobStatusTone(job: WhiteboxJob | null): string {
 
 export function ProcessingDialog({
   mapControllerRef,
+  onAddRaster,
 }: ProcessingDialogProps) {
+  const { t } = useTranslation();
   const open = useAppStore((s) => s.ui.processingOpen);
   const setProcessingOpen = useAppStore((s) => s.setProcessingOpen);
+  const processingInitialTool = useAppStore((s) => s.ui.processingInitialTool);
+  const setProcessingInitialTool = useAppStore(
+    (s) => s.setProcessingInitialTool,
+  );
   const layers = useAppStore((s) => s.layers);
   const addGeoJsonLayer = useAppStore((s) => s.addGeoJsonLayer);
 
@@ -320,27 +404,104 @@ export function ProcessingDialog({
   const [values, setValues] = useState<ParameterValues>({});
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState("All");
+  // Tool provenance filter: "All" | "geolibre" | "whitebox". Only meaningful in
+  // WASM mode, where GeoLibre-authored tools are mixed into the catalog.
+  const [source, setSource] = useState("All");
   const [loadingTools, setLoadingTools] = useState(false);
   const [runtimeMessage, setRuntimeMessage] = useState("");
   const [runtimeAvailable, setRuntimeAvailable] = useState<boolean | null>(null);
+  // Cache the desktop check once, matching the sibling processing dialogs
+  // (ConversionDialog, RasterToolsDialog).
+  const desktop = isTauri();
+  // Run tools locally in WebAssembly (no Python sidecar). Default on in the
+  // browser, where there is no sidecar; off under Tauri, where the sidecar is
+  // available and can read native file paths that the WASM runner cannot fetch.
+  const [runLocal, setRunLocal] = useState(!desktop);
   const [error, setError] = useState<string | null>(null);
   const [startingServer, setStartingServer] = useState(false);
   const [stoppingServer, setStoppingServer] = useState(false);
   const [job, setJob] = useState<WhiteboxJob | null>(null);
+  // True while a run is in flight. The WASM runner resolves straight to a
+  // terminal job (never "pending"/"running"), so without this flag the Run
+  // button would stay enabled mid-execution and allow concurrent runs.
+  const [runningLocal, setRunningLocal] = useState(false);
   const importedJobIdRef = useRef<string | null>(null);
+  // The selected tool's row in the left list, so a preselection arriving from the
+  // Processing menu can be scrolled into view (it may sit far down the catalog).
+  const selectedButtonRef = useRef<HTMLButtonElement>(null);
+  // A tool id queued from the Processing menu, applied once the catalog finishes
+  // loading (see the apply effect below). `wasLoadingRef` tracks whether a load
+  // has actually started, so the apply only fires on a true -> false transition.
+  const pendingInitialToolRef = useRef<string | null>(null);
+  const wasLoadingRef = useRef(false);
+  // Bytes of input files the user browsed from disk (web build, where the
+  // browser cannot expose a real path). Keyed by parameter name; consumed by
+  // the in-browser WASM runner. GeoJSON files are parsed up front so vector
+  // tools receive a FeatureCollection, matching the layer-input path.
+  const browsedInputsRef = useRef<
+    Map<string, { name: string; bytes: Uint8Array; geojson?: FeatureCollection }>
+  >(new Map());
 
-  const selectedTool = useMemo(
-    () => tools.find((tool) => tool.id === selectedToolId) ?? tools[0] ?? null,
-    [selectedToolId, tools],
+  const selectedTool = useMemo(() => {
+    const tool =
+      tools.find((item) => item.id === selectedToolId) ?? tools[0] ?? null;
+    // Drop `*args`/`**kwargs` params defensively: some upstream tools expose
+    // Python varargs that render as unusable inputs. The bundled catalog already
+    // strips these, but the live sidecar catalog may not.
+    if (!tool?.params?.some((param) => param.name?.startsWith("*"))) return tool;
+    return {
+      ...tool,
+      params: tool.params.filter((param) => !param.name?.startsWith("*")),
+    };
+  }, [selectedToolId, tools]);
+
+  // Whether any GeoLibre-authored tools are present (WASM mode), gating the
+  // source filter — pointless when every tool is from Whitebox.
+  const hasGeolibreTools = useMemo(
+    () => tools.some((tool) => tool.source === "geolibre"),
+    [tools],
   );
 
-  const categories = useMemo(() => {
-    const unique = Array.from(
-      new Set(tools.map((tool) => tool.category || "General")),
-    );
-    unique.sort((a, b) => a.localeCompare(b));
-    return ["All", ...unique];
+  // Ignore the source filter when no GeoLibre tools are present (e.g. sidecar
+  // mode), so a stale "geolibre" selection can't empty the whole list.
+  const matchesSource = useCallback(
+    (tool: WhiteboxTool) => {
+      if (source === "All" || !hasGeolibreTools) return true;
+      return (tool.source === "geolibre" ? "geolibre" : "whitebox") === source;
+    },
+    [source, hasGeolibreTools],
+  );
+
+  // Total tool count per source, for the source-filter labels.
+  const sourceCounts = useMemo(() => {
+    const geolibre = tools.filter(
+      (tool) => tool.source === "geolibre",
+    ).length;
+    return { all: tools.length, geolibre, whitebox: tools.length - geolibre };
   }, [tools]);
+
+  // Category options labelled with the number of tools in each (within the
+  // active source filter), e.g. "Conversion (37)".
+  const categories = useMemo(() => {
+    const counts = new Map<string, number>();
+    let total = 0;
+    for (const tool of tools) {
+      if (!matchesSource(tool)) continue;
+      total += 1;
+      const name = tool.category || "General";
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+    const sorted = [...counts.entries()].sort((a, b) =>
+      a[0].localeCompare(b[0]),
+    );
+    return [
+      { value: "All", label: `All (${total})` },
+      ...sorted.map(([name, count]) => ({
+        value: name,
+        label: `${name} (${count})`,
+      })),
+    ];
+  }, [tools, matchesSource]);
 
   const filteredTools = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -348,6 +509,7 @@ export function ProcessingDialog({
       if (category !== "All" && (tool.category || "General") !== category) {
         return false;
       }
+      if (!matchesSource(tool)) return false;
       if (!normalizedQuery) return true;
       return [
         tool.id,
@@ -359,11 +521,14 @@ export function ProcessingDialog({
         .toLowerCase()
         .includes(normalizedQuery);
     });
-  }, [category, query, tools]);
+  }, [category, matchesSource, query, tools]);
 
   const loadWhitebox = useCallback(async () => {
     setLoadingTools(true);
     setError(null);
+    // Reset the source filter so a stale "geolibre" selection from a previous
+    // mode doesn't silently hide tools after a reload / mode switch.
+    setSource("All");
     // Drop the in-memory snapshot so a fresh load reflects upstream catalog
     // changes; calls within this load still dedup once it is repopulated.
     clearRemoteWhiteboxCatalogSnapshotCache();
@@ -373,7 +538,11 @@ export function ProcessingDialog({
       available: boolean,
     ) => {
       try {
-        const snapshotTools = await fetchRemoteWhiteboxCatalogSnapshot();
+        // Hide locked ("pro"-tier) tools: they cannot run, so omit them from the
+        // catalog entirely rather than show them as disabled rows.
+        const snapshotTools = (await fetchRemoteWhiteboxCatalogSnapshot()).filter(
+          (tool) => !tool.locked,
+        );
         setRuntimeAvailable(available);
         setRuntimeMessage(message);
         setTools(snapshotTools);
@@ -394,6 +563,43 @@ export function ProcessingDialog({
         );
       }
     };
+
+    // In WASM mode the tools run in-browser, so skip the Python sidecar probe
+    // entirely (on the web build that request 404s to the SPA index.html, which
+    // is the "Unexpected token '<'" JSON error). Just load the catalog for the
+    // parameter UI.
+    if (runLocal) {
+      await applyRemoteCatalogSnapshot(
+        t("processing.whitebox.runningLocally"),
+        false,
+      );
+      // The GeoLibre-authored tools (write_geoparquet, delineate_depressions, …)
+      // aren't in the Whitebox catalog snapshot, so append them from the WASM
+      // binary's own manifests. WASM-only: they have no Python sidecar
+      // equivalent, hence only in the runLocal branch.
+      try {
+        const geolibreTools = await listGeolibreWasmTools();
+        if (geolibreTools.length > 0) {
+          setTools((current) => {
+            // On an id collision, prefer the GeoLibre manifest (it carries the
+            // richer param schemas) over a catalog stub.
+            const geolibreIds = new Set(geolibreTools.map((tool) => tool.id));
+            return [
+              ...current.filter((tool) => !geolibreIds.has(tool.id)),
+              ...geolibreTools,
+            ];
+          });
+          // Select the first GeoLibre tool if the snapshot was empty (otherwise
+          // applyRemoteCatalogSnapshot already picked a selection).
+          setSelectedToolId((current) => current || geolibreTools[0].id);
+        }
+      } catch (err) {
+        // Non-fatal: the catalog tools still load if the WASM enumeration fails.
+        console.warn("[GeoLibre] Could not enumerate WASM GeoLibre tools:", err);
+      }
+      setLoadingTools(false);
+      return;
+    }
 
     try {
       const status = await fetchWhiteboxStatus();
@@ -431,11 +637,13 @@ export function ProcessingDialog({
       } catch {
         // Keep the live catalog when the optional parameter fallback is unavailable.
       }
-      setTools(nextTools);
+      // Hide locked ("pro"-tier) tools: they cannot run, so omit them entirely.
+      const freeTools = nextTools.filter((tool) => !tool.locked);
+      setTools(freeTools);
       setSelectedToolId((current) =>
-        nextTools.some((tool) => tool.id === current)
+        freeTools.some((tool) => tool.id === current)
           ? current
-          : nextTools[0]?.id ?? "",
+          : freeTools[0]?.id ?? "",
       );
     } catch (err) {
       setRuntimeAvailable(false);
@@ -448,15 +656,60 @@ export function ProcessingDialog({
     } finally {
       setLoadingTools(false);
     }
-  }, []);
+  }, [runLocal, t]);
 
   useEffect(() => {
     if (!open) return;
     void loadWhitebox();
   }, [loadWhitebox, open]);
 
+  // When the dialog is opened from a Processing-menu category submenu, the store
+  // carries the chosen tool id. Stash it in a ref and clear the filters that
+  // could hide it; the apply effect below selects it once the catalog is loaded.
+  // We can't select eagerly here: the catalog loads async, and a GeoLibre WASM
+  // tool is appended only after the Whitebox snapshot, whose loader resets the
+  // selection to its first tool whenever the pending id is not (yet) present.
+  useEffect(() => {
+    if (!open || !processingInitialTool) return;
+    pendingInitialToolRef.current = processingInitialTool;
+    setProcessingInitialTool(null);
+    setCategory("All");
+    setSource("All");
+    setQuery("");
+  }, [open, processingInitialTool, setProcessingInitialTool]);
+
+  // Apply the pending preselection once a catalog load completes (loadingTools
+  // goes true -> false), when `tools` is final and includes the async GeoLibre
+  // WASM tools. Keying on the transition avoids firing on the first render, when
+  // loadingTools is still false only because the load has not started yet.
+  useEffect(() => {
+    if (loadingTools) {
+      wasLoadingRef.current = true;
+      return;
+    }
+    if (!wasLoadingRef.current) return;
+    wasLoadingRef.current = false;
+    const pending = pendingInitialToolRef.current;
+    if (!pending) return;
+    pendingInitialToolRef.current = null;
+    if (tools.some((tool) => tool.id === pending)) {
+      setSelectedToolId(pending);
+    }
+  }, [loadingTools, tools]);
+
+  // Keep the highlighted row visible: when the selection changes (e.g. a tool
+  // preselected from the menu lands deep in the catalog), scroll its list row
+  // into view. "nearest" leaves an already-visible row untouched.
+  useEffect(() => {
+    if (loadingTools) return;
+    selectedButtonRef.current?.scrollIntoView({ block: "nearest" });
+  }, [selectedToolId, loadingTools, filteredTools]);
+
   useEffect(() => {
     setValues(createDefaultValues(selectedTool));
+    // Drop any browsed input bytes from the previous tool so they cannot be
+    // silently reused by a same-named parameter on the new tool.
+    browsedInputsRef.current.clear();
     setJob(null);
     importedJobIdRef.current = null;
   }, [selectedTool?.id]);
@@ -489,18 +742,44 @@ export function ProcessingDialog({
   }, [job]);
 
   const updateValue = (name: string, value: unknown) => {
+    // Any manual change (typing a path, picking a layer) invalidates a
+    // previously browsed file's bytes for this parameter.
+    browsedInputsRef.current.delete(name);
     setValues((prev) => ({ ...prev, [name]: value }));
   };
+
+  // Stash a browsed input file's bytes and show its name in the field. Used by
+  // the path-browse button in the web build, where the WASM runner reads bytes
+  // directly instead of a (non-existent in the browser) filesystem path.
+  const handlePickInputFile = useCallback(
+    (paramName: string, fileName: string, bytes: Uint8Array) => {
+      let geojson: FeatureCollection | undefined;
+      if (/\.(geojson|json)$/i.test(fileName)) {
+        try {
+          const parsed = JSON.parse(new TextDecoder().decode(bytes));
+          if (isFeatureCollection(parsed)) geojson = parsed;
+        } catch {
+          // not valid JSON; fall back to raw bytes
+        }
+      }
+      browsedInputsRef.current.set(paramName, { name: fileName, bytes, geojson });
+      setValues((prev) => ({ ...prev, [paramName]: fileName }));
+    },
+    [],
+  );
 
   const importGeoJsonOutputs = useCallback(
     async (nextJob: WhiteboxJob) => {
       if (importedJobIdRef.current === nextJob.id) return;
       importedJobIdRef.current = nextJob.id;
-      const entries = Object.entries(nextJob.outputs)
-        .map(([name, value]) => [name, outputPath(value)] as const)
-        .filter((entry): entry is readonly [string, string] =>
-          Boolean(entry[1] && isJsonOutputPath(entry[1])),
-        );
+      // The sidecar returns output paths (fetched over HTTP); the WASM runner
+      // returns the GeoJSON inline. Handle both: keep inline FeatureCollections,
+      // else keep JSON output paths to fetch.
+      const entries = Object.entries(nextJob.outputs).filter(([, value]) => {
+        if (isFeatureCollection(value)) return true;
+        const path = outputPath(value);
+        return Boolean(path && isJsonOutputPath(path));
+      });
       // Resolve the producing tool from the job itself, not the live
       // `selectedTool`, so switching tools while a job finishes does not
       // mislabel the imported layer.
@@ -508,21 +787,46 @@ export function ProcessingDialog({
       const jobToolLabel = jobTool
         ? toolLabel(jobTool)
         : humanize(nextJob.tool_id);
-      for (const [name, path] of entries) {
-        const data = await fetchWhiteboxJsonOutput(path);
+      for (const [name, value] of entries) {
+        const path = isFeatureCollection(value) ? "" : (outputPath(value) ?? "");
+        const data = isFeatureCollection(value)
+          ? value
+          : await fetchWhiteboxJsonOutput(path);
         if (!isFeatureCollection(data)) continue;
         const layerId = addGeoJsonLayer(
           `${jobToolLabel} ${humanize(name)}`,
           data,
-          path,
+          path || undefined,
         );
         const layer = useAppStore
           .getState()
           .layers.find((item) => item.id === layerId);
         if (layer) mapControllerRef.current?.fitLayer(layer);
       }
+
+      // Binary outputs come back from the WASM runner inline. Raster (COG) bytes
+      // become a new raster layer; a `file_out` (e.g. write_geoparquet .parquet,
+      // a rendered .png, a .pmtiles) is not a GeoTIFF, so download it instead of
+      // handing it to the raster loader.
+      for (const [name, value] of Object.entries(nextJob.outputs)) {
+        if (!(value instanceof Uint8Array)) continue;
+        const param = jobTool?.params?.find((item) => item.name === name);
+        if (param && parameterKind(param) === "file_out") {
+          const label = `${jobToolLabel} ${humanize(name)}`.replace(/\s+/g, "_");
+          downloadBytes(value, `${label}.${fileOutputExtension(value)}`);
+        } else if (onAddRaster) {
+          // Display name stays human-readable; the file name matches the actual
+          // WASM output path (e.g. fill_depressions_wang_and_liu_output.tif), so
+          // the layer's sourcePath lines up with the path shown in the panel.
+          await onAddRaster(
+            value,
+            `${jobToolLabel} ${humanize(name)}`,
+            `${outputBaseName(nextJob.tool_id, name)}.tif`,
+          );
+        }
+      }
     },
-    [addGeoJsonLayer, mapControllerRef, tools],
+    [addGeoJsonLayer, mapControllerRef, onAddRaster, tools],
   );
 
   useEffect(() => {
@@ -538,6 +842,10 @@ export function ProcessingDialog({
     if (!selectedTool || selectedTool.locked) return;
     setError(null);
     importedJobIdRef.current = null;
+    // Flag "running" before any prep so the Run button shows its busy state
+    // immediately (input fetching can take a moment, and the local WASM run then
+    // blocks the main thread).
+    setRunningLocal(true);
     const parameters: Record<string, unknown> = {};
     const layerInputs: Record<string, WhiteboxLayerInput> = {};
 
@@ -549,19 +857,44 @@ export function ProcessingDialog({
         (value === undefined || value === null || value === "")
       ) {
         setError(`Missing required parameter: ${parameterLabel(param)}`);
+        setRunningLocal(false);
         return;
+      }
+
+      // A file browsed from disk in the web build: feed its bytes (or parsed
+      // GeoJSON) straight to the WASM runner instead of an unresolvable path.
+      const browsed = browsedInputsRef.current.get(param.name);
+      if (browsed && isDataInputParameter(param)) {
+        const kind = parameterKind(param);
+        layerInputs[param.name] = browsed.geojson
+          ? { name: browsed.name, kind, geojson: browsed.geojson }
+          : { name: browsed.name, kind, bytes: browsed.bytes };
+        continue;
       }
 
       if (typeof value === "string" && value.startsWith(LAYER_TOKEN_PREFIX)) {
         const layerId = value.slice(LAYER_TOKEN_PREFIX.length);
         const layer = layers.find((item) => item.id === layerId);
         if (!layer) continue;
-        if (layer.geojson && parameterKind(param) === "vector_in") {
+        const kind = parameterKind(param);
+        if (layer.geojson && kind === "vector_in") {
           layerInputs[param.name] = {
             name: layer.name,
-            kind: parameterKind(param),
+            kind,
             geojson: layer.geojson,
           };
+        } else if (runLocal && (kind === "raster_in" || kind === "lidar_in")) {
+          // WASM runs in-browser: pass the layer's actual bytes (fetched here),
+          // not a path. When the bytes are not fetchable in the browser (e.g. a
+          // desktop file path), fall back to the path: the WASM runner tries to
+          // fetch it as a URL and, failing that, surfaces a clear "data is not
+          // fetchable here; turn off Run locally" error (see wasm-client.ts).
+          const bytes = await fetchLayerBytes(layer);
+          if (bytes) {
+            layerInputs[param.name] = { name: layer.name, kind, bytes };
+          } else {
+            parameters[param.name] = layerPath(layer);
+          }
         } else {
           parameters[param.name] = layerPath(layer);
         }
@@ -571,20 +904,31 @@ export function ProcessingDialog({
     }
 
     try {
+      const request = {
+        tool_id: selectedTool.id,
+        parameters,
+        tool: selectedTool,
+        layer_inputs: layerInputs,
+        include_pro: false,
+        tier: "open",
+      };
+      // The local WASM runner executes synchronously on the main thread, so yield
+      // twice to the browser first: this lets React commit and paint the Run
+      // button's busy state before the run blocks rendering.
+      if (runLocal) {
+        await new Promise((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(resolve)),
+        );
+      }
       setJob(
-        await runWhiteboxTool({
-          tool_id: selectedTool.id,
-          parameters,
-          tool: selectedTool,
-          layer_inputs: layerInputs,
-          include_pro: false,
-          tier: "open",
-        }),
+        await (runLocal ? runWhiteboxToolWasm(request) : runWhiteboxTool(request)),
       );
     } catch (err) {
       setError(
         err instanceof Error ? err.message : "Could not start Whitebox tool.",
       );
+    } finally {
+      setRunningLocal(false);
     }
   };
 
@@ -620,7 +964,8 @@ export function ProcessingDialog({
     }
   };
 
-  const running = Boolean(job && RUNNING_JOB_STATUSES.has(job.status));
+  const running =
+    runningLocal || Boolean(job && RUNNING_JOB_STATUSES.has(job.status));
   const serverBusy = loadingTools || startingServer || stoppingServer;
 
   return (
@@ -666,7 +1011,11 @@ export function ProcessingDialog({
               </Button>
             </div>
 
-            {runtimeAvailable !== true && (
+            {/* The processing server is a local Python process that only the
+                desktop app can spawn or stop. In the browser these buttons
+                would always fail, and a same-origin sidecar (when deployed) is
+                auto-detected without them, so gate both on the desktop build. */}
+            {desktop && runtimeAvailable !== true && (
               <Button
                 type="button"
                 variant="outline"
@@ -682,7 +1031,7 @@ export function ProcessingDialog({
               </Button>
             )}
 
-            {runtimeAvailable === true && (
+            {desktop && runtimeAvailable === true && (
               <Button
                 type="button"
                 variant="outline"
@@ -700,11 +1049,36 @@ export function ProcessingDialog({
 
             <Select value={category} onChange={(e) => setCategory(e.target.value)}>
               {categories.map((item) => (
-                <option key={item} value={item}>
-                  {item}
+                <option key={item.value} value={item.value}>
+                  {item.label}
                 </option>
               ))}
             </Select>
+
+            {hasGeolibreTools && (
+              <Select
+                value={source}
+                // Reset the category too: a category with no tools in the newly
+                // chosen source would otherwise leave the list empty.
+                onChange={(e) => {
+                  setSource(e.target.value);
+                  setCategory("All");
+                }}
+                aria-label={t("processing.whitebox.filterBySource")}
+              >
+                <option value="All">
+                  {t("processing.whitebox.allSources")} ({sourceCounts.all})
+                </option>
+                <option value="geolibre">
+                  {t("processing.whitebox.geolibreTools")} (
+                  {sourceCounts.geolibre})
+                </option>
+                <option value="whitebox">
+                  {t("processing.whitebox.whiteboxTools")} (
+                  {sourceCounts.whitebox})
+                </option>
+              </Select>
+            )}
 
             <ScrollArea className="min-h-0 flex-1 rounded-md border">
               <div className="divide-y">
@@ -722,6 +1096,11 @@ export function ProcessingDialog({
                     <button
                       key={tool.id}
                       type="button"
+                      ref={
+                        selectedTool?.id === tool.id
+                          ? selectedButtonRef
+                          : undefined
+                      }
                       className={cn(
                         "block w-full px-3 py-2 text-left text-sm transition-colors hover:bg-accent",
                         selectedTool?.id === tool.id && "bg-accent",
@@ -757,6 +1136,18 @@ export function ProcessingDialog({
                       : ""}
                   </p>
                 </div>
+                <label
+                  className="flex items-center gap-1.5 text-xs text-muted-foreground"
+                  title={t("processing.whitebox.runLocalHint")}
+                >
+                  <input
+                    type="checkbox"
+                    data-testid="whitebox-run-local"
+                    checked={runLocal}
+                    onChange={(e) => setRunLocal(e.target.checked)}
+                  />
+                  {t("processing.whitebox.runLocal")}
+                </label>
                 <Button
                   type="button"
                   onClick={runSelectedTool}
@@ -764,7 +1155,7 @@ export function ProcessingDialog({
                     !selectedTool ||
                     selectedTool.locked ||
                     running ||
-                    runtimeAvailable !== true
+                    (!runLocal && runtimeAvailable !== true)
                   }
                 >
                   {running ? (
@@ -772,7 +1163,9 @@ export function ProcessingDialog({
                   ) : (
                     <Play className="h-4 w-4" />
                   )}
-                  Run
+                  {running
+                    ? t("processing.whitebox.running")
+                    : t("processing.whitebox.run")}
                 </Button>
               </div>
               {selectedTool?.summary && (
@@ -803,6 +1196,9 @@ export function ProcessingDialog({
                       toolId={selectedTool.id}
                       value={values[param.name]}
                       onChange={(value) => updateValue(param.name, value)}
+                      onPickFile={(fileName, bytes) =>
+                        handlePickInputFile(param.name, fileName, bytes)
+                      }
                     />
                   ))
                 )}
@@ -810,11 +1206,29 @@ export function ProcessingDialog({
             </ScrollArea>
 
             <div className="grid gap-2 border-t pt-3">
-              {error && (
-                <p className="flex items-center gap-2 text-sm text-destructive">
-                  <AlertCircle className="h-4 w-4" />
-                  {error}
-                </p>
+              {/* Sidecar mode but the server is unreachable: show interactive
+                  troubleshooting with a one-click switch to the WASM runner.
+                  Otherwise fall back to a plain error line (e.g. a parameter or
+                  tool-run error that has nothing to do with the sidecar). */}
+              {!runLocal && runtimeAvailable === false ? (
+                <SidecarHelpBanner
+                  isDesktop={desktop}
+                  error={error}
+                  onRunLocally={() => {
+                    // Clear the stale sidecar error in the same batch as the
+                    // mode switch, so it cannot flash as a plain error line on
+                    // the render before loadWhitebox resets it.
+                    setError(null);
+                    setRunLocal(true);
+                  }}
+                />
+              ) : (
+                error && (
+                  <p className="flex items-center gap-2 text-sm text-destructive">
+                    <AlertCircle className="h-4 w-4" />
+                    {error}
+                  </p>
+                )
               )}
               {job && (
                 <JobOutputPanel job={job} />
@@ -869,6 +1283,7 @@ interface ParameterFieldProps {
   param: WhiteboxToolParameter;
   layers: GeoLibreLayer[];
   onChange: (value: unknown) => void;
+  onPickFile?: (fileName: string, bytes: Uint8Array) => void;
   toolId: string;
   value: unknown;
 }
@@ -877,6 +1292,7 @@ function ParameterField({
   param,
   layers,
   onChange,
+  onPickFile,
   toolId,
   value,
 }: ParameterFieldProps) {
@@ -927,6 +1343,7 @@ function ParameterField({
           param={param}
           value={valueText}
           onChange={onChange}
+          onPickFile={onPickFile}
         />
       ) : isPathParameter(param) ? (
         <PathPickerInput
@@ -935,6 +1352,7 @@ function ParameterField({
           toolId={toolId}
           value={valueText}
           onChange={onChange}
+          onPickFile={onPickFile}
         />
       ) : kind === "int" || kind === "double" ? (
         <NumberStepperInput
@@ -1018,6 +1436,7 @@ interface LayerOrPathInputProps {
   id: string;
   layers: GeoLibreLayer[];
   onChange: (value: unknown) => void;
+  onPickFile?: (fileName: string, bytes: Uint8Array) => void;
   param: WhiteboxToolParameter;
   value: string;
 }
@@ -1026,6 +1445,7 @@ function LayerOrPathInput({
   id,
   layers,
   onChange,
+  onPickFile,
   param,
   value,
 }: LayerOrPathInputProps) {
@@ -1055,6 +1475,7 @@ function LayerOrPathInput({
         mode="open"
         param={param}
         onPick={(path) => onChange(path)}
+        onPickFile={onPickFile}
       />
     </div>
   );
@@ -1063,6 +1484,7 @@ function LayerOrPathInput({
 interface PathPickerInputProps {
   id: string;
   onChange: (value: unknown) => void;
+  onPickFile?: (fileName: string, bytes: Uint8Array) => void;
   param: WhiteboxToolParameter;
   toolId: string;
   value: string;
@@ -1071,6 +1493,7 @@ interface PathPickerInputProps {
 function PathPickerInput({
   id,
   onChange,
+  onPickFile,
   param,
   toolId,
   value,
@@ -1088,6 +1511,7 @@ function PathPickerInput({
         param={param}
         toolId={toolId}
         onPick={(path) => onChange(path)}
+        onPickFile={onPickFile}
       />
     </div>
   );
@@ -1097,6 +1521,7 @@ interface PathBrowseButtonProps {
   disabled?: boolean;
   mode: "open" | "save";
   onPick: (path: string) => void;
+  onPickFile?: (fileName: string, bytes: Uint8Array) => void;
   param: WhiteboxToolParameter;
   toolId?: string;
 }
@@ -1105,23 +1530,45 @@ function PathBrowseButton({
   disabled = false,
   mode,
   onPick,
+  onPickFile,
   param,
   toolId = "whitebox",
 }: PathBrowseButtonProps) {
   const pickPath = async () => {
     const filters = pathFiltersForParameter(param);
-    const path =
-      mode === "save"
-        ? await pickSavePathWithFallback({
-            defaultName: defaultOutputName(toolId, param),
-            filters,
-          })
-        : await pickLocalPathWithFallback({
-            accept: acceptForParameter(param),
-            directory: isDirectoryParameter(param),
-            filters,
-          });
-    if (path) onPick(path);
+    if (mode === "save") {
+      const path = await pickSavePathWithFallback({
+        defaultName: defaultOutputName(toolId, param),
+        filters,
+      });
+      if (path) onPick(path);
+      return;
+    }
+
+    const path = await pickLocalPathWithFallback({
+      accept: acceptForParameter(param),
+      directory: isDirectoryParameter(param),
+      filters,
+    });
+    if (path) {
+      onPick(path);
+      return;
+    }
+
+    // The browser cannot expose a real filesystem path, so pickLocalPath returns
+    // null there. Fall back to reading the chosen file's bytes for the in-browser
+    // WASM runner. (Skipped under Tauri, where null just means the user
+    // cancelled the native dialog, and for directory parameters.)
+    if (!isTauri() && onPickFile && !isDirectoryParameter(param)) {
+      const picked = await openLocalDataFileWithFallback({
+        accept: acceptForParameter(param),
+        filters,
+        readBinary: true,
+      });
+      if (picked?.data) {
+        onPickFile(picked.path, new Uint8Array(picked.data));
+      }
+    }
   };
 
   return (
