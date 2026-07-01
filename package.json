@@ -21,6 +21,7 @@
     "build": "npm run build -w geolibre-desktop",
     "build:jupyterlite": "node scripts/build-jupyterlite.mjs",
     "build:embed": "node scripts/build-embed.mjs",
+    "build:sce": "node scripts/build-sce.mjs",
     "typecheck": "npm run build",
     "lint": "eslint apps packages workers tests",
     "test": "npm run test:frontend",

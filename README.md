@@ -201,6 +201,14 @@ docker build --build-arg GEOLIBRE_APP_BASE=/geolibre/ -t geolibre .
 
 The container always serves the app from its root path. The build argument only sets the URL prefix that the app expects, so subpath deployments also require a reverse proxy in front of the container that strips the prefix before forwarding requests (for example, nginx `proxy_pass http://geolibre/;` with a trailing slash).
 
+For the SCE nginx deployment (served at `/geolibre/` via a docker volume mount from `apps/geolibre-desktop/dist/`), build a static bundle with the base already baked in:
+
+```bash
+npm run build:sce
+```
+
+This runs the web build with `GEOLIBRE_APP_BASE=/geolibre/` and fails if the base was not applied, so a root-based build (which would 404 under `/geolibre/`) can never be shipped by mistake after an upstream merge. It reads `VITE_ARCGIS_CLIENT_ID` from the environment or `.env.local` so the ArcGIS Online sign-in stays configured.
+
 ## SQL Workspace
 
 The SQL Workspace runs DuckDB SQL (with the Spatial extension loaded, so `ST_*` functions are available) directly in the browser against your loaded layers and remote data. Open it from the Processing menu.
