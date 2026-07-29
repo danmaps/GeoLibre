@@ -1,9 +1,24 @@
 export * from "./types";
+export * from "./diagram";
+export * from "./marker-shape";
+export * from "./photo";
+export * from "./ellipsoids";
+export * from "./geojson-z";
 export * from "./color-ramp";
 export * from "./paths";
 export * from "./routing";
 export * from "./vector-color";
+export * from "./expressions";
+export * from "./external-native-paint";
+export * from "./attribute-form";
+export * from "./joins";
+export * from "./virtual-fields";
+export * from "./selection";
+export * from "./scale-units";
 export * from "./project";
+export * from "./style-library";
+export * from "./layer-defaults";
+export * from "./layer-style-clipboard";
 export * from "./layer-groups";
 export { createSampleStoryMap } from "./storymap-sample";
 export {
@@ -21,6 +36,7 @@ export {
   useAppStore,
   type AppState,
   type ConversionToolKind,
+  type GpsStatusFix,
   type NetworkToolKind,
   type RasterToolKind,
   type StatisticsToolKind,
@@ -62,6 +78,7 @@ export {
   csvRowsToGeocodeRequests,
   geocodeForward,
   geocodeReverse,
+  setGeocodingFetch,
   type GeocoderConfig,
   type GeocodingProvider,
   type GeocodingProviderId,
@@ -73,8 +90,20 @@ export {
   type ReverseGeocodeDisplay,
 } from "./geocoding";
 export {
+  getCesiumIonToken,
+  getGoogleMapsApiKey,
+  getMapboxAccessToken,
   getProtomapsApiKey,
   getProtomapsStyleUrl,
   getRuntimeEnvironment,
   getSpatialExtensionPath,
 } from "./runtime-env";
+export {
+  GOOGLE_MAPS_API_KEY_HEADER,
+  googleMapsApiKeyHeaderValue,
+  isGooglePhotorealisticTilesetUrl,
+  nonEmptyRecord,
+  persistedThreeDTilesRequestHeaders,
+  resolveThreeDTilesRequestHeaders,
+  stripGoogleMapsApiKeyHeader,
+} from "./three-d-tiles";

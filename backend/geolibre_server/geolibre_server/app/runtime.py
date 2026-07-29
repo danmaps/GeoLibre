@@ -60,6 +60,10 @@ def _clean_env() -> dict[str, str]:
     """Return a Python subprocess environment suitable for extension imports."""
     env = dict(os.environ)
     env.pop("PYTHONHOME", None)
+    # PyPI geospatial wheels bundle a matching PROJ database. Inherited search
+    # paths can redirect them to an absent or incompatible system installation.
+    env.pop("PROJ_DATA", None)
+    env.pop("PROJ_LIB", None)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     return env
@@ -117,10 +121,7 @@ def _venv_python(env_dir: Path) -> Path:
 
 def _download_to_temp(url: str, suffix: str) -> Path:
     """Download a URL to a temporary file and return its path."""
-    target = (
-        Path(tempfile.mkdtemp(prefix="geolibre-uv-installer-"))
-        / f"install{suffix}"
-    )
+    target = Path(tempfile.mkdtemp(prefix="geolibre-uv-installer-")) / f"install{suffix}"
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "GeoLibre/0.7 uv-bootstrap"},
@@ -129,9 +130,7 @@ def _download_to_temp(url: str, suffix: str) -> Path:
         with urllib.request.urlopen(request, timeout=60) as response:
             target.write_bytes(response.read())
     except Exception as exc:
-        raise RuntimeBootstrapError(
-            f"Could not download uv installer from {url}: {exc}"
-        ) from exc
+        raise RuntimeBootstrapError(f"Could not download uv installer from {url}: {exc}") from exc
     return target
 
 
@@ -197,9 +196,7 @@ def _install_managed_uv_locked(uv: Path) -> str:
         detail = completed.stderr.strip() or completed.stdout.strip()
         raise RuntimeBootstrapError(f"uv installer failed. {detail}")
     if not _is_valid_managed_uv(uv):
-        raise RuntimeBootstrapError(
-            f"uv installer did not create a runnable binary at {uv}"
-        )
+        raise RuntimeBootstrapError(f"uv installer did not create a runnable binary at {uv}")
     return str(uv)
 
 
@@ -210,9 +207,7 @@ def _uv_executable() -> str:
         resolved = str(Path(configured).expanduser())
         if os.path.isfile(resolved) and os.access(resolved, os.X_OK):
             return resolved
-        raise RuntimeBootstrapError(
-            f"Configured uv executable is not valid: {configured}"
-        )
+        raise RuntimeBootstrapError(f"Configured uv executable is not valid: {configured}")
     uv = shutil.which("uv")
     if uv:
         return uv

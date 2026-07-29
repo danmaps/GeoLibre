@@ -15,17 +15,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      # Reads package-lock.json and queries the registry — no install needed, so
+      # this stays fast. Blocking at `high` catches high/critical advisories
+      # without reddening CI for the moderate/low noise Dependabot handles via PR.
+      # Scoped to production deps: `--omit=dev` drops advisories that only reach
+      # local build/dev tooling (e.g. sharp/libvips via wrangler+miniflare, which
+      # never ships in a GeoLibre artifact), while still blocking anything that
+      # reaches users. Dependabot bumps the dev toolchain separately.
+      - name: Audit npm dependencies (high and critical)
+        run: npm audit --omit=dev --audit-level=high
+
   e2e:
     name: E2E smoke (Playwright)
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -40,7 +64,7 @@ jobs:
 
       - name: Cache Playwright browsers
         id: pw-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
@@ -60,7 +84,7 @@ jobs:
 
       - name: Upload Playwright report
         if: ${{ failure() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-report
           path: |
@@ -73,12 +97,12 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -104,7 +128,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -158,6 +182,38 @@ jobs:
         # The full test suite needs the optional engines; without them the
         # vector/raster/SQL/ML tests skip themselves and CI is green but hollow.
         run: python -m pip install -e "backend/geolibre_server[test]"
+
+      # backend/geolibre_server/uv.lock is committed because the desktop
+      # installers bundle that project and `uv run --frozen` it from a read-only
+      # resource directory at app startup. A lock that has drifted from
+      # pyproject.toml would make the bundled sidecar and the Notebook panel
+      # fail to start on users' machines, with nothing failing here. Fail the
+      # build instead, so a dependency edit has to land with a refreshed lock
+      # (`uv lock --project backend/geolibre_server`).
+      - name: Check the bundled sidecar lockfile is in sync
+        run: |
+          python -m pip install uv
+          uv lock --check --project backend/geolibre_server
+
+      # Audit the resolved backend environment for known advisories. Non-blocking
+      # (continue-on-error): the sidecar pulls a heavy geospatial/ML dependency
+      # tree whose transitive advisories are often upstream and not immediately
+      # fixable, so this surfaces them without halting the release cadence.
+      # Dependabot opens the fix PRs; this step keeps the signal visible in CI.
+      #
+      # pip-audit runs in a throwaway venv against a frozen snapshot of the test
+      # environment (--exclude-editable drops the local geolibre_server checkout,
+      # which isn't on PyPI). This keeps its own dependency resolution from
+      # mutating the environment the "Run CI gate" step below tests against.
+      - name: Audit Python dependencies (advisory, non-blocking)
+        continue-on-error: true
+        run: |
+          python -m pip freeze --exclude-editable > /tmp/backend-freeze.txt
+          python -m venv /tmp/pip-audit-venv
+          /tmp/pip-audit-venv/bin/pip install --quiet pip-audit
+          /tmp/pip-audit-venv/bin/pip-audit \
+            --progress-spinner off \
+            --requirement /tmp/backend-freeze.txt
 
       # Drive the documented `npm run ci` gate directly (lint -> build ->
       # frontend+worker+backend coverage -> rust) so this workflow cannot drift

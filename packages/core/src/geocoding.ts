@@ -25,13 +25,13 @@ import { getRuntimeEnvironment } from "./runtime-env";
  *
  * Browser fetch cannot set `User-Agent`/`Referer`, so the app is identified to
  * Nominatim via the optional `email` query parameter plus the automatically
- * sent `Referer`. See docs/user-guide/data-integrations.md#geocoding.
+ * sent `Referer`. The desktop build overrides this with a native (Tauri) fetch
+ * via {@link setGeocodingFetch} — see the note there. See
+ * docs/user-guide/data-integrations.md#geocoding.
  */
 
-export const DEFAULT_FORWARD_GEOCODE_ENDPOINT =
-  "https://nominatim.openstreetmap.org/search";
-export const DEFAULT_REVERSE_GEOCODE_ENDPOINT =
-  "https://nominatim.openstreetmap.org/reverse";
+export const DEFAULT_FORWARD_GEOCODE_ENDPOINT = "https://nominatim.openstreetmap.org/search";
+export const DEFAULT_REVERSE_GEOCODE_ENDPOINT = "https://nominatim.openstreetmap.org/reverse";
 
 /** Host whose public usage policy (1 req/sec, bulk limits) we must respect. */
 export const NOMINATIM_PUBLIC_HOST = "nominatim.openstreetmap.org";
@@ -49,12 +49,7 @@ export const GEOCODE_DISPLAY_NAME_KEY = "geocode_display_name";
 export const GEOCODE_SCORE_KEY = "geocode_importance";
 
 /** Identifier of a selectable geocoding backend. */
-export type GeocodingProviderId =
-  | "nominatim"
-  | "pelias"
-  | "arcgis"
-  | "mapbox"
-  | "google";
+export type GeocodingProviderId = "nominatim" | "pelias" | "arcgis" | "mapbox" | "google";
 
 /** The provider used when none is configured. */
 export const DEFAULT_GEOCODING_PROVIDER_ID: GeocodingProviderId = "nominatim";
@@ -133,11 +128,7 @@ export interface GeocodingProvider {
   defaultForwardEndpoint: string;
   /** Default reverse endpoint used when the project does not override it. */
   defaultReverseEndpoint: string;
-  buildForwardUrl(
-    config: GeocoderConfig,
-    query: string,
-    options: ForwardRequestOptions,
-  ): string;
+  buildForwardUrl(config: GeocoderConfig, query: string, options: ForwardRequestOptions): string;
   parseForward(data: unknown): GeocodeMatch[];
   buildReverseUrl(
     config: GeocoderConfig,
@@ -255,9 +246,7 @@ export function buildReverseGeocodeUrl(
 }
 
 /** Map one Nominatim forward result onto a normalized match, or null. */
-function nominatimForwardResultToMatch(
-  result: NominatimForwardResult,
-): GeocodeMatch | null {
+function nominatimForwardResultToMatch(result: NominatimForwardResult): GeocodeMatch | null {
   const lat = Number(result.lat);
   const lon = Number(result.lon);
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
@@ -363,7 +352,11 @@ const nominatimProvider: GeocodingProvider = {
 
 /** Read a GeoJSON FeatureCollection's features array, or []. */
 function geojsonFeatures(data: unknown): Record<string, unknown>[] {
-  if (data && typeof data === "object" && Array.isArray((data as { features?: unknown }).features)) {
+  if (
+    data &&
+    typeof data === "object" &&
+    Array.isArray((data as { features?: unknown }).features)
+  ) {
     return (data as { features: unknown[] }).features.filter(
       (f): f is Record<string, unknown> => !!f && typeof f === "object",
     );
@@ -453,7 +446,9 @@ const arcgisProvider: GeocodingProvider = {
   },
   parseForward: (data) => {
     const candidates =
-      data && typeof data === "object" && Array.isArray((data as { candidates?: unknown }).candidates)
+      data &&
+      typeof data === "object" &&
+      Array.isArray((data as { candidates?: unknown }).candidates)
         ? ((data as { candidates: unknown[] }).candidates as Record<string, unknown>[])
         : [];
     return candidates
@@ -540,9 +535,7 @@ const mapboxProvider: GeocodingProvider = {
     return displayName
       ? {
           displayName,
-          parts: stringifyParts(
-            (feature.properties as Record<string, unknown>) ?? {},
-          ),
+          parts: stringifyParts((feature.properties as Record<string, unknown>) ?? {}),
         }
       : null;
   },
@@ -650,12 +643,8 @@ export function normalizeGeocodingProviderId(
 }
 
 /** Look up a provider by id, falling back to Nominatim for unknown ids. */
-export function getGeocodingProvider(
-  id: string | undefined | null,
-): GeocodingProvider {
-  return (
-    PROVIDERS_BY_ID.get(normalizeGeocodingProviderId(id)) ?? nominatimProvider
-  );
+export function getGeocodingProvider(id: string | undefined | null): GeocodingProvider {
+  return PROVIDERS_BY_ID.get(normalizeGeocodingProviderId(id)) ?? nominatimProvider;
 }
 
 /**
@@ -670,11 +659,8 @@ export function getGeocoderConfig(): GeocoderConfig {
   const provider = getGeocodingProvider(env.VITE_GEOCODER_PROVIDER);
   return {
     providerId: provider.id,
-    forwardEndpoint:
-      env.VITE_GEOCODER_ENDPOINT?.trim() || provider.defaultForwardEndpoint,
-    reverseEndpoint:
-      env.VITE_GEOCODER_REVERSE_ENDPOINT?.trim() ||
-      provider.defaultReverseEndpoint,
+    forwardEndpoint: env.VITE_GEOCODER_ENDPOINT?.trim() || provider.defaultForwardEndpoint,
+    reverseEndpoint: env.VITE_GEOCODER_REVERSE_ENDPOINT?.trim() || provider.defaultReverseEndpoint,
     email: env.VITE_GEOCODER_EMAIL?.trim() || undefined,
     apiKey: env.VITE_GEOCODER_API_KEY?.trim() || undefined,
   };
@@ -697,16 +683,12 @@ export interface GeocodingPreferenceInput {
  * the geocode dialog so a per-run provider choice resolves the right endpoints
  * and API key without round-tripping through runtime env.
  */
-export function resolveGeocoderConfig(
-  input: GeocodingPreferenceInput,
-): GeocoderConfig {
+export function resolveGeocoderConfig(input: GeocodingPreferenceInput): GeocoderConfig {
   const provider = getGeocodingProvider(input.providerId);
   return {
     providerId: provider.id,
-    forwardEndpoint:
-      input.forwardEndpoint?.trim() || provider.defaultForwardEndpoint,
-    reverseEndpoint:
-      input.reverseEndpoint?.trim() || provider.defaultReverseEndpoint,
+    forwardEndpoint: input.forwardEndpoint?.trim() || provider.defaultForwardEndpoint,
+    reverseEndpoint: input.reverseEndpoint?.trim() || provider.defaultReverseEndpoint,
     email: input.email?.trim() || undefined,
     apiKey: input.apiKeys?.[provider.id]?.trim() || undefined,
   };
@@ -728,9 +710,7 @@ export function shouldThrottle(endpoint: string): boolean {
 
 /** The row cap to apply for `endpoint`: a finite cap for the public host, else Infinity. */
 export function rowCap(endpoint: string): number {
-  return shouldThrottle(endpoint)
-    ? PUBLIC_GEOCODE_ROW_CAP
-    : Number.POSITIVE_INFINITY;
+  return shouldThrottle(endpoint) ? PUBLIC_GEOCODE_ROW_CAP : Number.POSITIVE_INFINITY;
 }
 
 /**
@@ -772,11 +752,7 @@ export function geocoderNeedsApiKey(config: GeocoderConfig): boolean {
  * request's start time (not its completion) so a slow network does not double
  * the wait. Returns 0 for the first request or when enough time has elapsed.
  */
-export function nextDelayMs(
-  lastStartedAt: number | null,
-  now: number,
-  intervalMs: number,
-): number {
+export function nextDelayMs(lastStartedAt: number | null, now: number, intervalMs: number): number {
   if (lastStartedAt === null) return 0;
   return Math.max(0, intervalMs - (now - lastStartedAt));
 }
@@ -805,6 +781,38 @@ export function csvRowsToGeocodeRequests(
 }
 
 /**
+ * The fetch implementation used by {@link geocodeForward}/{@link geocodeReverse}.
+ * Null means "use the global browser `fetch`" (the default for the web and
+ * embedded builds).
+ */
+let geocodingFetch: typeof globalThis.fetch | null = null;
+
+/**
+ * Override the fetch used for geocoding requests, or pass null to restore the
+ * global browser `fetch`.
+ *
+ * The desktop shell sets this to Tauri's native HTTP fetch so geocoding requests
+ * are made from the Rust side, which:
+ *   - bypasses the WebView's CORS enforcement. Public Nominatim's CDN
+ *     intermittently omits the `Access-Control-Allow-Origin` header on cached
+ *     responses, which the browser then rejects — surfacing to the user as
+ *     "Search failed. Try again." (the symptom that failed Microsoft Store
+ *     certification); and
+ *   - can send a `User-Agent` identifying the app, as Nominatim's usage policy
+ *     requires (browser fetch cannot set that header).
+ *
+ * Safe to call multiple times; only the most recent implementation is used.
+ */
+export function setGeocodingFetch(fetchImpl: typeof globalThis.fetch | null): void {
+  geocodingFetch = fetchImpl;
+}
+
+/** The active geocoding fetch: the injected override, else the global fetch. */
+function geocodeFetch(): typeof globalThis.fetch {
+  return geocodingFetch ?? fetch;
+}
+
+/**
  * Forward-geocode a single query through the configured provider, returning
  * normalized matches.
  */
@@ -818,7 +826,7 @@ export async function geocodeForward(
     email: config.email,
     limit: options.limit,
   });
-  const response = await fetch(url, {
+  const response = await geocodeFetch()(url, {
     signal: options.signal,
     headers: { Accept: "application/json" },
   });
@@ -844,7 +852,7 @@ export async function geocodeReverse(
     email: config.email,
     zoom: options.zoom,
   });
-  const response = await fetch(url, {
+  const response = await geocodeFetch()(url, {
     signal: options.signal,
     headers: { Accept: "application/json" },
   });

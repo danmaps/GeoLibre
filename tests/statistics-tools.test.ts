@@ -5,6 +5,8 @@ import {
   type ProcessingAlgorithm,
   STATISTICS_TOOLS,
   averageNearestNeighborTool,
+  emergingHotSpotTool,
+  emergingPattern,
   getStatisticsTool,
   getisOrdTool,
   globalMoransITool,
@@ -76,19 +78,17 @@ function gradientLine(values: number[]): GeoLibreLayer {
 }
 
 describe("statistics tools registry", () => {
-  it("exposes all five spatial-statistics tools", () => {
+  it("exposes all spatial-statistics tools", () => {
     // The sorted-id comparison below fully pins membership; no separate
     // (fragile) length assertion is needed.
-    assert.deepEqual(
-      STATISTICS_TOOLS.map((t) => t.id).sort(),
-      [
-        "average-nearest-neighbor",
-        "getis-ord-gi",
-        "global-morans-i",
-        "kernel-density",
-        "local-morans-i",
-      ],
-    );
+    assert.deepEqual(STATISTICS_TOOLS.map((t) => t.id).sort(), [
+      "average-nearest-neighbor",
+      "emerging-hot-spot",
+      "getis-ord-gi",
+      "global-morans-i",
+      "kernel-density",
+      "local-morans-i",
+    ]);
   });
 
   it("looks tools up by id", () => {
@@ -140,9 +140,7 @@ describe("Getis-Ord Gi*", () => {
     ]);
     const { results } = run(getisOrdTool, layer, { k: 2 });
     assert.equal(results.length, 1);
-    const z = results[0].geojson.features.map(
-      (f) => f.properties?.["v_gi_z"] as number,
-    );
+    const z = results[0].geojson.features.map((f) => f.properties?.["v_gi_z"] as number);
     // Indices 0-2 are the high cluster, 3-5 the low cluster.
     assert.ok(
       z.slice(0, 3).every((value) => value > 0),
@@ -180,9 +178,7 @@ describe("local Moran's I (LISA)", () => {
     const features = results[0].geojson.features;
     // Select the high-value members by attribute rather than position, so the
     // assertion holds even if the tool ever reorders output features.
-    const highFeatures = features.filter(
-      (f) => (f.properties?.["v"] as number) > 50,
-    );
+    const highFeatures = features.filter((f) => (f.properties?.["v"] as number) > 50);
     assert.equal(highFeatures.length, 3);
     // High-cluster members have a positive local I and sit in quadrant 1.
     for (const f of highFeatures) {
@@ -198,16 +194,21 @@ describe("average nearest neighbor", () => {
     // nearest neighbor sits inside its own knot, far below the expected random
     // spacing for the overall density -> a strongly clustered (<1) ratio.
     const clustered = pointLayer(
-      ([
-        [0, 0],
-        [1, 0],
-        [0, 1],
-        [1, 1],
-      ] as Array<[number, number]>).flatMap(([lon, lat]) => [
-        [lon, lat, {}],
-        [lon + 0.0005, lat, {}],
-        [lon, lat + 0.0005, {}],
-      ] as Array<[number, number, Record<string, unknown>]>),
+      (
+        [
+          [0, 0],
+          [1, 0],
+          [0, 1],
+          [1, 1],
+        ] as Array<[number, number]>
+      ).flatMap(
+        ([lon, lat]) =>
+          [
+            [lon, lat, {}],
+            [lon + 0.0005, lat, {}],
+            [lon, lat + 0.0005, {}],
+          ] as Array<[number, number, Record<string, unknown>]>,
+      ),
     );
     const clusteredRatio = loggedNumber(
       run(averageNearestNeighborTool, clustered, {}).messages,
@@ -270,5 +271,165 @@ describe("kernel density", () => {
       cellSize: 0.25,
     });
     assert.ok(messages.some((m) => m.includes("must be positive")));
+  });
+});
+
+describe("emerging hot spot (space-time cube)", () => {
+  const DAY_MS = 86_400_000;
+  const BASE = 1_600_000_000_000; // fixed epoch (ms) so the cube is deterministic
+
+  /**
+   * A 5×5 fishnet of background cells (one point per cell per day, 5 days),
+   * plus a corner cell at the origin that fills up on days 3 and 4 — a location
+   * that becomes a hot spot only in the final time steps.
+   */
+  function spaceTimeLayer(): GeoLibreLayer {
+    const pts: Array<[number, number, Record<string, unknown>]> = [];
+    for (let day = 0; day < 5; day++) {
+      const t = BASE + day * DAY_MS;
+      for (let row = 0; row < 5; row++) {
+        for (let col = 0; col < 5; col++) {
+          pts.push([col * 0.05, row * 0.05, { t }]);
+        }
+      }
+    }
+    // Pile events into the origin cell late in the series.
+    for (let i = 0; i < 8; i++) pts.push([0.001, 0.001, { t: BASE + 3 * DAY_MS }]);
+    for (let i = 0; i < 20; i++) pts.push([0.001, 0.001, { t: BASE + 4 * DAY_MS }]);
+    return pointLayer(pts);
+  }
+
+  const cubeParams = {
+    timeField: "t",
+    cellSize: 5,
+    timeStep: 1,
+    timeStepUnit: "days",
+    confidence: "95",
+  };
+
+  it("builds the cube and flags a late-emerging hot spot", () => {
+    const { results } = run(emergingHotSpotTool, spaceTimeLayer(), cubeParams);
+    assert.equal(results.length, 1);
+    const fc = results[0].geojson;
+    // One polygon per non-empty cell (the 5×5 background; the origin overlaps a
+    // background cell, so it is not a 26th cell).
+    assert.equal(fc.features.length, 25);
+    const props = fc.features[0].properties ?? {};
+    for (const key of ["pattern", "pattern_bin", "mk_z", "mk_p", "mk_tau", "total", "time_steps"]) {
+      assert.ok(key in props, `expected property "${key}"`);
+    }
+    assert.equal(props.time_steps, 5);
+
+    // Exactly one cell — the origin — turns hot, and it holds the most events.
+    const hot = fc.features.filter((f) => (f.properties?.pattern_bin as number) > 0);
+    assert.equal(hot.length, 1);
+    assert.match(String(hot[0].properties?.pattern), /Hot Spot/);
+    const totals = fc.features.map((f) => f.properties?.total as number);
+    assert.equal(hot[0].properties?.total, Math.max(...totals));
+  });
+
+  it("sums a weight field per bin instead of counting", () => {
+    const layer = spaceTimeLayer();
+    // Tag every feature with weight 2; the hot cell's total should double.
+    for (const f of layer.geojson!.features) (f.properties as Record<string, unknown>).w = 2;
+    const { results } = run(emergingHotSpotTool, layer, { ...cubeParams, weightField: "w" });
+    const fc = results[0].geojson;
+    const totals = fc.features.map((f) => f.properties?.total as number);
+    // 33 events in the origin cell × weight 2 = 66.
+    assert.equal(Math.max(...totals), 66);
+  });
+
+  it("errors when the data spans fewer than two time steps", () => {
+    const pts: Array<[number, number, Record<string, unknown>]> = [];
+    for (let row = 0; row < 3; row++)
+      for (let col = 0; col < 3; col++) pts.push([col * 0.05, row * 0.05, { t: BASE }]);
+    const { messages, results } = run(emergingHotSpotTool, pointLayer(pts), cubeParams);
+    assert.equal(results.length, 0);
+    assert.ok(messages.some((m) => m.includes("fewer than 2 time steps")));
+  });
+
+  it("errors when every point shares one location", () => {
+    const pts: Array<[number, number, Record<string, unknown>]> = [
+      [0, 0, { t: BASE }],
+      [0, 0, { t: BASE + DAY_MS }],
+      [0, 0, { t: BASE + 2 * DAY_MS }],
+    ];
+    const { messages, results } = run(emergingHotSpotTool, pointLayer(pts), cubeParams);
+    assert.equal(results.length, 0);
+    assert.ok(messages.some((m) => m.includes("share one location")));
+  });
+
+  it("analyzes a collinear transect (1-D extent) instead of rejecting it", () => {
+    // All points share a longitude but span latitude → a valid N×1 fishnet.
+    const pts: Array<[number, number, Record<string, unknown>]> = [];
+    for (let day = 0; day < 4; day++)
+      for (let row = 0; row < 5; row++) pts.push([0, row * 0.05, { t: BASE + day * DAY_MS }]);
+    const { results } = run(emergingHotSpotTool, pointLayer(pts), cubeParams);
+    assert.equal(results.length, 1);
+    assert.ok(results[0].geojson.features.length > 0);
+  });
+
+  it("keeps cells with net-negative summed weight (cold spots)", () => {
+    // A signed weight field can sum to a negative total in a busy cell; the
+    // cell recorded events and must not be dropped from the output.
+    const layer = spaceTimeLayer();
+    for (const f of layer.geojson!.features) (f.properties as Record<string, unknown>).w = -1;
+    const { results } = run(emergingHotSpotTool, layer, { ...cubeParams, weightField: "w" });
+    const fc = results[0].geojson;
+    assert.equal(fc.features.length, 25);
+    assert.ok(fc.features.every((f) => (f.properties?.total as number) < 0));
+  });
+
+  it("counts features dropped for a missing/invalid weight in the skip tally", () => {
+    const layer = spaceTimeLayer();
+    // Give only some features a numeric weight; the rest are dropped as skipped.
+    layer.geojson!.features.forEach((f, i) => {
+      (f.properties as Record<string, unknown>).w = i % 2 === 0 ? 1 : "n/a";
+    });
+    const { messages } = run(emergingHotSpotTool, layer, { ...cubeParams, weightField: "w" });
+    assert.ok(messages.some((m) => /Skipped \d+ feature\(s\).*valid weight/.test(m)));
+  });
+
+  it("errors without a time field and on too few points", () => {
+    const noTime = run(emergingHotSpotTool, spaceTimeLayer(), { ...cubeParams, timeField: "" });
+    assert.ok(noTime.messages.some((m) => m.includes("time field is required")));
+
+    const few = run(
+      emergingHotSpotTool,
+      pointLayer([
+        [0, 0, { t: BASE }],
+        [0.05, 0.05, { t: BASE + DAY_MS }],
+      ]),
+      cubeParams,
+    );
+    assert.ok(few.messages.some((m) => m.includes("at least 3 points")));
+  });
+});
+
+describe("emerging pattern classification", () => {
+  const CRIT = 1.96; // 95% two-sided threshold
+  const NO_TREND = { s: 0, tau: 0, z: 0, p: 1 };
+
+  it("prioritizes the >=90% persistent family over oscillating", () => {
+    // 12 steps, hot in 11 (>=90%) with one earlier significant-cold bin and no
+    // trend. ArcGIS classifies this as Persistent, not Oscillating.
+    const z = new Array(12).fill(3);
+    z[3] = -3;
+    assert.equal(emergingPattern(z, CRIT, NO_TREND, 0.05).pattern, "Persistent Hot Spot");
+  });
+
+  it("classifies <90% hot with a prior cold bin as oscillating", () => {
+    // Final step hot, only 2/12 hot (<90%), and a significant-cold bin earlier.
+    const z = new Array(12).fill(0);
+    z[3] = -3;
+    z[10] = 3;
+    z[11] = 3;
+    assert.equal(emergingPattern(z, CRIT, NO_TREND, 0.05).pattern, "Oscillating Hot Spot");
+  });
+
+  it("mirrors the priority for the cold family", () => {
+    const z = new Array(12).fill(-3);
+    z[3] = 3;
+    assert.equal(emergingPattern(z, CRIT, NO_TREND, 0.05).pattern, "Persistent Cold Spot");
   });
 });

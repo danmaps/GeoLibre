@@ -1,15 +1,14 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import {
-  DEFAULT_LAYER_STYLE,
-  type GeoLibreLayer,
-  useAppStore,
-} from "@geolibre/core";
+import { DEFAULT_LAYER_STYLE, type GeoLibreLayer, useAppStore } from "@geolibre/core";
 import type { RasterLayerInfo, RasterLayerState } from "maplibre-gl-raster";
 import {
   createRasterStoreLayer,
   isRasterControlStoreLayer,
+  localRasterPath,
+  rememberLocalRasterPath,
   removeRasterStoreLayers,
+  rendersNativeMapLibreLayer,
   runWithRasterStoreSyncSuspended,
   savedRasterState,
   syncRasterLayersToStore,
@@ -55,19 +54,14 @@ function rasterInfo(patch: Partial<RasterLayerInfo> = {}): RasterLayerInfo {
  * getState is a static snapshot of options.collapsed: tests exercising
  * event-driven expand/collapse transitions need a stateful fake instead.
  */
-function fakeControl(
-  infos: RasterLayerInfo[] = [],
-  options: { collapsed?: boolean } = {},
-) {
+function fakeControl(infos: RasterLayerInfo[] = [], options: { collapsed?: boolean } = {}) {
   const calls: { method: string; args: unknown[] }[] = [];
   const control: RasterSyncableControl = {
     getState: () => ({ collapsed: options.collapsed ?? true }),
     getRasters: () => infos,
     removeRaster: (id) => calls.push({ method: "removeRaster", args: [id] }),
-    setRasterState: (id, patch) =>
-      calls.push({ method: "setRasterState", args: [id, patch] }),
-    setVisible: (id, visible) =>
-      calls.push({ method: "setVisible", args: [id, visible] }),
+    setRasterState: (id, patch) => calls.push({ method: "setRasterState", args: [id, patch] }),
+    setVisible: (id, visible) => calls.push({ method: "setVisible", args: [id, visible] }),
   };
   return { control, calls };
 }
@@ -84,6 +78,19 @@ function otherStoreLayer(id = "unrelated"): GeoLibreLayer {
     metadata: {},
   };
 }
+
+// The projection rule in maplibre-raster.ts keys off this: only the deck.gl
+// engine cannot draw on the globe, so only it forces the map to mercator.
+describe("rendersNativeMapLibreLayer", () => {
+  it("is true for the engines backed by a real MapLibre raster layer", () => {
+    assert.equal(rendersNativeMapLibreLayer("cog-tiler-wasm"), true);
+    assert.equal(rendersNativeMapLibreLayer("titiler"), true);
+  });
+
+  it("is false for the deck.gl engine", () => {
+    assert.equal(rendersNativeMapLibreLayer("maplibre-gl-raster"), false);
+  });
+});
 
 describe("createRasterStoreLayer", () => {
   it("mirrors a URL raster as an external custom cog layer", () => {
@@ -176,6 +183,93 @@ describe("createRasterStoreLayer", () => {
     assert.deepEqual(layer.metadata.nativeLayerIds, []);
   });
 
+  // The WASM/TiTiler engines add a real MapLibre raster layer keyed by the
+  // raster id, so ordering works even in the runtime that forces the deck.gl
+  // overlay into its own stacked canvas (issue #1463).
+  for (const engine of ["cog-tiler-wasm", "titiler"] as const) {
+    it(`gives the ${engine} engine a native layer id even when not interleaved`, () => {
+      const layer = createRasterStoreLayer(rasterInfo(), true, {
+        interleaved: false,
+        engine,
+      });
+
+      assert.equal(layer.metadata.rasterOverlayMode, "native");
+      assert.deepEqual(layer.metadata.nativeLayerIds, ["raster-1"]);
+      // Still set: it is what makes layer-sync push the computed beforeId back
+      // into the control, which those engines re-apply on every render change.
+      assert.equal(layer.metadata.externalDeckLayer, true);
+    });
+  }
+
+  it("keeps the deck.gl engine's overlay bookkeeping when named explicitly", () => {
+    const layer = createRasterStoreLayer(rasterInfo(), true, {
+      interleaved: false,
+      engine: "maplibre-gl-raster",
+    });
+
+    assert.equal(layer.metadata.rasterOverlayMode, "overlaid");
+    assert.deepEqual(layer.metadata.nativeLayerIds, []);
+  });
+
+  it("records a local raster's path so a saved project can reload it", () => {
+    rememberLocalRasterPath("raster-1", "/data/local.tif");
+    try {
+      const layer = createRasterStoreLayer(
+        rasterInfo({
+          source: { kind: "file", fileName: "local.tif", objectUrl: "blob:x" },
+        }),
+      );
+
+      assert.equal(layer.metadata.localFilePath, "/data/local.tif");
+      assert.equal(localRasterPath("raster-1"), "/data/local.tif");
+    } finally {
+      rememberLocalRasterPath("raster-1", undefined);
+    }
+  });
+
+  it("omits the path for a raster added without one, and after it is forgotten", () => {
+    const fileInfo = rasterInfo({
+      source: { kind: "file", fileName: "local.tif", objectUrl: "blob:x" },
+    });
+    assert.equal("localFilePath" in createRasterStoreLayer(fileInfo).metadata, false);
+
+    rememberLocalRasterPath("raster-1", "/data/local.tif");
+    rememberLocalRasterPath("raster-1", undefined);
+    assert.equal("localFilePath" in createRasterStoreLayer(fileInfo).metadata, false);
+    assert.equal(localRasterPath("raster-1"), undefined);
+  });
+
+  it("never claims a path for a URL raster, even if one was recorded", () => {
+    rememberLocalRasterPath("raster-1", "/data/stale.tif");
+    try {
+      assert.equal("localFilePath" in createRasterStoreLayer(rasterInfo()).metadata, false);
+    } finally {
+      rememberLocalRasterPath("raster-1", undefined);
+    }
+  });
+
+  it("persists a Tauri asset URL as a local path instead of a session URL", () => {
+    rememberLocalRasterPath("raster-1", "/data/local.tif");
+    try {
+      const layer = createRasterStoreLayer(
+        rasterInfo({
+          source: {
+            kind: "url",
+            url: "http://asset.localhost/%2Fdata%2Flocal.tif",
+          },
+        }),
+      );
+
+      assert.equal(layer.metadata.localFilePath, "/data/local.tif");
+      assert.equal(layer.metadata.rasterSource, "file");
+      assert.equal(layer.metadata.localBytesUrl, "http://asset.localhost/%2Fdata%2Flocal.tif");
+      assert.equal(layer.source.url, undefined);
+      assert.equal(layer.sourcePath, "local.tif");
+    } finally {
+      rememberLocalRasterPath("raster-1", undefined);
+    }
+  });
+
   it("persists band count and serializes band names to pairs", () => {
     const layer = createRasterStoreLayer(
       rasterInfo({
@@ -195,9 +289,7 @@ describe("createRasterStoreLayer", () => {
   });
 
   it("stores a null band count and band names before the header loads", () => {
-    const layer = createRasterStoreLayer(
-      rasterInfo({ bandCount: null, bandNames: null }),
-    );
+    const layer = createRasterStoreLayer(rasterInfo({ bandCount: null, bandNames: null }));
 
     assert.equal(layer.metadata.bandCount, null);
     assert.equal(layer.metadata.bandNames, null);
@@ -233,6 +325,33 @@ describe("syncRasterLayersToStore", () => {
     const layer = useAppStore.getState().layers[0];
     assert.equal(layer.metadata.rasterOverlayMode, "overlaid");
     assert.deepEqual(layer.metadata.nativeLayerIds, []);
+  });
+
+  // localFilePath is derived from the path registry on every sync rather than
+  // carried in GEOLIBRE_OWNED_METADATA_KEYS, so a repeated sync (any control
+  // event: an opacity drag, a header load) must not drop it. The registry
+  // outlives a control teardown -- LayerManager.destroy() clears its layers
+  // without emitting rasterremove -- so the only thing that forgets a path is
+  // an actual raster removal, which drops the store layer too.
+  it("keeps a local raster's path across repeated syncs", () => {
+    const fileInfo = rasterInfo({
+      source: { kind: "file", fileName: "local.tif", objectUrl: "blob:x" },
+    });
+    rememberLocalRasterPath("raster-1", "/data/local.tif");
+    try {
+      syncRasterLayersToStore(fakeControl([fileInfo]).control);
+      assert.equal(useAppStore.getState().layers[0].metadata.localFilePath, "/data/local.tif");
+
+      // A later control event rebuilds the metadata wholesale.
+      syncRasterLayersToStore(
+        fakeControl([{ ...fileInfo, state: rasterState({ opacity: 0.4 }) }]).control,
+      );
+      const layer = useAppStore.getState().layers[0];
+      assert.equal(layer.opacity, 0.4);
+      assert.equal(layer.metadata.localFilePath, "/data/local.tif");
+    } finally {
+      rememberLocalRasterPath("raster-1", undefined);
+    }
   });
 
   it("removes store layers whose rasters are gone", () => {
@@ -285,33 +404,20 @@ describe("syncRasterLayersToStore", () => {
     // metadata wholesale; the symbology must survive since it is not on the
     // control's RasterLayerInfo.
     syncRasterLayersToStore(
-      fakeControl([
-        rasterInfo({ bounds: { west: 0, south: 0, east: 1, north: 1 } }),
-      ]).control,
+      fakeControl([rasterInfo({ bounds: { west: 0, south: 0, east: 1, north: 1 } })]).control,
     );
 
-    assert.deepEqual(
-      useAppStore.getState().layers[0].metadata.rasterSymbology,
-      symbology,
-    );
+    assert.deepEqual(useAppStore.getState().layers[0].metadata.rasterSymbology, symbology);
   });
 
   it("refreshes the saved panel collapsed state", () => {
     const { control } = fakeControl([rasterInfo()]);
     syncRasterLayersToStore(control);
-    assert.equal(
-      useAppStore.getState().layers[0].metadata.panelCollapsed,
-      true,
-    );
+    assert.equal(useAppStore.getState().layers[0].metadata.panelCollapsed, true);
 
-    syncRasterLayersToStore(
-      fakeControl([rasterInfo()], { collapsed: false }).control,
-    );
+    syncRasterLayersToStore(fakeControl([rasterInfo()], { collapsed: false }).control);
 
-    assert.equal(
-      useAppStore.getState().layers[0].metadata.panelCollapsed,
-      false,
-    );
+    assert.equal(useAppStore.getState().layers[0].metadata.panelCollapsed, false);
   });
 
   it("flips panelCollapsed on store layers when an expand event syncs", () => {
@@ -335,17 +441,11 @@ describe("syncRasterLayersToStore", () => {
     };
 
     syncRasterLayersToStore(control);
-    assert.equal(
-      useAppStore.getState().layers[0].metadata.panelCollapsed,
-      true,
-    );
+    assert.equal(useAppStore.getState().layers[0].metadata.panelCollapsed, true);
 
     expand();
 
-    assert.equal(
-      useAppStore.getState().layers[0].metadata.panelCollapsed,
-      false,
-    );
+    assert.equal(useAppStore.getState().layers[0].metadata.panelCollapsed, false);
   });
 
   it("does not touch an existing layer when nothing changed", () => {
@@ -399,9 +499,7 @@ describe("wireRasterStoreSync", () => {
 
     useAppStore.getState().removeLayer("raster-1");
 
-    assert.deepEqual(calls, [
-      { method: "removeRaster", args: ["raster-1"] },
-    ]);
+    assert.deepEqual(calls, [{ method: "removeRaster", args: ["raster-1"] }]);
   });
 
   it("does not echo control-driven syncs back at the control", () => {
@@ -491,6 +589,35 @@ describe("wireRasterStoreSync", () => {
 
     assert.deepEqual(calls, []);
   });
+
+  it("pushes the min/max zoom range through setRasterState when the style changes", () => {
+    const { control, calls } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    wireRasterStoreSync(control);
+
+    const layer = useAppStore.getState().layers[0];
+    useAppStore.getState().updateLayer("raster-1", {
+      style: { ...layer.style, minZoom: 6, maxZoom: 12 },
+    });
+
+    assert.deepEqual(calls, [
+      { method: "setRasterState", args: ["raster-1", { minZoom: 6, maxZoom: 12 }] },
+    ]);
+  });
+
+  it("does not push a zoom range when the style zoom bounds are unchanged", () => {
+    const { control, calls } = fakeControl([rasterInfo()]);
+    syncRasterLayersToStore(control);
+    wireRasterStoreSync(control);
+
+    const layer = useAppStore.getState().layers[0];
+    // A style edit that leaves minZoom/maxZoom untouched must not push a range.
+    useAppStore.getState().updateLayer("raster-1", {
+      style: { ...layer.style, fillOpacity: 0.5 },
+    });
+
+    assert.deepEqual(calls, []);
+  });
 });
 
 describe("removeRasterStoreLayers", () => {
@@ -542,11 +669,26 @@ describe("savedRasterState", () => {
   });
 
   it("round-trips the auto-rescale (null) state explicitly", () => {
-    const layer = createRasterStoreLayer(
-      rasterInfo({ state: rasterState({ rescale: null }) }),
-    );
+    const layer = createRasterStoreLayer(rasterInfo({ state: rasterState({ rescale: null }) }));
 
     assert.equal(savedRasterState(layer).rescale, null);
+  });
+
+  it("round-trips index mode and the preset id", () => {
+    const state = rasterState({
+      mode: "index",
+      bands: [4, 3],
+      index: "ndvi",
+      colormap: "rdylgn",
+      rescale: [[-1, 1]],
+    });
+    const layer = createRasterStoreLayer(rasterInfo({ state }));
+
+    const saved = savedRasterState(layer);
+    assert.equal(saved.mode, "index");
+    assert.equal(saved.index, "ndvi");
+    assert.deepEqual(saved.bands, [4, 3]);
+    assert.equal(saved.colormap, "rdylgn");
   });
 
   it("drops malformed fields from hand-edited project files", () => {

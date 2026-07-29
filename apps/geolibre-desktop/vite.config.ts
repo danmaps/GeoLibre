@@ -3,14 +3,12 @@ import { readFileSync, rmSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import path from "node:path";
-import type {
-  RollupLog,
-  RollupOptions,
-  WarningHandlerWithDefault,
-} from "rollup";
-import { defineConfig, type Plugin } from "vite";
+import type { RollupLog, RollupOptions, WarningHandlerWithDefault } from "rollup";
+import { fileURLToPath } from "node:url";
+import { defineConfig, loadEnv, type Plugin } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
 import { bundledPlugins } from "./vite-plugins/bundled-plugins";
+import { copyCesiumAssets } from "./vite-plugins/copy-cesium-assets";
 import { copyRtlText } from "./vite-plugins/copy-rtl-text";
 import { copyVectorOps } from "./vite-plugins/copy-vector-ops";
 
@@ -19,9 +17,92 @@ const EARTH_ENGINE_CONTROL_BUNDLE = "maplibre-gl-earth-engine/dist/";
 const EARTH_ENGINE_BROWSER_BUNDLE = "@google/earthengine/build/browser.js";
 const GIS_CHUNK_WARNING_LIMIT_KB = 14000;
 const APP_BASE = process.env.GEOLIBRE_APP_BASE;
-const APP_VERSION = JSON.parse(
-  readFileSync(new URL("./package.json", import.meta.url), "utf8"),
-).version as string;
+const APP_VERSION = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"))
+  .version as string;
+
+// Vite resolves `mode` from the `--mode` CLI flag (defaulting to `development`
+// for `vite`/`vite dev` and `production` for `vite build`). This shim runs at
+// module load, before `defineConfig` receives the resolved mode, so read
+// `--mode` from argv directly and fall back to NODE_ENV (which Vite's CLI sets
+// from the command). This lets `loadEnv` pick up mode-specific files such as
+// `.env.staging.local` under `vite build --mode staging`, not just NODE_ENV.
+function resolveViteMode(): string {
+  const argv = process.argv;
+  const inline = argv.find((arg) => arg.startsWith("--mode="));
+  if (inline) return inline.slice("--mode=".length);
+  const flagIndex = argv.findIndex((arg) => arg === "--mode" || arg === "-m");
+  if (flagIndex !== -1 && argv[flagIndex + 1]) return argv[flagIndex + 1];
+  return process.env.NODE_ENV || "development";
+}
+
+// Vite only exposes `VITE_`-prefixed vars to the client, so the Google Maps key
+// is surfaced as `VITE_GOOGLE_MAPS_API_KEY`. Accept a bare `GOOGLE_MAPS_API_KEY`
+// too (handy for local shell/CI testing) and copy it into the prefixed name.
+// `loadEnv(mode, dir, "")` reads the app's `.env*` files with no prefix filter,
+// so a key placed in `apps/geolibre-desktop/.env.local` also works, not just a
+// real shell env var (process.env alone would miss the file).
+const CONFIG_DIR = path.dirname(fileURLToPath(import.meta.url));
+const FILE_ENV = loadEnv(resolveViteMode(), CONFIG_DIR, "");
+
+// A managed build can use the server-side AI proxy without embedding any
+// provider credential. Only its public endpoint and selected model enter the
+// client bundle.
+for (const name of ["GEOLIBRE_AI_URL", "GEOLIBRE_AI_MODEL"] as const) {
+  const viteName = `VITE_${name}`;
+  if (!process.env[viteName]) {
+    const value = process.env[name] || FILE_ENV[viteName] || FILE_ENV[name];
+    if (value) process.env[viteName] = value;
+  }
+}
+if (!process.env.VITE_GOOGLE_MAPS_API_KEY) {
+  const googleMapsApiKey =
+    process.env.GOOGLE_MAPS_API_KEY ||
+    FILE_ENV.VITE_GOOGLE_MAPS_API_KEY ||
+    FILE_ENV.GOOGLE_MAPS_API_KEY;
+  if (googleMapsApiKey) {
+    process.env.VITE_GOOGLE_MAPS_API_KEY = googleMapsApiKey;
+  }
+}
+
+// Cesium Ion token for the 3D-globe view: same bare→prefixed bridge as the
+// Google Maps key. A bare `CESIUM_TOKEN` (shell or .env file) is surfaced as
+// `VITE_CESIUM_TOKEN` so `import.meta.env` exposes it, and getCesiumIonToken()
+// then lets a runtime Settings override win over this build-time value.
+if (!process.env.VITE_CESIUM_TOKEN) {
+  const cesiumToken =
+    process.env.CESIUM_TOKEN || FILE_ENV.VITE_CESIUM_TOKEN || FILE_ENV.CESIUM_TOKEN;
+  if (cesiumToken) {
+    process.env.VITE_CESIUM_TOKEN = cesiumToken;
+  }
+}
+
+// Mapbox access token for the basemap control's Mapbox styles: same
+// bare→prefixed bridge as the Google Maps and Cesium keys. `MAPBOX_TOKEN` is the
+// spelling Mapbox's own tooling uses, so accept it from the shell or an .env
+// file and surface it as `VITE_MAPBOX_ACCESS_TOKEN`; getMapboxAccessToken() then
+// lets a runtime Settings override win over this build-time value.
+if (!process.env.VITE_MAPBOX_ACCESS_TOKEN) {
+  const mapboxAccessToken =
+    process.env.MAPBOX_TOKEN || FILE_ENV.VITE_MAPBOX_ACCESS_TOKEN || FILE_ENV.MAPBOX_TOKEN;
+  if (mapboxAccessToken) {
+    process.env.VITE_MAPBOX_ACCESS_TOKEN = mapboxAccessToken;
+  }
+}
+
+// Earth Engine OAuth client ID: same bare→prefixed bridge as the Google Maps
+// and Cesium keys. The app reads `import.meta.env.VITE_GEE_OAUTH_CLIENT_ID`, so
+// a bare `GEE_OAUTH_CLIENT_ID` (shell/.zshrc or an .env file) is surfaced under
+// the prefixed name here; otherwise Vite ignores the unprefixed var and the
+// plugin falls back to its hardcoded DEFAULT_GEE_OAUTH_CLIENT_ID.
+if (!process.env.VITE_GEE_OAUTH_CLIENT_ID) {
+  const geeOauthClientId =
+    process.env.GEE_OAUTH_CLIENT_ID ||
+    FILE_ENV.VITE_GEE_OAUTH_CLIENT_ID ||
+    FILE_ENV.GEE_OAUTH_CLIENT_ID;
+  if (geeOauthClientId) {
+    process.env.VITE_GEE_OAUTH_CLIENT_ID = geeOauthClientId;
+  }
+}
 
 // Tauri sets TAURI_ENV_* env vars while running its beforeBuildCommand
 // (`npm run build`), so their presence flags a desktop build. Used below to drop
@@ -54,6 +135,15 @@ const PGLITE_CDN = process.env.GEOLIBRE_PGLITE_CDN !== "0";
 const IS_EMBED = process.env.GEOLIBRE_EMBED === "1";
 const PWA_DISABLED = IS_TAURI_BUILD || IS_EMBED;
 
+// Microsoft Store MSIX build. Strips the in-app "Check for updates" flow (Help
+// menu, command palette, About dialog, and the automated startup check) so the
+// Store package updates only through the Store — Microsoft policy 10.2.5 rejects
+// a Store app that updates itself outside the Store. Set ONLY by the dedicated
+// Store build path (.github/workflows/msix-store.yml); every other build (the
+// GitHub .exe/winget installer, the sideload MSIX, portable, macOS, Linux, web,
+// and the Jupyter embed) leaves it unset, so their update checker is untouched.
+const IS_STORE_BUILD = process.env.GEOLIBRE_STORE_BUILD === "1";
+
 const pgliteCdnRequire = createRequire(import.meta.url);
 // The ESM entry of a package's manifest. Prefer the `module` field and the
 // `import` condition of `exports` (both point at the ESM build); never fall back
@@ -62,11 +152,8 @@ const pgliteCdnRequire = createRequire(import.meta.url);
 // historical PGlite layout, if neither is declared.
 function esmEntry(manifest: Record<string, unknown>): string {
   if (typeof manifest.module === "string") return manifest.module;
-  const exportsRoot = (manifest.exports as Record<string, unknown> | undefined)?.[
-    "."
-  ];
-  const importEntry = (exportsRoot as Record<string, unknown> | undefined)
-    ?.import;
+  const exportsRoot = (manifest.exports as Record<string, unknown> | undefined)?.["."];
+  const importEntry = (exportsRoot as Record<string, unknown> | undefined)?.import;
   const importDefault =
     typeof importEntry === "string"
       ? importEntry
@@ -86,9 +173,7 @@ function findPackageManifest(
   let dir = path.dirname(startFile);
   while (dir !== path.dirname(dir)) {
     try {
-      const parsed = JSON.parse(
-        readFileSync(path.join(dir, "package.json"), "utf8"),
-      );
+      const parsed = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8"));
       if (parsed.name === pkg) return { dir, manifest: parsed };
     } catch {
       // Not this directory's package.json; keep walking up.
@@ -146,10 +231,7 @@ const CEREUS_WASM_CDN_URL = cereusWasmCdnUrl();
 const GDAL_CDN = process.env.GEOLIBRE_GDAL_CDN !== "0";
 function gdal3CdnPaths(): { wasm: string; data: string } | null {
   if (!GDAL_CDN) return null;
-  const { manifest } = findPackageManifest(
-    pgliteCdnRequire.resolve("gdal3.js"),
-    "gdal3.js",
-  );
+  const { manifest } = findPackageManifest(pgliteCdnRequire.resolve("gdal3.js"), "gdal3.js");
   const base = `https://cdn.jsdelivr.net/npm/gdal3.js@${manifest.version}/dist/package`;
   return {
     wasm: `${base}/gdal3WebAssembly.wasm`,
@@ -178,6 +260,18 @@ const RADIX_OPTIMIZE_EXCLUDES = [
 ];
 
 function manualChunks(id: string): string | undefined {
+  // Lazy per-locale i18n catalogs (src/i18n/index.ts dynamic-imports every
+  // non-English locale). Give each its own predictably named `i18n-locale-<code>`
+  // chunk so the service worker can keep them OUT of the app-shell precache
+  // (globIgnored below) and CacheFirst-cache them on demand instead. The prefix
+  // is deliberately distinct from the auto-named `i18n-<hash>` chunk that holds
+  // the i18n init module + statically bundled English, which MUST stay precached
+  // for offline boot.
+  // Match any locale filename, including regional tags like `pt-BR` / `zh-Hans`
+  // (uppercase/mixed-case), so those chunks still get the `i18n-locale-` name
+  // and the Workbox exclusion below — not just the two-letter `[a-z]` codes.
+  const localeMatch = id.match(/\/i18n\/locales\/([^/]+)\.json(?:\?|$)/);
+  if (localeMatch && localeMatch[1] !== "en") return `i18n-locale-${localeMatch[1]}`;
   if (!id.includes("node_modules")) return undefined;
   // Only route JS/TS modules into manual chunks. The name-based rules below match
   // on the module id, so a package's *stylesheet* (e.g.
@@ -217,6 +311,15 @@ function manualChunks(id: string): string | undefined {
   // `maplibre` chunk and force DuckDB into boot. Give it its own lazy chunk.
   if (id.includes("maplibre-gl-duckdb")) return "maplibre-duckdb";
   if (id.includes("maplibre-gl")) return "maplibre";
+  // Cesium is large (~several MB) and only loads when the user opens the 3D
+  // globe view; keep it in its own lazily-fetched chunk, off the boot graph.
+  // `@cesium/engine`/`@cesium/widgets` (which the `cesium` wrapper re-exports)
+  // are only reachable through the lazy `import("cesium")`, so Rollup already
+  // groups them into this chunk; matching them explicitly keeps that intent
+  // even if some future eager import would otherwise pull them onto the boot
+  // graph.
+  if (id.includes("/node_modules/cesium/") || id.includes("/node_modules/@cesium/"))
+    return "cesium";
   // Returning undefined hands remaining node_modules back to Rollup's default
   // chunking. We intentionally do not group them into a single "vendor" chunk:
   // that produced a circular manual-chunks warning. Do not re-add a catch-all
@@ -224,10 +327,7 @@ function manualChunks(id: string): string | undefined {
   return undefined;
 }
 
-function onwarn(
-  warning: RollupLog,
-  defaultHandler: WarningHandlerWithDefault,
-): void {
+function onwarn(warning: RollupLog, defaultHandler: WarningHandlerWithDefault): void {
   if (
     warning.code === "EVAL" &&
     typeof warning.id === "string" &&
@@ -245,9 +345,7 @@ function onwarn(
   // for vendored files only; a real occurrence in our own source still warns.
   if (warning.code === "COMMONJS_VARIABLE_IN_ESM") {
     const file =
-      (typeof warning.id === "string" ? warning.id : undefined) ??
-      warning.loc?.file ??
-      "";
+      (typeof warning.id === "string" ? warning.id : undefined) ?? warning.loc?.file ?? "";
     if (file.includes("/node_modules/") || file.includes("\\node_modules\\")) {
       return;
     }
@@ -264,8 +362,7 @@ function wmsProxyPlugin(): Plugin {
         try {
           await proxyWmsRequest(req, res);
         } catch (error) {
-          const message =
-            error instanceof Error ? error.message : "WMS proxy request failed";
+          const message = error instanceof Error ? error.message : "WMS proxy request failed";
           res.statusCode = 502;
           res.setHeader("content-type", "text/plain");
           res.end(message);
@@ -275,8 +372,7 @@ function wmsProxyPlugin(): Plugin {
         try {
           await proxyBinaryRequest(req, res, WFS_PROXY_PATH);
         } catch (error) {
-          const message =
-            error instanceof Error ? error.message : "WFS proxy request failed";
+          const message = error instanceof Error ? error.message : "WFS proxy request failed";
           res.statusCode = 502;
           res.setHeader("content-type", "text/plain");
           res.end(message);
@@ -286,8 +382,7 @@ function wmsProxyPlugin(): Plugin {
         try {
           await proxyBinaryRequest(req, res, GPX_PROXY_PATH);
         } catch (error) {
-          const message =
-            error instanceof Error ? error.message : "GPX proxy request failed";
+          const message = error instanceof Error ? error.message : "GPX proxy request failed";
           res.statusCode = 502;
           res.setHeader("content-type", "text/plain");
           res.end(message);
@@ -297,10 +392,7 @@ function wmsProxyPlugin(): Plugin {
         try {
           await proxyBinaryRequest(req, res, RASTER_PROXY_PATH);
         } catch (error) {
-          const message =
-            error instanceof Error
-              ? error.message
-              : "Raster proxy request failed";
+          const message = error instanceof Error ? error.message : "Raster proxy request failed";
           res.statusCode = 502;
           res.setHeader("content-type", "text/plain");
           res.end(message);
@@ -327,10 +419,7 @@ function stripDuckDbWorkerSourcemapPlugin(): Plugin {
           "../../node_modules",
           decodedPath.slice(decodedPath.indexOf(DUCKDB_WORKER_PATH_PART) + 1),
         );
-        const source = readFileSync(workerFile, "utf8").replace(
-          DUCKDB_WORKER_SOURCE_MAP_RE,
-          "",
-        );
+        const source = readFileSync(workerFile, "utf8").replace(DUCKDB_WORKER_SOURCE_MAP_RE, "");
         res.statusCode = 200;
         res.setHeader("content-type", "application/javascript");
         res.end(source);
@@ -380,10 +469,7 @@ function selectiveJsMinifyPlugin(): Plugin {
   };
 }
 
-function shouldPreserveEarthEngineChunk(
-  fileName: string,
-  code: string,
-): boolean {
+function shouldPreserveEarthEngineChunk(fileName: string, code: string): boolean {
   return (
     fileName.includes("earth-engine") ||
     fileName.includes("maplibre-geoagent") ||
@@ -472,17 +558,13 @@ function cereusCdnLoaderPlugin(): Plugin {
 function duckdbWasmBundlesPlugin(): Plugin {
   const modulePath = path.resolve(
     __dirname,
-    IS_TAURI_BUILD
-      ? "src/lib/duckdb-wasm-bundles.tauri.ts"
-      : "src/lib/duckdb-wasm-bundles.ts",
+    IS_TAURI_BUILD ? "src/lib/duckdb-wasm-bundles.tauri.ts" : "src/lib/duckdb-wasm-bundles.ts",
   );
   return {
     name: "geolibre-duckdb-wasm-bundles",
     enforce: "pre",
     resolveId(source) {
-      return /(?:^|\/)duckdb-wasm-bundles(?:\.ts)?$/.test(source)
-        ? modulePath
-        : null;
+      return /(?:^|\/)duckdb-wasm-bundles(?:\.ts)?$/.test(source) ? modulePath : null;
     },
   };
 }
@@ -544,10 +626,7 @@ function safeDecodeURIComponent(value: string): string {
   }
 }
 
-async function proxyWmsRequest(
-  req: IncomingMessage,
-  res: ServerResponse,
-): Promise<void> {
+async function proxyWmsRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   await proxyBinaryRequest(req, res, WMS_PROXY_PATH);
 }
 
@@ -570,8 +649,7 @@ async function proxyBinaryRequest(
   if (range) headers.set("range", range);
 
   const response = await fetch(target, { headers });
-  const contentType =
-    response.headers.get("content-type") ?? "application/octet-stream";
+  const contentType = response.headers.get("content-type") ?? "application/octet-stream";
   const body = Buffer.from(await response.arrayBuffer());
 
   res.statusCode = response.status;
@@ -612,6 +690,17 @@ function pwaPlugin(): Plugin[] {
     // its first runtime fetch and is CacheFirst-cached thereafter.
     "**/maplibre-*",
     "**/duckdb-*",
+    // CesiumJS (~4.8 MB) for the 3D-globe view. Lazily imported only when a pane
+    // switches to the globe, so it is CacheFirst-cached on first use rather than
+    // bloating the app-shell precache. The `Cesium-*` (capital) glob catches the
+    // Rollup facade chunk for the dynamic `import("cesium")` boundary, which the
+    // lowercase glob misses on case-sensitive matchers.
+    "**/cesium-*",
+    "**/Cesium-*",
+    // h5wasm's ~5.6 MB single-file chunk (embedded libhdf5) for the local
+    // NetCDF/HDF reader. Lazily imported when a user opens a local file, so it
+    // is CacheFirst-cached on first use rather than bloating the precache.
+    "**/hdf5_hl-*",
     "**/pglite-*",
     "**/earth-engine-browser-*",
     "**/mapillary-*",
@@ -622,6 +711,19 @@ function pwaPlugin(): Plugin[] {
     // its own service worker scoped to /jupyterlite/. Keep it entirely out of
     // the app shell precache, or first visit would balloon by thousands of files.
     "**/jupyterlite/**",
+    // Bundled drop-in plugins (public/plugins/<id>/) load at runtime through
+    // the external-plugin path (fetch → blob import), so they never need to be
+    // in the app-shell precache — and a large private plugin bundle would
+    // otherwise trip workbox's maximumFileSizeToCacheInBytes and fail the build.
+    "**/plugins/**",
+    // Lazy per-locale i18n catalogs (`i18n-locale-<code>` chunks from
+    // manualChunks). Only the active language is fetched, and it is CacheFirst-
+    // cached on first use like the other lazily-loaded chunks — keeping all 15
+    // non-English catalogs (several MB fully translated) out of the app-shell
+    // precache. The `-locale-` infix is required: the i18n init + English chunk
+    // is auto-named `i18n-<hash>` and must stay precached, so this must NOT match
+    // it. English is bundled there, so it stays precached and works offline.
+    "**/i18n-locale-*.js",
   ];
   // Note: the 4 KB public/pyodide/pyodide-worker.js shim is intentionally left
   // in the precache (revisioned, so no stale-after-deploy risk). The heavy
@@ -765,15 +867,11 @@ export default defineConfig({
     projectUrlQueryPlugin(),
     bundledPlugins(path.resolve(__dirname, "public/plugins")),
     copyVectorOps(
-      path.resolve(
-        __dirname,
-        "../../backend/geolibre_server/geolibre_server/vector_ops.py",
-      ),
+      path.resolve(__dirname, "../../backend/geolibre_server/geolibre_server/vector_ops.py"),
       path.resolve(__dirname, "src/lib/pyodide/vector_ops.generated.py"),
     ),
-    copyRtlText(
-      path.resolve(__dirname, "src/lib/vendor/mapbox-gl-rtl-text.generated.js"),
-    ),
+    copyRtlText(path.resolve(__dirname, "src/lib/vendor/mapbox-gl-rtl-text.generated.js")),
+    copyCesiumAssets(path.resolve(__dirname, "public/cesium")),
     react(),
     wmsProxyPlugin(),
     selectiveJsMinifyPlugin(),
@@ -783,6 +881,7 @@ export default defineConfig({
   clearScreen: false,
   define: {
     __GEOLIBRE_VERSION__: JSON.stringify(APP_VERSION),
+    __GEOLIBRE_STORE_BUILD__: JSON.stringify(IS_STORE_BUILD),
     __PGLITE_CDN_URL__: JSON.stringify(PGLITE_CDN_URL),
     __PGLITE_POSTGIS_CDN_URL__: JSON.stringify(PGLITE_POSTGIS_CDN_URL),
     __CEREUS_WASM_CDN_URL__: JSON.stringify(CEREUS_WASM_CDN_URL),
@@ -823,6 +922,16 @@ export default defineConfig({
       // pre-bundled via the deck.gl-geotiff static import.)
       "proj4",
       "geotiff-geokeys-to-proj4",
+      // Cesium (the 3D-globe view). Pre-bundle it up front so esbuild applies
+      // CJS→ESM interop to its CommonJS transitive deps (e.g. mersenne-twister,
+      // which has no ESM entry): without this, the dev server serves those raw
+      // and the `import x from "mersenne-twister"` default import throws. It is
+      // reached only through the lazy `import("cesium")` in CesiumCanvas, so
+      // without pre-bundling Vite would also discover it on first open and do a
+      // full-page reload to re-optimize. Cesium locates its Workers/Assets via
+      // the CESIUM_BASE_URL global (never `import.meta.url`), so pre-bundling
+      // does not mangle any asset reference.
+      "cesium",
     ],
     // PGlite ships its own WASM + filesystem bundles and must not be pre-bundled
     // by esbuild, which mangles those asset references (per PGlite's Vite guide).
@@ -847,6 +956,11 @@ export default defineConfig({
       // breaks that asset reference so the tiler stops rendering. Serve it
       // as-is. (Its plain-JS deps are pre-bundled via optimizeDeps.include.)
       "cog-tiler-wasm",
+      // h5wasm (local NetCDF/HDF5 reader) loads its libhdf5 .wasm via
+      // `new URL(..., import.meta.url)`; esbuild pre-bundling mangles that
+      // asset reference, so serve it as-is. Only reached through the lazy
+      // dynamic import in local-netcdf.ts when a user opens a local file.
+      "h5wasm",
     ],
   },
   build: {
@@ -866,7 +980,15 @@ export default defineConfig({
     } satisfies RollupOptions,
   },
   resolve: {
-    dedupe: ["react", "react-dom", "maplibre-gl"],
+    // `@anthropic-ai/sdk` (and the other assistant provider SDKs) are optional
+    // peers of `@strands-agents/sdk`, which is hoisted to the monorepo root. When
+    // a provider SDK can't hoist to root alongside it (e.g. a duplicate version
+    // pulled in by another dependency), strands' bare `import '@anthropic-ai/sdk'`
+    // is unresolvable from the root and the production build emits a throwing stub
+    // ("Cannot destructure property 'AnthropicModel' … is undefined"). Deduping
+    // these forces resolution from this app's node_modules — where they are always
+    // installed — so the build is deterministic across environments (see #331).
+    dedupe: ["react", "react-dom", "maplibre-gl", "@anthropic-ai/sdk", "openai", "@google/genai"],
     alias: {
       "@": path.resolve(__dirname, "./src"),
       module: path.resolve(__dirname, "./src/lib/browser-node-module.ts"),

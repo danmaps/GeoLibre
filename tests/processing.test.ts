@@ -128,9 +128,7 @@ describe("processing registry", () => {
       },
     });
     assert.equal(left!.features.length, 2);
-    const outside = left!.features.find(
-      (f) => f.properties?.name === "outside",
-    );
+    const outside = left!.features.find((f) => f.properties?.name === "outside");
     // Unmatched left-join rows null-fill the join columns (consistent schema,
     // mirrors the sidecar), so `region` is present and null rather than absent.
     assert.equal(outside?.properties?.region, null);
@@ -353,9 +351,7 @@ describe("processing registry", () => {
       },
     });
     assert.equal(inner!.features.length, 2);
-    const innerBarbour = inner!.features.find(
-      (f) => f.properties?.GEOID === 1003,
-    );
+    const innerBarbour = inner!.features.find((f) => f.properties?.GEOID === 1003);
     assert.equal(innerBarbour?.properties?.pop, 200);
     // Only "pop" was requested, so "label" is not brought over.
     assert.equal("label" in (innerBarbour?.properties ?? {}), false);
@@ -379,9 +375,7 @@ describe("processing registry", () => {
         blankFields = geojson;
       },
     });
-    const blankAutauga = blankFields!.features.find(
-      (f) => f.properties?.GEOID === "01001",
-    );
+    const blankAutauga = blankFields!.features.find((f) => f.properties?.GEOID === "01001");
     assert.equal(blankAutauga?.properties?.pop, 100);
     assert.equal(blankAutauga?.properties?.label, "Autauga");
   });
@@ -435,62 +429,35 @@ describe("processing registry", () => {
       fc.features.map((f) => f.properties?.name as string | undefined).sort();
 
     // Numeric comparison: pop > 15 → only beta.
-    assert.deepEqual(names(run({ field: "pop", operator: "gt", value: "15" })), [
-      "beta",
-    ]);
+    assert.deepEqual(names(run({ field: "pop", operator: "gt", value: "15" })), ["beta"]);
     // String equals.
-    assert.deepEqual(
-      names(run({ field: "name", operator: "eq", value: "alpha" })),
-      ["alpha"],
-    );
+    assert.deepEqual(names(run({ field: "name", operator: "eq", value: "alpha" })), ["alpha"]);
     // Case-insensitive contains.
-    assert.deepEqual(
-      names(run({ field: "name", operator: "contains", value: "ET" })),
-      ["beta"],
-    );
+    assert.deepEqual(names(run({ field: "name", operator: "contains", value: "ET" })), ["beta"]);
     // is-null matches both an explicit null (gamma) and a missing key (delta).
-    assert.deepEqual(names(run({ field: "pop", operator: "is-null" })), [
+    assert.deepEqual(names(run({ field: "pop", operator: "is-null" })), ["delta", "gamma"]);
+    // is-not-null is the inverse: only the features with a real pop value.
+    assert.deepEqual(names(run({ field: "pop", operator: "is-not-null" })), ["alpha", "beta"]);
+    // starts-with is case-insensitive.
+    assert.deepEqual(names(run({ field: "name", operator: "starts-with", value: "AL" })), [
+      "alpha",
+    ]);
+    // neq excludes the matched value (nulls/missing never compare equal).
+    assert.deepEqual(names(run({ field: "name", operator: "neq", value: "alpha" })), [
+      "beta",
       "delta",
       "gamma",
     ]);
-    // is-not-null is the inverse: only the features with a real pop value.
-    assert.deepEqual(names(run({ field: "pop", operator: "is-not-null" })), [
-      "alpha",
-      "beta",
-    ]);
-    // starts-with is case-insensitive.
-    assert.deepEqual(
-      names(run({ field: "name", operator: "starts-with", value: "AL" })),
-      ["alpha"],
-    );
-    // neq excludes the matched value (nulls/missing never compare equal).
-    assert.deepEqual(
-      names(run({ field: "name", operator: "neq", value: "alpha" })),
-      ["beta", "delta", "gamma"],
-    );
     // SQL-like: neq on a numeric field excludes the null (gamma) and missing
     // (delta) rows, not just the equal one.
-    assert.deepEqual(
-      names(run({ field: "pop", operator: "neq", value: "10" })),
-      ["beta"],
-    );
+    assert.deepEqual(names(run({ field: "pop", operator: "neq", value: "10" })), ["beta"]);
     // gte / lte boundary checks.
-    assert.deepEqual(names(run({ field: "pop", operator: "gte", value: "20" })), [
-      "beta",
-    ]);
-    assert.deepEqual(names(run({ field: "pop", operator: "lte", value: "10" })), [
-      "alpha",
-    ]);
+    assert.deepEqual(names(run({ field: "pop", operator: "gte", value: "20" })), ["beta"]);
+    assert.deepEqual(names(run({ field: "pop", operator: "lte", value: "10" })), ["alpha"]);
     // A field absent from every feature is schemaless all-empty, not an error:
     // eq matches nothing, is-null matches every feature.
-    assert.equal(
-      run({ field: "missing", operator: "eq", value: "x" }).features.length,
-      0,
-    );
-    assert.equal(
-      run({ field: "missing", operator: "is-null" }).features.length,
-      4,
-    );
+    assert.equal(run({ field: "missing", operator: "eq", value: "x" }).features.length, 0);
+    assert.equal(run({ field: "missing", operator: "is-null" }).features.length, 4);
 
     // A hex-looking string compares as text, not coerced to a number — matching
     // Python's float(), which rejects "0x10" (so the engines stay in sync).
@@ -523,6 +490,59 @@ describe("processing registry", () => {
     };
     assert.equal(runHex({ operator: "eq", value: "16" }), 0);
     assert.equal(runHex({ operator: "eq", value: "0x10" }), 1);
+  });
+
+  it("extracts a random subset of features", () => {
+    const tool = getVectorTool("random-extract");
+    assert.ok(tool);
+    // 10 features with distinct, ordered ids so we can check membership + order.
+    const many: GeoLibreLayer = {
+      ...layer,
+      id: "many",
+      name: "Many",
+      geojson: {
+        type: "FeatureCollection",
+        features: Array.from({ length: 10 }, (_, i) => ({
+          type: "Feature" as const,
+          properties: { idx: i },
+          geometry: { type: "Point" as const, coordinates: [i, 0] },
+        })),
+      },
+    };
+    const run = (parameters: Record<string, unknown>): FeatureCollection => {
+      let out: FeatureCollection = { type: "FeatureCollection", features: [] };
+      tool.run({
+        layers: [many],
+        parameters: { layer: "many", ...parameters },
+        log: () => {},
+        addResultLayer: (_n, g) => {
+          out = g;
+        },
+      });
+      return out;
+    };
+
+    // By count: exactly N features, all drawn from the input, no duplicates,
+    // and the input's feature order is preserved in the output.
+    const byCount = run({ method: "count", count: 3 });
+    assert.equal(byCount.features.length, 3);
+    const idxs = byCount.features.map((f) => f.properties?.idx as number);
+    assert.ok(idxs.every((i) => i >= 0 && i < 10));
+    assert.equal(new Set(idxs).size, 3);
+    assert.deepEqual(
+      idxs,
+      [...idxs].sort((a, b) => a - b),
+    );
+
+    // By percentage: 40% of 10 → 4 features.
+    assert.equal(run({ method: "percentage", percentage: 40 }).features.length, 4);
+    // 0% (and a count of 0) select nothing.
+    assert.equal(run({ method: "percentage", percentage: 0 }).features.length, 0);
+    assert.equal(run({ method: "count", count: 0 }).features.length, 0);
+    // A count larger than the input is clamped to every feature, not an error.
+    assert.equal(run({ method: "count", count: 999 }).features.length, 10);
+    // Likewise a percentage above 100 clamps to the full input.
+    assert.equal(run({ method: "percentage", percentage: 150 }).features.length, 10);
   });
 
   it("selects features by location, including disjoint", () => {
@@ -558,10 +578,7 @@ describe("processing registry", () => {
     const overlap = square("overlap", 0.5); // intersects a
     const far = square("far", 10); // disjoint from a
     // A large square that fully contains `a`, and a tiny one fully inside it.
-    const bigPoly = (
-      id: string,
-      coords: number[][],
-    ): GeoLibreLayer => ({
+    const bigPoly = (id: string, coords: number[][]): GeoLibreLayer => ({
       ...layer,
       id,
       name: id,
@@ -591,10 +608,7 @@ describe("processing registry", () => {
       [0.2, 0.2],
     ]);
 
-    const run = (
-      filter: GeoLibreLayer,
-      predicate: string,
-    ): FeatureCollection => {
+    const run = (filter: GeoLibreLayer, predicate: string): FeatureCollection => {
       let out: FeatureCollection = { type: "FeatureCollection", features: [] };
       tool.run({
         layers: [a, filter],
@@ -725,11 +739,7 @@ describe("processing registry", () => {
       name: "Parcels",
       geojson: {
         type: "FeatureCollection",
-        features: [
-          cell("north", 10, 0),
-          cell("north", 30, 1),
-          cell("south", 5, 5),
-        ],
+        features: [cell("north", 10, 0), cell("north", 30, 1), cell("south", 5, 5)],
       },
     };
     const run = (parameters: Record<string, unknown>): FeatureCollection => {
@@ -924,8 +934,7 @@ describe("processing registry", () => {
       },
     });
     assert.ok(out);
-    const ring = (out!.features[0].geometry as { coordinates: number[][][] })
-      .coordinates[0];
+    const ring = (out!.features[0].geometry as { coordinates: number[][][] }).coordinates[0];
     // One Chaikin pass on a 4-vertex closed ring yields 8 cut points + the
     // closing vertex, and stays a closed ring (more vertices than the input).
     assert.equal(ring.length, 9);
@@ -976,8 +985,7 @@ describe("processing registry", () => {
     );
     assert.ok(malformedOut);
     assert.deepEqual(
-      (malformedOut!.features[0].geometry as { coordinates: number[][][] })
-        .coordinates,
+      (malformedOut!.features[0].geometry as { coordinates: number[][][] }).coordinates,
       [[]],
     );
 
@@ -1011,9 +1019,7 @@ describe("processing registry", () => {
         line3dOut = g;
       },
     });
-    const coords3d = (
-      line3dOut!.features[0].geometry as { coordinates: number[][] }
-    ).coordinates;
+    const coords3d = (line3dOut!.features[0].geometry as { coordinates: number[][] }).coordinates;
     // Endpoints kept; the 1/4 cut point interpolates Z: 100*0.75 + 200*0.25 = 125.
     assert.ok(coords3d.every((c) => c.length === 3));
     assert.deepEqual(coords3d[1], [0, 2.5, 125]);
@@ -1179,8 +1185,7 @@ describe("processing registry", () => {
     assert.ok(cells.features.length > 0);
     assert.ok(
       cells.features.every(
-        (f) =>
-          f.geometry.type === "Polygon" || f.geometry.type === "MultiPolygon",
+        (f) => f.geometry.type === "Polygon" || f.geometry.type === "MultiPolygon",
       ),
     );
     const triangles = run("delaunay");
@@ -1236,10 +1241,7 @@ describe("processing registry", () => {
 
     // The guard runs before the diagram-type branch, so Delaunay rejects the
     // same axis-aligned input...
-    const runCollinear = (
-      type: string,
-      feats: typeof points.geojson.features,
-    ): string[] => {
+    const runCollinear = (type: string, feats: typeof points.geojson.features): string[] => {
       const out: string[] = [];
       let made = false;
       tool.run({
@@ -1267,9 +1269,7 @@ describe("processing registry", () => {
     // ...and diagonally collinear points (non-zero-area bbox) are caught by the
     // empty-result guard rather than silently producing nothing.
     assert.ok(
-      runCollinear("delaunay", [pt(0, 0), pt(1, 1), pt(2, 2)]).some((m) =>
-        m.includes("collinear"),
-      ),
+      runCollinear("delaunay", [pt(0, 0), pt(1, 1), pt(2, 2)]).some((m) => m.includes("collinear")),
     );
   });
 

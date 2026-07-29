@@ -39,11 +39,10 @@ declare global {
   }
 }
 
-export interface ColorFieldProps
-  extends Omit<
-    React.InputHTMLAttributes<HTMLInputElement>,
-    "type" | "value" | "onChange"
-  > {
+export interface ColorFieldProps extends Omit<
+  React.InputHTMLAttributes<HTMLInputElement>,
+  "type" | "value" | "onChange"
+> {
   /**
    * The current color as a `#rrggbb` hex string, or `TRANSPARENT_COLOR` when
    * the transparent toggle is on (only possible with `allowTransparent`).
@@ -149,9 +148,7 @@ export const ColorField = React.forwardRef<HTMLInputElement, ColorFieldProps>(
     // back to `fallbackColor` until the user picks one. The guard keys off the
     // value itself (not the `transparent` flag, which also depends on
     // `allowTransparent`) so the ref can never hold the transparent sentinel.
-    const lastOpaqueRef = React.useRef(
-      isTransparentColor(value) || !value ? fallbackColor : value,
-    );
+    const lastOpaqueRef = React.useRef(isTransparentColor(value) || !value ? fallbackColor : value);
     // Keep the remembered color current via an effect rather than a render-time
     // ref write, so a discarded/replayed concurrent render can't double-apply.
     React.useEffect(() => {
@@ -215,7 +212,12 @@ export const ColorField = React.forwardRef<HTMLInputElement, ColorFieldProps>(
         <div
           className={cn(
             "relative inline-flex",
-            supportsEyeDropper && fill && "flex-1",
+            // Grow to fill the row whenever the field is full-width, so the
+            // `w-full` swatch has a real width to fill. Gating this on
+            // `supportsEyeDropper` collapsed the swatch to a thin vertical line
+            // in browsers/webviews without the EyeDropper API (Firefox, Safari,
+            // the desktop webview), where the eyedropper button is absent.
+            fill && "flex-1",
           )}
         >
           {/* While transparent, the visible color input is left unnamed and a

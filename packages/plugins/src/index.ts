@@ -41,11 +41,17 @@ export {
   subscribeFloatingPanels,
   type FloatingPanelsSnapshot,
 } from "./floating-panel-registry";
+// Public so hosts and plugins that ship their own panel-like registries can
+// reuse the title-resolve-or-fallback + per-id warning-dedup behavior instead
+// of re-implementing (and drifting from) it.
+export { PanelTitleResolver } from "./panel-title";
 export { maplibreLayerControlPlugin } from "./plugins/layer-control";
 export { osmBasemapPlugin } from "./plugins/osm-basemap";
 export { cartoLightPlugin } from "./plugins/carto-light";
 export {
   maplibreBasemapControlPlugin,
+  BASEMAP_CONTROL_PLUGIN_ID,
+  getActiveBasemapControl,
   setBasemapControlLabels,
   type BasemapControlLabels,
 } from "./plugins/maplibre-basemap-control";
@@ -85,6 +91,7 @@ export {
   openColorbarPanel,
   openHtmlPanel,
   openLegendPanel,
+  openLegendPanelWithItems,
   openLidarLayerPanel,
   restoreLidarLayers,
   openMeasurePanel,
@@ -99,6 +106,12 @@ export {
   openZarrLayerPanel,
   addCloudNetcdfLayer,
   type CloudNetcdfLayerOptions,
+  addZarrRasterLayer,
+  setZarrLayerSelector,
+  setZarrLocalStoreProvider,
+  type ZarrRasterLayerOptions,
+  type ZarrReadableStore,
+  type ZarrTimeAttributesReader,
   setBookmarkLabels,
   setViewStateLabels,
   subscribeBookmarkPanel,
@@ -122,6 +135,22 @@ export {
   type KerchunkVariable,
 } from "./plugins/kerchunk-reference-store";
 export {
+  ZarrDirectoryStore,
+  createDirectoryZarrMetadataReader,
+  localZarrStoreUrl,
+  normalizeZarrKey,
+  type ZarrDirectoryReader,
+  type ZarrMetadataReader,
+} from "./plugins/zarr-directory-store";
+export {
+  openLocalNetcdf,
+  buildInlineZarrRefs,
+  type LocalNetcdfFile,
+  type LocalNetcdfVariable,
+  type LocalNetcdfLayerRefs,
+  type InlineZarrGrid,
+} from "./plugins/local-netcdf";
+export {
   closeDuckDBLayerPanel,
   getDuckDBFeatureBounds,
   getDuckDBLayerRows,
@@ -132,6 +161,11 @@ export {
   type DuckDBAttributeRow,
   type DuckDBIdentifyResult,
 } from "./plugins/maplibre-duckdb";
+export {
+  queryOvertureFeatures,
+  overtureFeatureMatchesFilter,
+  overtureTilesForBBox,
+} from "./plugins/overture-query";
 export {
   closePlanetaryComputerPanel,
   openPlanetaryComputerPanel,
@@ -151,16 +185,23 @@ export {
 } from "./plugins/maplibre-3d-tiles";
 export {
   addRasterToMap,
+  prepareRasterControl,
   applyRasterLayerOrder,
   closeRasterLayerPanel,
   openRasterLayerPanel,
   restoreRasterLayers,
+  setLocalRasterFileReader,
+  setLocalRasterPicker,
   setNonTiledRasterHandler,
   setRasterPixelInspect,
+  type LocalRasterFileReader,
+  type LocalRasterPicker,
   type NonTiledRasterRequest,
+  type PickedLocalRaster,
 } from "./plugins/maplibre-raster";
 export {
   RASTER_MAX_CLASSES,
+  RASTER_MAX_STORED_CLASSES,
   RASTER_MIN_CLASSES,
   RASTER_MIN_CUSTOM_COLORS,
   type RasterBandStats,
@@ -171,13 +212,19 @@ export {
   defaultRasterSymbology,
   savedRasterSymbology,
 } from "./plugins/raster-symbology";
+export { RASTER_SOURCE_KIND, getRasterBandStats } from "./plugins/raster-symbology-texture";
 export {
-  RASTER_SOURCE_KIND,
-  getRasterBandStats,
-} from "./plugins/raster-symbology-texture";
+  disposeAllPaletteLegends,
+  disposePaletteLegend,
+  extractPaletteLegend,
+  getPaletteLegend,
+  type PaletteLegendEntry,
+} from "./plugins/raster-palette";
 export { colormapColors, warmColormapColors } from "./plugins/colormap-colors";
+export { setTerrainMeasureLabels } from "./plugins/terrain-measure";
 export {
   closeVectorLayerPanel,
+  getVectorLayerPropertyValues,
   materializeEmbeddableVectorLayers,
   openVectorLayerPanel,
   reloadVectorControlLayer,
@@ -221,10 +268,34 @@ export {
   setEffectsSettings,
 } from "./plugins/maplibre-effects";
 export {
-  DECK_VIZ_PLUGIN_ID,
-  maplibreDeckGlVizPlugin,
-} from "./plugins/maplibre-deckgl-viz";
+  advanceSunClock,
+  closeSunPanel,
+  DEFAULT_SUN_SETTINGS,
+  getSunSettings,
+  getSunSettingsSnapshot,
+  isSunPanelVisible,
+  localDayStart,
+  maplibreSunPlugin,
+  normalizeSunSettings,
+  openSunPanel,
+  reattachSun,
+  restoreSun,
+  setSunSettings,
+  SUN_PLUGIN_ID,
+  SUN_SHADE_MAX,
+  SUN_SHADE_MIN,
+  SUN_SPEED_MAX,
+  SUN_SPEED_MIN,
+  type SunSettings,
+  subsolarPoint,
+  subscribeSunPanel,
+  subscribeSunSettings,
+  sunEquatorialPosition,
+  sunPositionAt,
+} from "./plugins/maplibre-sun";
+export { DECK_VIZ_PLUGIN_ID, maplibreDeckGlVizPlugin } from "./plugins/maplibre-deckgl-viz";
 export { restoreDeckViz } from "./plugins/deckgl-viz/overlay";
+export { countAtlasDroppedDiagrams } from "./plugins/deckgl-viz/diagrams";
 export { ensureMercatorProjection } from "./plugins/map-projection-utils";
 export {
   DECK_VIZ_CATEGORY_LABELS,
@@ -259,19 +330,156 @@ export { maplibreEsriWaybackPlugin } from "./plugins/maplibre-esri-wayback";
 export { maplibreFemaWmsPlugin } from "./plugins/maplibre-fema-wms";
 export {
   maplibreGeoEditorPlugin,
+  GEO_EDITOR_PLUGIN_ID,
   canEditLayerGeometry,
   SKETCHES_SOURCE_KIND,
   startLayerGeometryEdit,
   endLayerGeometryEdit,
   getGeometryEditTargetLayerId,
   subscribeGeometryEdit,
+  isGeoEditorAvailableForImport,
+  getGeoEditorFeatureCount,
+  hasViewImportBaseline,
+  loadViewFeaturesIntoEditor,
+  buildEditorSaveCollection,
 } from "./plugins/maplibre-geo-editor";
+export {
+  listViewVectorLayers,
+  resolveStoreLayerViewSource,
+  queryViewLayerFeatures,
+  VIEW_IMPORT_ID_PROPERTY,
+  VIEW_IMPORT_CHANGE_PROPERTY,
+  type ViewVectorLayer,
+  type ViewImportMap,
+  type ViewImportExport,
+  type ViewImportChangeCounts,
+} from "./plugins/geo-editor-view-import";
 export { maplibreGeoAgentPlugin } from "./plugins/maplibre-geoagent";
 export { maplibreUsgsLidarPlugin } from "./plugins/maplibre-usgs-lidar";
 export { maplibreNasaEarthdataPlugin } from "./plugins/maplibre-nasa-earthdata";
+export {
+  DEFAULT_EARTHDATA_GIS_LABELS,
+  EARTHDATA_GIS_PLUGIN_ID,
+  maplibreEarthdataGisPlugin,
+  setEarthdataCogSaver,
+  setEarthdataGisLabels,
+  type EarthdataCogSaver,
+  type EarthdataGisLabels,
+} from "./plugins/maplibre-earthdata-gis";
+// The catalog client's helpers (buildSearchUrl, parseSearchResponse, …) are
+// deliberately not re-exported here: those names are already taken by the
+// OpenAerialMap client below. Import them from the module path instead.
+export {
+  EARTHDATA_GIS_PORTAL_URL,
+  type EarthdataGisItem,
+  type EarthdataGisSearchResult,
+  type EarthdataServiceKind,
+} from "./plugins/earthdata-gis-api";
+export {
+  DEFAULT_OPENAERIALMAP_LABELS,
+  maplibreOpenAerialMapPlugin,
+  OPENAERIALMAP_PLUGIN_ID,
+  setOpenAerialMapLabels,
+  type OpenAerialMapLabels,
+} from "./plugins/maplibre-openaerialmap";
+export {
+  buildSearchUrl,
+  buildTitilerTemplate,
+  OAM_DEFAULT_ENDPOINT,
+  parseSearchResponse,
+  searchOpenAerialMap,
+  type OamImage,
+  type OamSearchResult,
+  type OpenAerialMapSearchOptions,
+} from "./plugins/openaerialmap-api";
+export {
+  maplibreStacCatalogsPlugin,
+  setStacLabels,
+  STAC_PLUGIN_ID,
+  type StacLabels,
+} from "./plugins/maplibre-stac";
+export {
+  connectStac,
+  isVisualizableAsset,
+  itemBbox,
+  loadStacIndex,
+  searchStacApi,
+  searchStaticStac,
+  STAC_INDEX_CATALOGS_URL,
+  type StacAsset,
+  type StacCollection,
+  type StacConnection,
+  type StacIndexCatalog,
+  type StacItem,
+  type StacNextPage,
+  type StacSearchOptions,
+  type StacSearchResult,
+} from "./plugins/stac-api";
+export {
+  DEFAULT_SOURCE_COOP_LABELS,
+  maplibreNaturalEarthPlugin,
+  maplibreSourceCoopPlugin,
+  NATURAL_EARTH_PLUGIN_ID,
+  setSourceCoopLabels,
+  SOURCE_COOP_PLUGIN_ID,
+  type SourceCoopLabels,
+  type SourceCoopPinnedProduct,
+} from "./plugins/maplibre-source-coop";
+export {
+  DEFAULT_HUGGINGFACE_LABELS,
+  HUGGINGFACE_PLUGIN_ID,
+  maplibreHuggingFacePlugin,
+  setHuggingFaceLabels,
+  type HuggingFaceLabels,
+} from "./plugins/maplibre-huggingface";
+export {
+  DEFAULT_GEOLENS_LABELS,
+  DEFAULT_GEOLENS_FEATURE_LIMIT,
+  GEOLENS_FEATURES_SOURCE_KIND,
+  GEOLENS_PLUGIN_ID,
+  GEOLENS_SAMPLE_SERVERS,
+  maplibreGeoLensPlugin,
+  normalizeGeoLensFeatureLimit,
+  setGeoLensLabels,
+  type GeoLensLabels,
+  type GeoLensSampleServer,
+} from "./plugins/maplibre-geolens";
+export {
+  buildListObjectsUrl,
+  buildObjectUrl,
+  classifyKey,
+  fetchCatalog,
+  filterProducts,
+  formatBytes,
+  isAddable,
+  listProductObjects,
+  parseFeed,
+  parseListObjects,
+  parseProduct,
+  parseProductList,
+  parseProductRef,
+  productUrl,
+  SOURCE_COOP_DATA_BASE,
+  SOURCE_COOP_PROXY_ENDPOINT,
+  synthesizeProduct,
+  type SourceCoopFormat,
+  type SourceCoopListing,
+  type SourceCoopObject,
+  type SourceCoopProduct,
+} from "./plugins/source-coop-api";
 export { maplibreNationalMapPlugin } from "./plugins/maplibre-national-map";
 export { maplibreOvertureMapsPlugin } from "./plugins/maplibre-overture-maps";
 export { maplibreStreetViewPlugin } from "./plugins/maplibre-streetview";
+export {
+  maplibreMapillaryPlugin,
+  MAPILLARY_PLUGIN_ID,
+  setMapillaryLabels,
+  type MapillaryLabels,
+} from "./plugins/maplibre-mapillary";
+export {
+  maplibreElevationProfilePlugin,
+  ELEVATION_PROFILE_PLUGIN_ID,
+} from "./plugins/elevation-profile";
 export { maplibreSwipePlugin, SWIPE_PLUGIN_ID } from "./plugins/maplibre-swipe";
 export {
   maplibreGraticulePlugin,
@@ -289,16 +497,88 @@ export {
   type GraticuleLabelEdges,
 } from "./plugins/maplibre-graticule";
 export {
+  maplibreH3Plugin,
+  H3_PLUGIN_ID,
+  H3_VIEWPORT_CELL_LIMIT,
+  DEFAULT_H3_GRID_SETTINGS,
+  DEFAULT_H3_LABELS,
+  getH3GridSettings,
+  setH3GridSettings,
+  setH3Labels,
+  normalizeH3GridSettings,
+  h3LabelMinZoom,
+  h3CellFeature,
+  h3GridForBounds,
+  h3BoundaryGeometry,
+  unwrapH3Boundary,
+  type H3GridSettings,
+  type H3Labels,
+} from "./plugins/maplibre-h3";
+export type { WeatherAnimationState, WeatherLayerController } from "./plugins/weather-layer";
+export {
+  maplibreCloudsPlugin,
+  CLOUDS_PLUGIN_ID,
+  getCloudsAnimationState,
+  setCloudsFrame,
+  toggleCloudsPlaying,
+  subscribeClouds,
+} from "./plugins/maplibre-clouds";
+export {
+  maplibrePrecipitationPlugin,
+  PRECIPITATION_PLUGIN_ID,
+  getPrecipitationAnimationState,
+  setPrecipitationFrame,
+  togglePrecipitationPlaying,
+  subscribePrecipitation,
+} from "./plugins/maplibre-precipitation";
+export {
   maplibreTimeSliderPlugin,
   TIME_SLIDER_PLUGIN_ID,
+  TIME_SLIDER_SOURCE_KIND,
   getActiveTimeSliderControl,
   getLayerTimeBinding,
+  isTimeSliderIdle,
 } from "./plugins/maplibre-time-slider";
+export {
+  DEFAULT_TIMELAPSE_LABELS,
+  getActiveTimelapseControl,
+  maplibreTimelapsePlugin,
+  recordTimelapseCycle,
+  setTimelapseLabels,
+  setTimelapseVideoSaver,
+  TIMELAPSE_PANEL_ID,
+  TIMELAPSE_PLUGIN_ID,
+  TIMELAPSE_SOURCE_KIND,
+  timelapseStoreLayerId,
+  TimelapseControl,
+  TimelapseVideoUnsupportedError,
+  type RecordTimelapseCycleOptions,
+  type TimelapseLabels,
+  type TimelapseRecording,
+  type TimelapseVideoSaver,
+} from "./plugins/maplibre-timelapse";
+export {
+  eoxS2CloudlessProvider,
+  EOX_S2CLOUDLESS_PROVIDER_ID,
+  getTimelapseProvider,
+  listTimelapseProviders,
+  MODIS_LANDCOVER_PROVIDER_ID,
+  modisLandCoverProvider,
+  NASA_GIBS_WELD_NDVI_PROVIDER_ID,
+  NASA_GIBS_WELD_PROVIDER_ID,
+  nasaGibsWeldNdviProvider,
+  nasaGibsWeldProvider,
+  registerTimelapseProvider,
+  type TimelapseFrame,
+  type TimelapseLegendItem,
+  type TimelapseProvider,
+} from "./plugins/timelapse-providers";
 export {
   bandOptionsFromResults,
   downsampleSteps,
-  getTimeSliderCogSources,
+  getTimeSliderPixelSources,
   hasTimeSliderRasterStack,
+  ordinalSteps,
   queryPixelTimeSeries,
   seriesToFeatureCollection,
   valueAtBand,
@@ -310,13 +590,171 @@ export {
   type PixelTimeSeriesResult,
 } from "./plugins/time-slider-pixel-series";
 export {
+  getTimeSliderSymbology,
+  parseBandList,
+  setTimeSliderSymbology,
+  type TimeSliderSymbology,
+  type TimeSliderSymbologyPatch,
+} from "./plugins/time-slider-symbology";
+export {
+  getPixelIdentifiableSource,
+  identifyTimeSliderPixel,
+  isPixelIdentifiableSourceType,
+  PixelOutsideCoverageError,
+  type PixelIdentifiableSpec,
+  type TimeSliderPixelIdentifyResult,
+} from "./plugins/time-slider-pixel-identify";
+export {
   buildTimeBinding,
+  buildTimeBindingFromRecords,
   buildTimeFilter,
   detectTimeProperties,
+  detectTimePropertiesFromRecords,
+  formatTimeExtentInput,
+  parseTimeValue,
+  type BuildTimeBindingOptions,
   type TimeBinding,
   type TimeGranularity,
   type TimePropertyCandidate,
+  type TimePropertyRecord,
   type TimeValueKind,
   type TimeWindow,
 } from "./plugins/time-slider-binding";
+export {
+  buildSelectorTimeBinding,
+  getTemporalLayerAdapter,
+  getTemporalLayersVersion,
+  isSelectorTimeBinding,
+  nearestTimeIndex,
+  registerTemporalLayer,
+  subscribeTemporalLayers,
+  toEpochMsAxis,
+  unregisterTemporalLayer,
+  type SelectorTimeBinding,
+  type TemporalLayerAdapter,
+} from "./plugins/temporal-layers";
+export {
+  decodeCfTimeValues,
+  fetchZarrTimeAttributes,
+  parseCfTimeUnits,
+  pickTimeDimension,
+  resolveZarrTimeAxis,
+  type CfTimeUnits,
+  type ZarrTimeAttributes,
+  type ZarrTimeAxis,
+} from "./plugins/zarr-time-axis";
+export {
+  isTileVectorLayer,
+  resolveTileQueryTargets,
+  sampleTileFeatureRecords,
+  type TileQueryTarget,
+  type TileSampleMap,
+  type TileSampleStyle,
+} from "./plugins/time-slider-tile-sample";
 export { WEB_SERVICE_PLUGIN_IDS } from "./plugins/web-service-sync";
+export {
+  DEFAULT_ROUTE_ANIMATION_SETTINGS,
+  ROUTE_ANIM_SPEED_MAX,
+  ROUTE_ANIM_SPEED_MIN,
+  ROUTE_ANIMATION_PLUGIN_ID,
+  ROUTE_FOLLOW_PITCH_MAX,
+  ROUTE_FOLLOW_PITCH_MIN,
+  ROUTE_FOLLOW_ZOOM_MAX,
+  ROUTE_FOLLOW_ZOOM_MIN,
+  ROUTE_MARKER_STYLES,
+  ROUTE_VIDEO_FPS,
+  ROUTE_VIDEO_MIME_CANDIDATES,
+  RouteVideoUnsupportedError,
+  closeRouteAnimationPanel,
+  getRouteAnimationDurationSeconds,
+  getRouteAnimationSettings,
+  getRouteAnimationSnapshot,
+  isRouteAnimationPanelVisible,
+  isRouteVideoSupported,
+  maplibreRouteAnimationPlugin,
+  normalizeRouteAnimationSettings,
+  openRouteAnimationPanel,
+  pickRouteVideoMimeType,
+  pickVideoMimeType,
+  reattachRouteAnimation,
+  recordRouteAnimation,
+  restoreRouteAnimation,
+  setRouteAnimationElevation,
+  setRouteAnimationProgress,
+  setRouteAnimationRoute,
+  setRouteAnimationSettings,
+  subscribeRouteAnimation,
+  subscribeRouteAnimationPanel,
+  toggleRouteAnimationPlaying,
+  videoExtensionForMime,
+  type RecordRouteAnimationOptions,
+  type RouteAnimationRecording,
+  type RouteAnimationSettings,
+  type RouteElevationConfig,
+  type RouteMarkerStyle,
+} from "./plugins/maplibre-route-animation";
+export {
+  bearingBetween,
+  flattenToLine,
+  flattenToRoute,
+  measureLine,
+  pointAlongLine,
+  sliceLineAtDistance,
+  sliceRouteAtDistance,
+  type PointOnLine,
+  type RouteWithElevation,
+} from "./plugins/route-animation-geometry";
+export {
+  DEFAULT_FLIGHT_SIMULATOR_SETTINGS,
+  FLIGHT_CAMERA_TOKEN,
+  FLIGHT_MAX_SPEED_MAX,
+  FLIGHT_MAX_SPEED_MIN,
+  FLIGHT_MIN_AGL_MAX,
+  FLIGHT_MIN_AGL_MIN,
+  FLIGHT_SIMULATOR_PLUGIN_ID,
+  FLIGHT_UNITS,
+  LEVEL_CAMERA_PITCH,
+  MAX_CAMERA_PITCH,
+  MIN_CAMERA_PITCH,
+  closeFlightSimulatorPanel,
+  flightSimulatorPlugin,
+  getFlightHudSnapshot,
+  getFlightSimulatorSettings,
+  getFlightSimulatorSnapshot,
+  isFlightSimulatorPanelVisible,
+  isFlying,
+  normalizeFlightSimulatorSettings,
+  openFlightSimulatorPanel,
+  reattachFlightSimulator,
+  restoreFlightSimulator,
+  setFlightSimulatorSettings,
+  startFlying,
+  stopFlying,
+  subscribeFlightHud,
+  subscribeFlightSimulatorPanel,
+  toggleFlying,
+  type FlightHudState,
+  type FlightSimulatorSettings,
+  type FlightUnits,
+} from "./plugins/flight-simulator";
+export {
+  DEFAULT_FLIGHT_MODEL,
+  FEET_PER_METER,
+  KNOTS_PER_MPS,
+  MAX_FLIGHT_LATITUDE,
+  NEUTRAL_CONTROLS,
+  altitudeAboveGround,
+  altitudeForZoom,
+  approach,
+  compassPoint,
+  constrainToTerrain,
+  normalizeHeading,
+  normalizeLongitude,
+  offsetPosition,
+  stepFlight,
+  turnRateDegPerSec,
+  type AircraftState,
+  type FlightControls,
+  type FlightModelConfig,
+  type FlightStepResult,
+} from "./plugins/flight-simulator-physics";

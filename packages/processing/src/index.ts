@@ -5,7 +5,27 @@ export {
   calculateBoundsAlgorithm,
   countFeaturesAlgorithm,
 } from "./registry";
-export { VECTOR_TOOLS, getVectorTool } from "./vector-tools";
+export {
+  VECTOR_TOOLS,
+  getVectorTool,
+  matchFeaturesByLocation,
+  MAX_CLIENT_PAIRS,
+  SELECT_LOCATION_PREDICATES,
+  type LocationMatches,
+  type SelectLocationPredicate,
+} from "./vector-tools";
+export {
+  TOPOLOGY_TOOLS,
+  TOPOLOGY_RULES,
+  FIXABLE_TOPOLOGY_RULES,
+  checkValidityTool,
+  fixGeometriesTool,
+  checkTopologyRulesTool,
+  fixTopologyTool,
+  setTopologyWasmRunner,
+  type WasmToolRunner,
+  type WasmToolRunResult,
+} from "./topology-tools";
 export {
   runAlgorithmCapture,
   runModel,
@@ -13,11 +33,7 @@ export {
   type ModelStepResult,
   type RunModelOptions,
 } from "./runner";
-export {
-  NETWORK_TOOLS,
-  getNetworkTool,
-  layerToSequencedPoints,
-} from "./network-tools";
+export { NETWORK_TOOLS, getNetworkTool, layerToSequencedPoints } from "./network-tools";
 export {
   STATISTICS_TOOLS,
   getStatisticsTool,
@@ -26,13 +42,10 @@ export {
   getisOrdTool,
   averageNearestNeighborTool,
   kernelDensityTool,
+  emergingHotSpotTool,
+  emergingPattern,
 } from "./statistics-tools";
-export {
-  H3_TOOLS,
-  getH3Tool,
-  createH3GridTool,
-  binPointsTool,
-} from "./h3-tools";
+export { H3_TOOLS, getH3Tool, createH3GridTool, binPointsTool } from "./h3-tools";
 export {
   RASTER_TOOLS,
   getRasterTool,
@@ -79,6 +92,7 @@ export {
 } from "./raster-client";
 export {
   checkSidecarHealth,
+  setSidecarAuthToken,
   clearRemoteWhiteboxCatalogSnapshotCache,
   fetchConversionJob,
   fetchConversionStatus,
@@ -103,10 +117,18 @@ export {
   runVectorToPmtiles,
   runVectorToShapefile,
   runVectorToVector,
+  runVectorLayers,
   runVectorTool,
+  writeVectorToSource,
+  fetchPostgisStatus,
+  listPostgisTables,
+  readPostgisTable,
+  writePostgisTable,
   fetchVectorStatus,
   runWhiteboxTool,
   WHITEBOX_CATALOG_URL,
+  VECTOR_OUTPUT_FORMATS,
+  normalizeVectorOutputFormat,
   type ConversionJob,
   type ConversionStatus,
   type CsvToGeoParquetRequest,
@@ -127,9 +149,20 @@ export {
   type VectorToPmtilesRequest,
   type VectorToShapefileRequest,
   type VectorToVectorRequest,
+  type VectorDatasetLayer,
+  type VectorLayersRequest,
+  type VectorOutputFormat,
   type VectorStatus,
   type VectorToolRequest,
   type VectorToolResult,
+  type WriteVectorToSourceRequest,
+  type WriteVectorToSourceResult,
+  type PostgisStatus,
+  type PostgisTableInfo,
+  type ReadPostgisTableRequest,
+  type ReadPostgisTableResult,
+  type WritePostgisTableRequest,
+  type WritePostgisTableResult,
   type WhiteboxJob,
   type WhiteboxLayerInput,
   type WhiteboxParameterKind,
@@ -141,8 +174,13 @@ export {
   runWhiteboxToolWasm,
   whiteboxWasmAvailable,
   listWhiteboxWasmTools,
-  listGeolibreWasmTools,
+  listWasmToolManifests,
+  manifestScalarDefaults,
+  mergeWasmToolManifests,
+  type ToolManifest,
   outputBaseName,
+  fileOutputTargetExtension,
+  outputTextFormatHint,
   isTiff,
 } from "./wasm-client";
 export {
@@ -150,5 +188,51 @@ export {
   readGeoTiffInfo,
   isTiledGeoTiff,
   convertGeoTiffToCog,
+  COG_WASM_COMPRESSIONS,
+  type CogWasmCompression,
+  type ConvertGeoTiffToCogOptions,
   type GeoTiffInfo,
 } from "./cog-convert";
+export {
+  convertVectorWithWasm,
+  initConvertTools,
+  renderRasterToPmtiles,
+  tileVectorToPmtiles,
+  MAX_VECTOR_PMTILES_ZOOM,
+  PMTILES_COLORMAPS,
+  PMTILES_RESAMPLING_METHODS,
+  type PmtilesColormap,
+  type PmtilesResamplingMethod,
+  type RasterToPmtilesOptions,
+  type VectorToPmtilesOptions,
+  type WasmConvertFile,
+  type WasmConvertResult,
+} from "./wasm-convert";
+export {
+  extractPmtiles,
+  pmtilesTileTypeKind,
+  type ExtractPmtilesOptions,
+  type PmtilesExtractProgress,
+  type PmtilesExtractResult,
+  type PmtilesSourceInfo,
+} from "./pmtiles-extract";
+export {
+  detectObjects,
+  rasterFromRgba,
+  readDetectionImage,
+  type Detection,
+  type DetectionOptions,
+} from "./object-detection";
+export {
+  segmentEverything,
+  type SegmentMask,
+  type SegmentEverythingOptions,
+} from "./segment-everything";
+export {
+  extractCogSubset,
+  extractWmsSubset,
+  extractXyzTileSubset,
+  type ExtractCogSubsetOptions,
+  type ExtractWmsSubsetOptions,
+  type ExtractXyzTileSubsetOptions,
+} from "./raster-subset";

@@ -1,8 +1,4 @@
-import {
-  type CogSourceSpec,
-  generateSteps,
-  resolveUrl,
-} from "maplibre-gl-time-slider";
+import { generateSteps, resolveUrl } from "maplibre-gl-time-slider";
 import {
   type BandReading,
   loadGeoTIFF,
@@ -12,21 +8,31 @@ import {
 } from "maplibre-gl-raster";
 import type { Feature, FeatureCollection, Point } from "geojson";
 import { getActiveTimeSliderControl } from "./maplibre-time-slider";
+import {
+  isPixelIdentifiableSourceType,
+  type PixelIdentifiableSpec,
+  resolvePixelReadUrl,
+} from "./time-slider-pixel-identify";
 
 /**
  * Pixel time-series support for the Time Slider's raster stack.
  *
  * A Time Slider COG source is a single template URL (e.g.
  * `https://.../{date:YYYY}.tif`) that resolves to a different Cloud Optimized
- * GeoTIFF per timeline date. Stepping the timeline therefore walks a temporal
- * stack of COGs. This module clicks a single pixel through that stack: for every
- * timeline step it resolves the source URL, HTTP-range-reads just the tile under
- * the click, and records *every* band value, producing a value-over-time series
- * the UI charts (for a user-chosen band) and can export.
+ * GeoTIFF per timeline date; a mosaic source resolves the same way to a
+ * different MosaicJSON/STAC *manifest* per date, each listing many COGs.
+ * Stepping the timeline therefore walks a temporal stack either way. This module
+ * clicks a single pixel through that stack: for every timeline step it resolves
+ * the source URL, HTTP-range-reads just the tile under the click, and records
+ * *every* band value, producing a value-over-time series the UI charts (for a
+ * user-chosen band) and can export.
  *
  * It reuses `maplibre-gl-raster`'s `loadGeoTIFF`/`readPixelValues`, the same
  * client-side reader the single-COG Identify tool uses, so no Python sidecar or
- * full-file download is involved.
+ * full-file download is involved. Which file a step reads is decided by
+ * {@link resolvePixelReadUrl}, shared with the single-date Identify sibling
+ * (`time-slider-pixel-identify`) so a value charted over time and a value
+ * identified at the current date always come from the same COG.
  */
 
 /** A single timestep's reading for one source. */
@@ -35,7 +41,13 @@ export interface PixelSeriesPoint {
   date: string;
   /** Epoch milliseconds of the step, for ordering and the chart x-axis. */
   timestamp: number;
-  /** Concrete COG URL the source template resolved to for this date. */
+  /**
+   * The COG the value came from. For a COG source this is the URL the template
+   * resolved to for this date; for a mosaic it is the individual asset covering
+   * the click, so a reading stays attributable. Falls back to the resolved
+   * manifest URL when no asset covers the point, and is empty when the step was
+   * never reached (aborted query).
+   */
   url: string;
   /**
    * Every band's reading at the clicked pixel for this step. Empty when the
@@ -110,26 +122,41 @@ const DEFAULT_MAX_STEPS = 120;
 const READ_CONCURRENCY = 6;
 
 /**
- * The COG sources currently configured on the active Time Slider, in dock order.
+ * The pixel-readable sources currently configured on the active Time Slider, in
+ * dock order.
  *
- * @returns The COG source specs, or an empty array when the dock is closed or
- *   has no COG sources (XYZ/WMS/GeoJSON sources are not pixel-readable here).
+ * COG *and* mosaic sources qualify: both carry real source values behind a
+ * per-date URL, and both are read here with the same client-side GeoTIFF
+ * reader — a mosaic just resolves through its manifest to the asset covering
+ * the click first. This is deliberately the same set Identify accepts
+ * ({@link isPixelIdentifiableSourceType}), so a source the Layers panel offers
+ * to identify can also be charted.
+ *
+ * Accepting both is not optional for COG support either: the library renders a
+ * COG through its mosaic adapter on the `gpu`/`wasm` engines and rewrites the
+ * reported spec to `type: 'mosaic'`, and the dock's COG form defaults to `gpu`.
+ * Matching only `type === 'cog'` therefore hid the chart for the ordinary case
+ * of a COG stack added through the dock.
+ *
+ * @returns The COG/mosaic source specs, or an empty array when the dock is
+ *   closed or has none (XYZ/WMS are pre-rendered picture tiles with no source
+ *   values, and GeoJSON is not raster data).
  */
-export function getTimeSliderCogSources(): CogSourceSpec[] {
+export function getTimeSliderPixelSources(): PixelIdentifiableSpec[] {
   const control = getActiveTimeSliderControl();
   if (!control) return [];
   return control
     .getSources()
-    .filter((spec): spec is CogSourceSpec => spec.type === "cog");
+    .filter((spec): spec is PixelIdentifiableSpec => isPixelIdentifiableSourceType(spec.type));
 }
 
 /**
  * Whether the Time Slider currently exposes a pixel-readable raster stack.
  *
- * @returns True when at least one COG source is configured.
+ * @returns True when at least one COG or mosaic source is configured.
  */
 export function hasTimeSliderRasterStack(): boolean {
-  return getTimeSliderCogSources().length > 0;
+  return getTimeSliderPixelSources().length > 0;
 }
 
 /**
@@ -162,7 +189,35 @@ export function downsampleSteps(
 }
 
 /**
+ * The steps of an *ordinal* timeline: the explicit date list the slider walks,
+ * taking every `interval`-th entry so the sampled steps are exactly the marker
+ * positions the library's ordinal scale reaches from the start.
+ *
+ * Exported for testing — an ordinal timeline is what a sparse acquisition
+ * series (e.g. 16 irregular EMIT overpasses) uses, and deriving its steps from
+ * start/end/granularity instead would query hundreds of dates that have no data.
+ *
+ * @param dates - The clipped, ascending date list from the control's state.
+ * @param interval - Entries of `dates` between marker positions.
+ * @returns The step dates.
+ */
+export function ordinalSteps(dates: Date[], interval: number): Date[] {
+  // Guard a non-finite interval: `Math.max(1, Math.floor(NaN))` is NaN, which
+  // would make the loop below never advance.
+  const stride = Number.isFinite(interval) ? Math.max(1, Math.floor(interval)) : 1;
+  const kept: Date[] = [];
+  for (let i = 0; i < dates.length; i += stride) kept.push(dates[i]);
+  return kept;
+}
+
+/**
  * The timeline step dates for the active Time Slider, downsampled to the cap.
+ *
+ * A timeline is either *ordinal* (an explicit list of dates the slider visits,
+ * e.g. a sparse satellite acquisition series) or *continuous* (a start/end range
+ * walked in granularity units). Reading the range for an ordinal timeline would
+ * invent steps between the real acquisitions — every one of them a wasted read
+ * that charts as a gap — so the date list wins when the state carries one.
  *
  * @param maxSteps - Maximum steps before downsampling.
  * @returns The (possibly downsampled) step dates, whether the timeline was
@@ -177,12 +232,15 @@ function getTimeSliderSteps(maxSteps: number): {
   const control = getActiveTimeSliderControl();
   if (!control) return { steps: [], truncated: false, total: 0 };
   const state = control.getState();
-  const steps = generateSteps(
-    state.startDate,
-    state.endDate,
-    Math.max(1, state.interval),
-    state.granularity,
-  );
+  const steps =
+    state.dates && state.dates.length > 0
+      ? ordinalSteps(state.dates, state.interval)
+      : generateSteps(
+          state.startDate,
+          state.endDate,
+          Math.max(1, state.interval),
+          state.granularity,
+        );
   return { ...downsampleSteps(steps, maxSteps), total: steps.length };
 }
 
@@ -196,10 +254,7 @@ function getTimeSliderSteps(maxSteps: number): {
  *   (a stray NaN/Infinity would otherwise blank the whole chart via scaleY).
  *   Null renders as a gap.
  */
-export function valueAtBand(
-  point: PixelSeriesPoint,
-  bandIndex: number,
-): number | null {
+export function valueAtBand(point: PixelSeriesPoint, bandIndex: number): number | null {
   const band = point.bands.find((entry) => entry.index === bandIndex);
   if (!band || band.isNodata || !Number.isFinite(band.value)) return null;
   return band.value;
@@ -213,16 +268,13 @@ export function valueAtBand(
  * @param results - The loaded query results.
  * @returns Band options sorted by index.
  */
-export function bandOptionsFromResults(
-  results: PixelTimeSeriesResult[],
-): BandOption[] {
+export function bandOptionsFromResults(results: PixelTimeSeriesResult[]): BandOption[] {
   const byIndex = new Map<number, BandOption>();
   for (const result of results) {
     for (const band of result.bands) {
       const existing = byIndex.get(band.index);
       if (!existing) byIndex.set(band.index, band);
-      else if (existing.name == null && band.name != null)
-        byIndex.set(band.index, band);
+      else if (existing.name == null && band.name != null) byIndex.set(band.index, band);
     }
   }
   return [...byIndex.values()].sort((a, b) => a.index - b.index);
@@ -264,9 +316,7 @@ async function runWithConcurrency<T>(
       }
     }
   }
-  const workers = Array.from({ length: Math.min(limit, tasks.length) }, () =>
-    worker(),
-  );
+  const workers = Array.from({ length: Math.min(limit, tasks.length) }, () => worker());
   await Promise.all(workers);
   return results;
 }
@@ -283,7 +333,7 @@ async function runWithConcurrency<T>(
  *   band that renders the first series as all gaps).
  */
 function pickDefaultBandIndex(
-  sources: CogSourceSpec[],
+  sources: PixelIdentifiableSpec[],
   bands: BandOption[],
   firstSourcePoints: PixelSeriesPoint[],
 ): number | null {
@@ -292,38 +342,39 @@ function pickDefaultBandIndex(
   const firstSourceBands = new Set(
     firstSourcePoints.flatMap((point) => point.bands.map((band) => band.index)),
   );
-  if (configured !== undefined && firstSourceBands.has(configured))
-    return configured;
+  if (configured !== undefined && firstSourceBands.has(configured)) return configured;
   return bands[0].index;
 }
 
 /**
  * Queries a single pixel's value across the Time Slider's raster stack and
- * timeline, returning one value-over-time series per COG source. Every band is
- * read and retained so the UI can switch the charted band without re-querying.
+ * timeline, returning one value-over-time series per COG or mosaic source. Every
+ * band is read and retained so the UI can switch the charted band without
+ * re-querying.
  *
  * For every (source, step) pair the source URL template is resolved to the
  * step's date, the COG is opened, and all band values at the click are read via
- * an HTTP range read. Reads share a per-URL cache so a static (non-templated)
- * source is fetched once. Failed reads become empty points (charted as gaps)
- * rather than aborting the whole query.
+ * an HTTP range read. A mosaic step resolves to a manifest instead, so the asset
+ * covering the click is located first and read the same way. Reads share a
+ * per-URL cache so a static (non-templated) source, or a manifest repeated
+ * across dates, is fetched once. Failed reads become empty points (charted as
+ * gaps) rather than aborting the whole query.
  *
  * @param lngLat - The clicked location, `[lng, lat]` in WGS84.
  * @param options - Progress, abort, and step-cap controls.
  * @returns The assembled result.
- * @throws When the Time Slider has no COG sources or no timeline steps.
+ * @throws When the Time Slider has no COG/mosaic sources or no timeline steps.
  */
 export async function queryPixelTimeSeries(
   lngLat: [number, number],
   options: PixelTimeSeriesOptions = {},
 ): Promise<PixelTimeSeriesResult> {
   const { signal, onProgress, maxSteps = DEFAULT_MAX_STEPS } = options;
-  const sources = getTimeSliderCogSources();
+  const sources = getTimeSliderPixelSources();
   if (sources.length === 0) {
-    throw new Error("The Time Slider has no COG sources to query.");
+    throw new Error("The Time Slider has no COG or mosaic sources to query.");
   }
-  const { steps, truncated, total: originalStepCount } =
-    getTimeSliderSteps(maxSteps);
+  const { steps, truncated, total: originalStepCount } = getTimeSliderSteps(maxSteps);
   if (steps.length === 0) {
     throw new Error("The Time Slider timeline has no steps to query.");
   }
@@ -349,6 +400,24 @@ export async function queryPixelTimeSeries(
     // this query — exactly the static-source case the dedup cache targets.
     promise.catch(() => readingCache.delete(url));
     readingCache.set(url, promise);
+    return promise;
+  };
+
+  // Mosaic manifests dedupe the same way, and one step further: lngLat is
+  // constant, so the *asset* a manifest resolves to is constant too. Caching the
+  // read URL (rather than the parsed mosaic) keeps a manifest shared across
+  // dates down to a single fetch plus a single bbox search. Keyed by source type
+  // as well, since that decides how the same URL is interpreted.
+  const readUrlCache = new Map<string, Promise<string | null>>();
+  const readUrlFor = (spec: PixelIdentifiableSpec, resolvedUrl: string): Promise<string | null> => {
+    const key = `${spec.type}\n${resolvedUrl}`;
+    const cached = readUrlCache.get(key);
+    if (cached) return cached;
+    const promise = resolvePixelReadUrl(spec, resolvedUrl, lngLat, signal);
+    // Evict on rejection for the same reason as readingCache: a transient
+    // failure must not poison every later step that resolves to this manifest.
+    promise.catch(() => readUrlCache.delete(key));
+    readUrlCache.set(key, promise);
     return promise;
   };
 
@@ -386,7 +455,15 @@ export async function queryPixelTimeSeries(
         };
         try {
           if (signal?.aborted) throw new Error("aborted");
-          const url = await resolveUrl(source.url, date);
+          const resolved = await resolveUrl(source.url, date);
+          point.url = resolved;
+          // A COG source resolves straight to the file; a mosaic resolves to a
+          // manifest listing many COGs, so the covering asset has to be found
+          // first. A point outside every asset's bbox has no reading for this
+          // step — leave it as a gap, keeping the manifest URL so the export
+          // still shows what was consulted.
+          const url = await readUrlFor(source, resolved);
+          if (!url) return;
           point.url = url;
           const reading = await readAt(url);
           if (reading) point.bands = reading.bands;
@@ -411,10 +488,11 @@ export async function queryPixelTimeSeries(
   await runWithConcurrency(tasks, READ_CONCURRENCY, signal);
 
   const series = sources.map((source, si) => ({
-    // Index-based fallbacks so multiple unnamed COG sources still get distinct
-    // ids (React keys / export rows) rather than all collapsing to "cog".
-    sourceId: source.id ?? source.name ?? `cog-${si}`,
-    sourceName: source.name ?? source.id ?? `COG ${si + 1}`,
+    // Index-based fallbacks so multiple unnamed sources still get distinct ids
+    // (React keys / export rows) rather than all collapsing to one.
+    sourceId: source.id ?? source.name ?? `${source.type}-${si}`,
+    sourceName:
+      source.name ?? source.id ?? `${source.type === "mosaic" ? "Mosaic" : "COG"} ${si + 1}`,
     points: points[si],
   }));
 
@@ -470,11 +548,7 @@ export function seriesToFeatureCollection(
 ): FeatureCollection<Point> {
   const features: Feature<Point>[] = [];
   let id = 0;
-  const push = (
-    lng: number,
-    lat: number,
-    properties: Record<string, unknown>,
-  ) =>
+  const push = (lng: number, lat: number, properties: Record<string, unknown>) =>
     features.push({
       type: "Feature",
       id: id++,
@@ -505,10 +579,7 @@ export function seriesToFeatureCollection(
               band_name: band.name,
               // Mirror valueAtBand: a non-finite value exports as null so CSV /
               // GeoParquet output stays consistent with the chart's semantics.
-              value:
-                band.isNodata || !Number.isFinite(band.value)
-                  ? null
-                  : band.value,
+              value: band.isNodata || !Number.isFinite(band.value) ? null : band.value,
               is_nodata: band.isNodata,
             });
           }

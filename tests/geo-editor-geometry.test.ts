@@ -3,8 +3,12 @@ import assert from "node:assert/strict";
 import type { FeatureCollection } from "geojson";
 import type { GeoLibreLayer } from "../packages/core/src/types";
 import {
+  GEOMAN_SHAPE_PROPERTIES,
   GEOMETRY_EDIT_FID_PROPERTY,
+  type OverlayOrderLayer,
   canEditLayerGeometry,
+  captureEditedProperties,
+  planGeoEditorOverlayOrder,
   reconcileEditedFeatures,
   tagFeatureKeys,
 } from "../packages/plugins/src/plugins/geo-editor-geometry";
@@ -24,10 +28,7 @@ function makeLayer(overrides: Partial<GeoLibreLayer>): GeoLibreLayer {
   } as unknown as GeoLibreLayer;
 }
 
-function point(
-  id: string | number | undefined,
-  properties: Record<string, unknown> = {},
-) {
+function point(id: string | number | undefined, properties: Record<string, unknown> = {}) {
   return {
     type: "Feature" as const,
     id,
@@ -57,10 +58,7 @@ describe("canEditLayerGeometry", () => {
   });
 
   it("rejects non-vector layer types", () => {
-    assert.equal(
-      canEditLayerGeometry(makeLayer({ type: "raster", geojson: undefined })),
-      false,
-    );
+    assert.equal(canEditLayerGeometry(makeLayer({ type: "raster", geojson: undefined })), false);
   });
 
   it("rejects a layer without an in-memory feature collection", () => {
@@ -84,8 +82,22 @@ describe("canEditLayerGeometry", () => {
 
   it("rejects the GeoEditor Sketches layer", () => {
     assert.equal(
+      canEditLayerGeometry(makeLayer({ metadata: { sourceKind: "geoeditor-sketches" } })),
+      false,
+    );
+  });
+
+  it("rejects live SQL query layers", () => {
+    // A query result is derived: refresh re-runs the stored SQL and would
+    // overwrite in-place edits, so editing is disabled.
+    assert.equal(
       canEditLayerGeometry(
-        makeLayer({ metadata: { sourceKind: "geoeditor-sketches" } }),
+        makeLayer({
+          metadata: {
+            sourceKind: "sql-query",
+            sqlQuery: { engine: "duckdb", sql: "SELECT 1 AS geom" },
+          },
+        }),
       ),
       false,
     );
@@ -150,23 +162,14 @@ describe("tagFeatureKeys", () => {
       features: [point("a"), point(undefined)],
     };
     const tagged = tagFeatureKeys(collection);
-    assert.equal(
-      tagged.features[0].properties?.[GEOMETRY_EDIT_FID_PROPERTY],
-      "a",
-    );
+    assert.equal(tagged.features[0].properties?.[GEOMETRY_EDIT_FID_PROPERTY], "a");
     assert.equal(tagged.features[0].id, "a");
     // The untagged feature gets a freshly allocated, non-colliding id.
     const secondId = String(tagged.features[1].id);
-    assert.equal(
-      tagged.features[1].properties?.[GEOMETRY_EDIT_FID_PROPERTY],
-      secondId,
-    );
+    assert.equal(tagged.features[1].properties?.[GEOMETRY_EDIT_FID_PROPERTY], secondId);
     assert.notEqual(secondId, "a");
     // Original collection is not mutated.
-    assert.equal(
-      collection.features[0].properties?.[GEOMETRY_EDIT_FID_PROPERTY],
-      undefined,
-    );
+    assert.equal(collection.features[0].properties?.[GEOMETRY_EDIT_FID_PROPERTY], undefined);
   });
 
   it("assigns unique ids when the input has duplicate ids", () => {
@@ -254,5 +257,205 @@ describe("reconcileEditedFeatures", () => {
     assert.equal(ids[0], "7");
     assert.notEqual(ids[1], "7");
     assert.equal(new Set(ids).size, ids.length);
+  });
+});
+
+describe("planGeoEditorOverlayOrder", () => {
+  function row(id: string, flags: Partial<OverlayOrderLayer> = {}): OverlayOrderLayer {
+    return { id, isOverlay: false, isAnchor: false, ...flags };
+  }
+
+  it("raises overlay above a layer stacked over the edited layer (issue #1015)", () => {
+    // Bottom-to-top: the overlay has sunk below the raster, which is stacked
+    // above the (hidden) edited layer; it must move back up to the edited slot.
+    const plan = planGeoEditorOverlayOrder([
+      row("basemap"),
+      row("gm_main-fill", { isOverlay: true }),
+      row("geo-editor-selection-fill", { isOverlay: true }),
+      row("xyz-raster"),
+      row("edited-fill", { isAnchor: true }),
+      row("edited-line", { isAnchor: true }),
+    ]);
+    assert.deepEqual(plan, {
+      overlayIds: ["gm_main-fill", "geo-editor-selection-fill"],
+      // The edited layer is the topmost data layer here, so nothing real sits
+      // above it: the overlay goes to the very top.
+      beforeId: undefined,
+    });
+  });
+
+  it("anchors the overlay just below the first layer above the edited layer", () => {
+    // The overlay has sunk to the bottom; the edited layer is genuinely below a
+    // raster, so the overlay must return to the edited layer's slot (below the
+    // raster), not jump to the very top.
+    const plan = planGeoEditorOverlayOrder([
+      row("basemap"),
+      row("gm_main-fill", { isOverlay: true }),
+      row("edited-fill", { isAnchor: true }),
+      row("raster-on-top"),
+    ]);
+    assert.deepEqual(plan, {
+      overlayIds: ["gm_main-fill"],
+      beforeId: "raster-on-top",
+    });
+  });
+
+  it("returns null when the overlay already sits directly above the anchor", () => {
+    const plan = planGeoEditorOverlayOrder([
+      row("basemap"),
+      row("edited-fill", { isAnchor: true }),
+      row("edited-line", { isAnchor: true }),
+      row("gm_main-fill", { isOverlay: true }),
+      row("geo-editor-selection-fill", { isOverlay: true }),
+      row("raster-on-top"),
+    ]);
+    assert.equal(plan, null);
+  });
+
+  it("returns null when the edited layer is not on the map (no anchor)", () => {
+    const plan = planGeoEditorOverlayOrder([
+      row("basemap"),
+      row("gm_main-fill", { isOverlay: true }),
+    ]);
+    assert.equal(plan, null);
+  });
+
+  it("returns null when there are no overlay layers", () => {
+    const plan = planGeoEditorOverlayOrder([
+      row("basemap"),
+      row("edited-fill", { isAnchor: true }),
+    ]);
+    assert.equal(plan, null);
+  });
+});
+
+describe("reconcileEditedFeatures — attribute preservation", () => {
+  // Geoman claims `id`, `height`, `text`, `width`, `angle`, … as its own "shape
+  // properties": it strips the plain key and re-emits the value as `__gm_<name>`.
+  // A buildings layer with a `height` column came back from a pure geometry edit
+  // with its columns renamed to `__gm_height`/`__gm_id` (opengeos/GeoLibre, Las
+  // Vegas Buildings demo dataset), which also made every feature look edited to
+  // any change tracker.
+  const original: FeatureCollection = {
+    type: "FeatureCollection",
+    features: [
+      {
+        type: "Feature",
+        id: 1,
+        geometry: { type: "Point", coordinates: [0, 0] },
+        properties: { id: "abc", height: 2.6, name: "keep me" },
+      },
+    ],
+  };
+
+  /** What Geoman hands back: reserved names namespaced, the rest untouched. */
+  function asGeomanReturned(collection: FeatureCollection): FeatureCollection {
+    return {
+      type: "FeatureCollection",
+      features: collection.features.map((feature) => {
+        const props = { ...(feature.properties ?? {}) };
+        const out: Record<string, unknown> = {};
+        for (const [key, value] of Object.entries(props)) {
+          if (GEOMAN_SHAPE_PROPERTIES.has(key)) out[`__gm_${key}`] = value;
+          else out[key] = value;
+        }
+        out.__gm_shape = "polygon";
+        return { ...feature, properties: out };
+      }),
+    };
+  }
+
+  it("restores columns Geoman renamed, and drops its internal keys", () => {
+    const tagged = tagFeatureKeys(original);
+    const snapshot = captureEditedProperties(tagged);
+    const reconciled = reconcileEditedFeatures(asGeomanReturned(tagged), snapshot);
+    assert.deepEqual(reconciled.features[0].properties, {
+      id: "abc",
+      height: 2.6,
+      name: "keep me",
+    });
+  });
+
+  it("leaves the layer unchanged when nothing was edited", () => {
+    const tagged = tagFeatureKeys(original);
+    const reconciled = reconcileEditedFeatures(
+      asGeomanReturned(tagged),
+      captureEditedProperties(tagged),
+    );
+    assert.deepEqual(reconciled.features[0].properties, original.features[0].properties);
+    assert.equal(String(reconciled.features[0].id), String(original.features[0].id));
+  });
+
+  it("strips Geoman bookkeeping from a feature drawn during the session", () => {
+    const drawn: FeatureCollection = {
+      type: "FeatureCollection",
+      features: [
+        {
+          type: "Feature",
+          geometry: { type: "Point", coordinates: [1, 1] },
+          properties: { __gm_shape: "circle_marker", __gm_id: 7, note: "new" },
+        },
+      ],
+    };
+    const reconciled = reconcileEditedFeatures(drawn, new Map());
+    assert.deepEqual(reconciled.features[0].properties, { note: "new" });
+  });
+
+  it("keeps working without a snapshot (older callers)", () => {
+    const reconciled = reconcileEditedFeatures(tagFeatureKeys(original));
+    assert.equal(reconciled.features[0].properties?.name, "keep me");
+  });
+});
+
+describe("captureEditedProperties — null properties", () => {
+  // Tagging has to put the feature key somewhere, so it turns `properties: null`
+  // into an object. Snapshotting the tagged collection would therefore restore
+  // `{}` on save and silently rewrite valid GeoJSON; the pre-tag collection is
+  // the source of truth.
+  const original: FeatureCollection = {
+    type: "FeatureCollection",
+    features: [
+      {
+        type: "Feature",
+        id: 1,
+        geometry: { type: "Point", coordinates: [0, 0] },
+        properties: null,
+      },
+      {
+        type: "Feature",
+        id: 2,
+        geometry: { type: "Point", coordinates: [1, 1] },
+        properties: { height: 4 },
+      },
+    ],
+  };
+
+  it("keeps null properties null through tag → edit → reconcile", () => {
+    const tagged = tagFeatureKeys(original);
+    const snapshot = captureEditedProperties(tagged, original);
+    // What Geoman hands back: the reserved `height` renamed, its own key added.
+    const returned: FeatureCollection = {
+      type: "FeatureCollection",
+      features: tagged.features.map((feature) => ({
+        ...feature,
+        properties: {
+          [GEOMETRY_EDIT_FID_PROPERTY]: feature.properties?.[GEOMETRY_EDIT_FID_PROPERTY],
+          __gm_shape: "circle_marker",
+          ...(feature.properties?.height === undefined
+            ? {}
+            : { __gm_height: feature.properties.height }),
+        },
+      })),
+    };
+    const reconciled = reconcileEditedFeatures(returned, snapshot);
+    assert.equal(reconciled.features[0].properties, null);
+    assert.deepEqual(reconciled.features[1].properties, { height: 4 });
+  });
+
+  it("falls back to the tagged collection when no source is given", () => {
+    const tagged = tagFeatureKeys(original);
+    const snapshot = captureEditedProperties(tagged);
+    // Without the pre-tag source the best available answer is the tagged one.
+    assert.deepEqual(snapshot.get(String(tagged.features[0].id)), {});
   });
 });

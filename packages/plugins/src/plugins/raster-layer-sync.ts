@@ -1,11 +1,39 @@
-import {
-  DEFAULT_LAYER_STYLE,
-  type GeoLibreLayer,
-  useAppStore,
-} from "@geolibre/core";
-import type { RasterLayerInfo, RasterLayerState } from "maplibre-gl-raster";
+import { DEFAULT_LAYER_STYLE, type GeoLibreLayer, styleValue, useAppStore } from "@geolibre/core";
+import type { RasterLayerInfo, RasterLayerState, RenderEngine } from "maplibre-gl-raster";
 
 export const RASTER_SOURCE_KIND = "maplibre-gl-raster";
+
+// Absolute filesystem paths of File-backed rasters, by raster id. The control
+// only ever sees a browser `File` -- the desktop host reads the bytes off disk
+// and wraps them -- so the path that would let a saved project reload the
+// raster is not recoverable from `RasterLayerInfo`. Hosts that opened the file
+// by path record it here, and it is mirrored onto the store layer as
+// `metadata.localFilePath` so it survives into the project file (issue #1463).
+const localRasterPaths = new Map<string, string>();
+
+/**
+ * Record (or, with `undefined`, forget) the absolute path a File-backed raster
+ * was read from, so a saved project can reload it. Callers that only have a
+ * browser `File` (a web drag-and-drop, a tool output) pass nothing and the
+ * raster stays unrestorable, as before.
+ *
+ * @param id - The raster/store layer id.
+ * @param path - The absolute filesystem path, or undefined to forget it.
+ */
+export function rememberLocalRasterPath(id: string, path: string | undefined): void {
+  if (path) localRasterPaths.set(id, path);
+  else localRasterPaths.delete(id);
+}
+
+/**
+ * The absolute path recorded for a File-backed raster, if any.
+ *
+ * @param id - The raster/store layer id.
+ * @returns The path, or undefined when the raster was not opened by path.
+ */
+export function localRasterPath(id: string): string | undefined {
+  return localRasterPaths.get(id);
+}
 
 /**
  * The slice of the maplibre-gl-raster RasterControl surface the store sync
@@ -22,7 +50,25 @@ export type RasterSyncableControl = {
 
 export type RasterSyncOptions = {
   interleaved?: boolean;
+  /**
+   * The control's active rendering backend. `maplibre-gl-raster` draws through
+   * a deck.gl overlay; the other two add a real MapLibre raster source/layer
+   * whose layer id is the raster id. Defaults to the deck.gl engine so callers
+   * that predate the option keep their behavior.
+   */
+  engine?: RenderEngine;
 };
+
+/**
+ * Whether an engine renders through a native MapLibre raster layer (rather than
+ * a deck.gl overlay). Those layers carry a real style layer id, so layer-sync
+ * can move them for ordering in every runtime -- including the desktop build,
+ * where the deck.gl overlay is a separate stacked canvas with no style layer at
+ * all (issue #1463).
+ */
+export function rendersNativeMapLibreLayer(engine: RenderEngine): boolean {
+  return engine === "cog-tiler-wasm" || engine === "titiler";
+}
 
 let syncedControl: RasterSyncableControl | null = null;
 let storeUnsubscribe: (() => void) | null = null;
@@ -45,8 +91,7 @@ let storeSyncSuspended = 0;
  */
 export function isRasterControlStoreLayer(layer: GeoLibreLayer): boolean {
   return (
-    layer.metadata.sourceKind === RASTER_SOURCE_KIND &&
-    layer.metadata.externalNativeLayer === true
+    layer.metadata.sourceKind === RASTER_SOURCE_KIND && layer.metadata.externalNativeLayer === true
   );
 }
 
@@ -68,7 +113,19 @@ export function createRasterStoreLayer(
   options: RasterSyncOptions = {},
 ): GeoLibreLayer {
   const interleaved = options.interleaved ?? true;
-  const url = info.source.kind === "url" ? info.source.url : undefined;
+  const nativeMapLibreLayer = rendersNativeMapLibreLayer(options.engine ?? "maplibre-gl-raster");
+  // Desktop local paths are handed to the control as Tauri asset-protocol URLs
+  // so COG reads stay range-based. The path registry distinguishes those from
+  // genuinely remote URL rasters; never persist the session-specific asset URL.
+  const candidateLocalPath = localRasterPaths.get(info.id);
+  const localFilePath =
+    info.source.kind === "file" ||
+    (info.source.kind === "url" &&
+      (info.source.url.startsWith("asset:") ||
+        /^https?:\/\/asset\.localhost(?:\/|$)/i.test(info.source.url)))
+      ? candidateLocalPath
+      : undefined;
+  const url = info.source.kind === "url" && !localFilePath ? info.source.url : undefined;
   // The control retains a File-backed raster's original bytes behind a blob
   // URL (source.objectUrl). Surface it as metadata.localBytesUrl so in-browser
   // tools (the WASM Whitebox runner, the symbology stats reader, raster export)
@@ -76,9 +133,18 @@ export function createRasterStoreLayer(
   // the Add Data > Raster Layer panel's own drop zone, and tool outputs - since
   // they all funnel through the control's addRaster.
   const localBytesUrl =
-    info.source.kind === "file" ? info.source.objectUrl : undefined;
+    info.source.kind === "file"
+      ? info.source.objectUrl
+      : localFilePath && info.source.kind === "url"
+        ? info.source.url
+        : undefined;
   const sourcePath =
-    url ?? (info.source.kind === "file" ? info.source.fileName : info.id);
+    url ??
+    (localFilePath
+      ? localFilePath.split(/[\\/]/).pop() || localFilePath
+      : info.source.kind === "file"
+        ? info.source.fileName
+        : info.id);
   return {
     id: info.id,
     name: info.name,
@@ -92,19 +158,25 @@ export function createRasterStoreLayer(
     style: { ...DEFAULT_LAYER_STYLE },
     metadata: {
       customLayerType: "raster",
+      // Not literally a deck.gl layer under the WASM/TiTiler engines, but the
+      // flag is what makes layer-sync forward the computed beforeId to the
+      // control (applyRasterLayerOrder -> setRasterBeforeId). Those engines
+      // re-apply their own moveLayer on every render-setting change, so without
+      // it a later opacity edit would silently pull the raster back to the top.
       externalDeckLayer: true,
       externalNativeLayer: true,
       identifiable: false,
-      // In interleaved mode the deck.gl overlay inserts one custom style
-      // layer per raster, keyed by the raster id, so ordering moves reach it.
-      // The Tauri/WebKit fallback uses a separate deck.gl canvas, so there is
-      // no MapLibre style layer id to sync.
-      nativeLayerIds: interleaved ? [info.id] : [],
+      // The WASM/TiTiler engines add a native MapLibre raster layer keyed by
+      // the raster id, in every runtime. With the deck.gl engine there is a
+      // style layer id only in interleaved mode, where the overlay inserts one
+      // custom style layer per raster; the Tauri/WebKit fallback uses a
+      // separate deck.gl canvas, so there is no MapLibre style layer to sync.
+      nativeLayerIds: nativeMapLibreLayer || interleaved ? [info.id] : [],
       panelCollapsed,
-      rasterOverlayMode: interleaved ? "interleaved" : "overlaid",
+      rasterOverlayMode: nativeMapLibreLayer ? "native" : interleaved ? "interleaved" : "overlaid",
       // The visualization state is persisted so restoreRasterLayers can
       // replay URL-backed rasters when a saved project is reopened.
-      rasterSource: info.source.kind,
+      rasterSource: localFilePath ? "file" : info.source.kind,
       rasterState: serializableRasterState(info.state),
       // Band metadata powers the symbology panel's band / RGB pickers. Known
       // only once the GeoTIFF header loads (null until then). The Map is
@@ -115,14 +187,13 @@ export function createRasterStoreLayer(
       sourceIds: [],
       sourceKind: RASTER_SOURCE_KIND,
       ...(localBytesUrl ? { localBytesUrl } : {}),
+      // Persisted so restoreRasterLayers can re-read the file when the project
+      // is reopened on the machine that holds it (desktop only -- the browser
+      // has no path). Absent for a raster added from a browser File.
+      ...(localFilePath ? { localFilePath } : {}),
       ...(info.bounds
         ? {
-            bounds: [
-              info.bounds.west,
-              info.bounds.south,
-              info.bounds.east,
-              info.bounds.north,
-            ],
+            bounds: [info.bounds.west, info.bounds.south, info.bounds.east, info.bounds.north],
           }
         : {}),
       ...(info.error ? { error: info.error.message } : {}),
@@ -142,6 +213,23 @@ export function createRasterStoreLayer(
 export function syncRasterLayersToStore(control: RasterSyncableControl): void {
   syncRasterLayersToStoreWithOptions(control);
 }
+
+/**
+ * Metadata keys GeoLibre writes onto control-managed raster layers that the
+ * control itself knows nothing about: `rasterSymbology` (discrete
+ * classification), `rasterAttributeTable` (the categorical class table,
+ * #1307), and `localBytesUrl` (a blob URL retaining a File-loaded raster's
+ * bytes for in-browser tools). The store sync rebuilds a raster layer's
+ * metadata wholesale from the control's `RasterLayerInfo` on every control
+ * event, so any key not listed here is silently wiped by the next opacity
+ * drag or visibility toggle — add new GeoLibre-owned raster metadata keys to
+ * this list.
+ */
+export const GEOLIBRE_OWNED_METADATA_KEYS = [
+  "rasterSymbology",
+  "rasterAttributeTable",
+  "localBytesUrl",
+] as const;
 
 export function syncRasterLayersToStoreWithOptions(
   control: RasterSyncableControl,
@@ -164,32 +252,25 @@ export function syncRasterLayersToStoreWithOptions(
 
     for (const info of infos) {
       const layer = createRasterStoreLayer(info, panelCollapsed, options);
-      const existing = useAppStore
-        .getState()
-        .layers.find((current) => current.id === layer.id);
+      const existing = useAppStore.getState().layers.find((current) => current.id === layer.id);
 
       if (!existing) {
         useAppStore.getState().addLayer(layer);
         continue;
       }
 
-      // rasterSymbology (discrete classification) and localBytesUrl (a blob URL
-      // retaining a File-loaded raster's bytes for in-browser tools) are
-      // GeoLibre-owned and absent from RasterLayerInfo, so carry them forward
-      // across the wholesale metadata rebuild instead of letting every control
-      // event wipe them.
-      const preserved = {
-        ...(existing.metadata.rasterSymbology !== undefined
-          ? { rasterSymbology: existing.metadata.rasterSymbology }
-          : {}),
-        ...(existing.metadata.localBytesUrl !== undefined
-          ? { localBytesUrl: existing.metadata.localBytesUrl }
-          : {}),
-      };
+      // GeoLibre-owned metadata keys (see GEOLIBRE_OWNED_METADATA_KEYS) are
+      // absent from RasterLayerInfo, so carry them forward across the
+      // wholesale metadata rebuild instead of letting every control event
+      // wipe them.
+      const preserved: Record<string, unknown> = {};
+      for (const key of GEOLIBRE_OWNED_METADATA_KEYS) {
+        if (existing.metadata[key] !== undefined) {
+          preserved[key] = existing.metadata[key];
+        }
+      }
       const metadata =
-        Object.keys(preserved).length > 0
-          ? { ...layer.metadata, ...preserved }
-          : layer.metadata;
+        Object.keys(preserved).length > 0 ? { ...layer.metadata, ...preserved } : layer.metadata;
 
       if (
         existing.visible !== layer.visible ||
@@ -261,6 +342,8 @@ export function wireRasterStoreSync(control: RasterSyncableControl): void {
         }
         const patch = rasterStatePatch(layer, current);
         if (patch) activeControl.setRasterState(layer.id, patch);
+        const zoomPatch = zoomRangePatch(layer, current);
+        if (zoomPatch) activeControl.setRasterState(layer.id, zoomPatch);
       }
     });
   });
@@ -272,6 +355,7 @@ export function wireRasterStoreSync(control: RasterSyncableControl): void {
 const SYNCED_RASTER_STATE_KEYS = [
   "mode",
   "bands",
+  "index",
   "colormap",
   "reversed",
   "rescale",
@@ -306,6 +390,32 @@ function rasterStatePatch(
   return changed ? (patch as Partial<RasterLayerState>) : null;
 }
 
+/**
+ * Diffs a raster layer's min/max zoom between two store snapshots and returns
+ * the range to push through setRasterState, or null when unchanged.
+ *
+ * The zoom-range control lives on `layer.style` (the shared Style-panel widget),
+ * not in `metadata.rasterState`, so it is diffed separately from the symbology
+ * fields. A control-managed COG is an external custom layer, so layer-sync skips
+ * the native `map.setLayerZoomRange` path for it; the range reaches the raster
+ * only through this bridge.
+ *
+ * @param previous - The prior store layer.
+ * @param current - The current store layer.
+ * @returns A `{ minZoom, maxZoom }` patch, or null.
+ */
+function zoomRangePatch(
+  previous: GeoLibreLayer,
+  current: GeoLibreLayer,
+): Partial<RasterLayerState> | null {
+  const beforeMin = styleValue(previous.style, "minZoom");
+  const beforeMax = styleValue(previous.style, "maxZoom");
+  const afterMin = styleValue(current.style, "minZoom");
+  const afterMax = styleValue(current.style, "maxZoom");
+  if (beforeMin === afterMin && beforeMax === afterMax) return null;
+  return { minZoom: afterMin, maxZoom: afterMax };
+}
+
 function rasterStateRecord(layer: GeoLibreLayer): Record<string, unknown> {
   const raw = layer.metadata.rasterState;
   return raw && typeof raw === "object" && !Array.isArray(raw)
@@ -313,9 +423,7 @@ function rasterStateRecord(layer: GeoLibreLayer): Record<string, unknown> {
     : {};
 }
 
-function serializeBandNames(
-  bandNames: Map<number, string> | null,
-): [number, string][] | null {
+function serializeBandNames(bandNames: Map<number, string> | null): [number, string][] | null {
   return bandNames ? [...bandNames.entries()] : null;
 }
 
@@ -393,23 +501,24 @@ export function resetRasterStoreSyncSuspension(): void {
  * @param layer - A store layer created by createRasterStoreLayer.
  * @returns The state overrides to replay through RasterControl.addRaster.
  */
-export function savedRasterState(
-  layer: GeoLibreLayer,
-): Partial<RasterLayerState> {
+export function savedRasterState(layer: GeoLibreLayer): Partial<RasterLayerState> {
   const raw = layer.metadata.rasterState;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const candidate = raw as Record<string, unknown>;
   const state: Partial<RasterLayerState> = {};
 
-  if (candidate.mode === "rgb" || candidate.mode === "single") {
+  if (candidate.mode === "rgb" || candidate.mode === "single" || candidate.mode === "index") {
     state.mode = candidate.mode;
+  }
+  // The normalized-difference preset id (index mode). The control tolerates
+  // unknown ids (falls back to the first preset), so no allowlist here.
+  if (typeof candidate.index === "string" && candidate.index) {
+    state.index = candidate.index;
   }
   if (
     Array.isArray(candidate.bands) &&
     candidate.bands.length > 0 &&
-    candidate.bands.every(
-      (band) => typeof band === "number" && Number.isInteger(band) && band > 0,
-    )
+    candidate.bands.every((band) => typeof band === "number" && Number.isInteger(band) && band > 0)
   ) {
     state.bands = candidate.bands as number[];
   }
@@ -423,9 +532,7 @@ export function savedRasterState(
         (range) =>
           Array.isArray(range) &&
           range.length === 2 &&
-          range.every(
-            (value) => typeof value === "number" && Number.isFinite(value),
-          ),
+          range.every((value) => typeof value === "number" && Number.isFinite(value)),
       ))
   ) {
     state.rescale = candidate.rescale as [number, number][] | null;
@@ -467,19 +574,14 @@ export function savedRasterState(
   return state;
 }
 
-function rasterPanelCollapsedFromControl(
-  control: RasterSyncableControl,
-): boolean {
+function rasterPanelCollapsedFromControl(control: RasterSyncableControl): boolean {
   try {
     const collapsed = control.getState?.().collapsed;
     return typeof collapsed === "boolean" ? collapsed : true;
   } catch (error) {
     // getState is optional, so only a throwing implementation lands here;
     // surface it instead of letting it look like the method being absent.
-    console.warn(
-      "[GeoLibre] rasterPanelCollapsedFromControl: getState threw",
-      error,
-    );
+    console.warn("[GeoLibre] rasterPanelCollapsedFromControl: getState threw", error);
     return true;
   }
 }
@@ -488,10 +590,7 @@ function rasterPanelCollapsedFromControl(
 // the helper of the same name in maplibre-3d-tiles.ts. JSON.stringify would
 // report a difference for semantically equal objects whose keys were built
 // in a different order, forcing a spurious updateLayer on every event.
-function recordsEqual(
-  left: Record<string, unknown>,
-  right: Record<string, unknown>,
-): boolean {
+function recordsEqual(left: Record<string, unknown>, right: Record<string, unknown>): boolean {
   const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
   for (const key of keys) {
     if (!valuesEqual(left[key], right[key])) return false;
@@ -517,9 +616,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function serializableRasterState(
-  state: RasterLayerState,
-): Record<string, unknown> {
+function serializableRasterState(state: RasterLayerState): Record<string, unknown> {
   // visible and opacity live on the top-level layer fields (the panel edits
   // them there); persisting copies here would leave two competing values in
   // a saved project file, so they are omitted.

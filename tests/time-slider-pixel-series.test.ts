@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   bandOptionsFromResults,
   downsampleSteps,
+  ordinalSteps,
   type PixelTimeSeriesResult,
   seriesToFeatureCollection,
   valueAtBand,
@@ -17,10 +18,7 @@ describe("downsampleSteps", () => {
   });
 
   it("downsamples to the cap, preserving the endpoints", () => {
-    const steps = Array.from(
-      { length: 100 },
-      (_, i) => new Date(2000 + i, 0, 1),
-    );
+    const steps = Array.from({ length: 100 }, (_, i) => new Date(2000 + i, 0, 1));
     const result = downsampleSteps(steps, 5);
     assert.equal(result.truncated, true);
     assert.equal(result.steps.length, 5);
@@ -39,6 +37,35 @@ describe("downsampleSteps", () => {
     // Guards the cap===1 path: a NaN index would leave steps[0] undefined.
     assert.ok(result.steps[0] instanceof Date);
     assert.equal(result.steps[0].getTime(), steps[0].getTime());
+  });
+});
+
+describe("ordinalSteps", () => {
+  // A sparse acquisition series: irregular gaps that a start/end/granularity
+  // range would step straight over.
+  const dates = [
+    new Date("2023-01-28"),
+    new Date("2023-02-20"),
+    new Date("2023-03-27"),
+    new Date("2023-05-27"),
+  ];
+
+  it("visits every listed date at the default interval", () => {
+    assert.deepEqual(ordinalSteps(dates, 1), dates);
+  });
+
+  it("strides the list when the timeline steps more than one entry", () => {
+    assert.deepEqual(ordinalSteps(dates, 2), [dates[0], dates[2]]);
+  });
+
+  it("coerces a non-positive or non-finite interval to every entry", () => {
+    assert.deepEqual(ordinalSteps(dates, 0), dates);
+    // A NaN stride would otherwise never advance the loop.
+    assert.deepEqual(ordinalSteps(dates, Number.NaN), dates);
+  });
+
+  it("returns nothing for an empty date list", () => {
+    assert.deepEqual(ordinalSteps([], 1), []);
   });
 });
 
@@ -152,9 +179,7 @@ describe("seriesToFeatureCollection", () => {
   };
 
   it("emits one feature per (location, source, step, band) in long format", () => {
-    const collection = seriesToFeatureCollection([
-      { label: "Point 1", result },
-    ]);
+    const collection = seriesToFeatureCollection([{ label: "Point 1", result }]);
     // 2 bands for step 1, plus a single placeholder row for the empty step 2.
     assert.equal(collection.features.length, 3);
     for (const feature of collection.features) {
@@ -164,9 +189,7 @@ describe("seriesToFeatureCollection", () => {
   });
 
   it("carries the label, date, source, band, value, and nodata flag", () => {
-    const collection = seriesToFeatureCollection([
-      { label: "Point 1", result },
-    ]);
+    const collection = seriesToFeatureCollection([{ label: "Point 1", result }]);
     assert.deepEqual(collection.features[0].properties, {
       label: "Point 1",
       lng: -122.5,

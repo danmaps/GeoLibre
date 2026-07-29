@@ -59,9 +59,7 @@ def _assert_public_url(url: str) -> None:
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
         if not ip.is_global:
-            raise ValueError(
-                f"Refusing to fetch from a non-public address ({ip}): {url}"
-            )
+            raise ValueError(f"Refusing to fetch from a non-public address ({ip}): {url}")
 
 
 class _PublicOnlyRedirectHandler(HTTPRedirectHandler):
@@ -162,9 +160,7 @@ def build_empty_project(
     map_view = default_map_view()
     if center is not None:
         if len(center) != 2:
-            raise ValueError(
-                "center must be a [lng, lat] sequence with exactly 2 elements"
-            )
+            raise ValueError("center must be a [lng, lat] sequence with exactly 2 elements")
         map_view["center"] = [float(center[0]), float(center[1])]
     if zoom is not None:
         map_view["zoom"] = float(zoom)
@@ -342,14 +338,25 @@ def _append_query(endpoint: str, params: list[tuple[str, str]]) -> str:
         separator = "?"
     query = "&".join(
         f"{quote(key, safe=_ENCODE_URI_SAFE)}="
-        + (
-            value
-            if value == "{bbox-epsg-3857}"
-            else quote(value, safe=_ENCODE_URI_SAFE)
-        )
+        + (value if value == "{bbox-epsg-3857}" else quote(value, safe=_ENCODE_URI_SAFE))
         for key, value in params
     )
     return f"{base}{separator}{query}{sep}{fragment}"
+
+
+def _normalize_wms_version(version: str | None) -> str:
+    """Normalize a WMS version to the "1.1.1"/"1.3.0" pair the builder emits.
+
+    Args:
+        version: The requested WMS protocol version, or None.
+
+    Returns:
+        ``"1.3.0"`` for any version in the 1.3 line, ``"1.1.1"`` otherwise
+        (including None or a non-string value).
+    """
+    if not isinstance(version, str):
+        return "1.1.1"
+    return "1.3.0" if version.strip().startswith("1.3") else "1.1.1"
 
 
 def wms_layer(
@@ -361,6 +368,7 @@ def wms_layer(
     image_format: str = "image/png",
     transparent: bool = True,
     tile_size: int = 256,
+    version: str | None = "1.1.1",
     **style: Any,
 ) -> dict[str, Any]:
     """Build a WMS layer rendered as tiled raster (a WMS GetMap request).
@@ -377,22 +385,27 @@ def wms_layer(
         image_format: WMS image format (e.g. ``"image/png"``).
         transparent: Whether to request transparent tiles.
         tile_size: Tile size in pixels.
+        version: WMS protocol version, ``"1.1.1"`` (default) or ``"1.3.0"``.
+            Version 1.3.0 sends ``CRS`` instead of ``SRS``; some servers accept
+            only one version. EPSG:3857 keeps its axis order in both, so the
+            BBOX template is unchanged. None falls back to ``"1.1.1"``.
         **style: Style overrides merged into the default layer style.
 
     Returns:
         A layer dict for the project's ``layers`` array.
     """
+    wms_version = _normalize_wms_version(version)
     tile_url = _append_query(
         endpoint,
         [
             ("SERVICE", "WMS"),
             ("REQUEST", "GetMap"),
-            ("VERSION", "1.1.1"),
+            ("VERSION", wms_version),
             ("LAYERS", layers),
             ("STYLES", styles),
             ("FORMAT", image_format),
             ("TRANSPARENT", "TRUE" if transparent else "FALSE"),
-            ("SRS", "EPSG:3857"),
+            ("CRS" if wms_version == "1.3.0" else "SRS", "EPSG:3857"),
             ("BBOX", "{bbox-epsg-3857}"),
             ("WIDTH", str(tile_size)),
             ("HEIGHT", str(tile_size)),
@@ -408,6 +421,7 @@ def wms_layer(
         "styles": styles,
         "format": image_format,
         "transparent": transparent,
+        "version": wms_version,
     }
     layer["metadata"] = {"service": "wms"}
     return layer
@@ -590,8 +604,7 @@ def vector_tiles_layer(
     if source_layers:
         if source_layer is not None:
             warnings.warn(
-                "source_layer is ignored when source_layers is provided; pass "
-                "one or the other.",
+                "source_layer is ignored when source_layers is provided; pass one or the other.",
                 stacklevel=2,
             )
         source["sourceLayers"] = list(source_layers)
@@ -737,14 +750,10 @@ def video_layer(
     # which would mask a malformed call and build a layer with fewer URLs.
     invalid = [u for u in urls if not (isinstance(u, str) and u)]
     if invalid:
-        raise ValueError(
-            f"video_layer: every URL must be a non-empty string; got {invalid!r}"
-        )
+        raise ValueError(f"video_layer: every URL must be a non-empty string; got {invalid!r}")
     clean_urls = list(urls)
     if any(not u.lower().startswith("https://") for u in clean_urls):
-        raise ValueError(
-            "Video URLs must start with https:// (the browser CSP blocks http://)"
-        )
+        raise ValueError("Video URLs must start with https:// (the browser CSP blocks http://)")
     if len(coordinates) != 4 or any(len(corner) != 2 for corner in coordinates):
         raise ValueError(
             "coordinates must be four [lng, lat] corners (top-left, top-right, "
@@ -846,9 +855,7 @@ def load_featurecollection(data: Any) -> dict[str, Any]:
 
 # The four corners every map control accepts (CONTROL_POSITIONS in
 # maplibre-components.ts; PROJECT_PLUGIN_CONTROL_POSITIONS in core).
-CONTROL_POSITIONS = frozenset(
-    {"top-left", "top-right", "bottom-left", "bottom-right"}
-)
+CONTROL_POSITIONS = frozenset({"top-left", "top-right", "bottom-left", "bottom-right"})
 
 # Plugin ids registered in apps/geolibre-desktop/src/hooks/usePlugins.ts.
 SWIPE_PLUGIN_ID = "maplibre-gl-swipe"

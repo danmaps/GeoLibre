@@ -34,8 +34,12 @@ npm run check:rust                                 # cargo check the Tauri crate
 ```
 
 The `:coverage` variants run the same suites and print a coverage summary; CI
-runs them so every build reports coverage. They are **not** gated on a threshold
-yet (the report is informational, so a low number never fails CI). The frontend
+runs them so every build reports coverage. They are now **gated on a floor**:
+`test:frontend:coverage` fails below 78% lines / 78% branches / 63% functions,
+and `test:backend:coverage` fails below 55% (`--cov-fail-under`). The floors sit
+a few points under the current numbers as a **ratchet** — regressions fail CI,
+and when coverage rises comfortably above a floor, raise the floor to lock in the
+gain. The frontend
 report only counts files a test actually imports, so a module with no test does
 not appear at all rather than as 0%. The backend coverage run (and `npm run ci`,
 which calls the `:coverage` variants) needs `pytest-cov` from the backend `dev`
@@ -48,6 +52,11 @@ tests skip themselves and CI is green but hollow:
 it with Playwright (`@playwright/test`). First run: `npx playwright install
 chromium`. The webServer reuses an already-running preview locally and rebuilds
 in CI; add specs under `e2e/`.
+
+Dependencies are watched two ways: **Dependabot** (`.github/dependabot.yml`)
+opens grouped weekly update PRs for npm, pip (backend + `python/`), cargo, and
+Actions, and the CI **`audit` job** runs `npm audit --audit-level=high`
+(blocking) plus a non-blocking `pip-audit` of the resolved backend environment.
 
 The `python/` package has its own pytest suite (`cd python && pytest`) and is built into a wheel via `npm run build:embed` (produces `apps/geolibre-desktop/dist-embed`, consumed by `python/hatch_build.py`). Its version is dynamic, sourced from `python/src/geolibre/__init__.py`.
 
@@ -77,8 +86,14 @@ The browser build proxies the sidecar at `/sidecar` (same-origin, no CORS); conf
 ## Conventions
 
 - Never commit directly to `main`; branch and open a PR.
+- **`backend/geolibre_server/uv.lock` is committed** (the root `.gitignore` ignores `uv.lock` everywhere else and negates it for this one path). That project is bundled into the desktop installers and launched with `uv run --frozen --project <resource dir>` from `src-tauri/src/lib.rs` — a directory the user cannot write (`C:\Program Files\…`, `/usr/lib/GeoLibre Desktop/…`). Ship it lockless and uv resolves, then tries to *write* `uv.lock` there, fails with "Permission denied" and exits 2 — which reaches the user as "Jupyter server exited before it was ready (exit code: 2)" with the cause invisible. So: any edit to that `pyproject.toml`'s dependencies must land with a refreshed lock (`uv lock --project backend/geolibre_server`). CI's "Check the bundled sidecar lockfile is in sync" step (`uv lock --check`) fails if they drift.
 - Tauri CSP allowlists tile/style hosts (OpenFreeMap, CARTO) — new external map/tile hosts must be added there.
 - Map/tile-host CORS for selected release assets is handled by a dev-server raster proxy.
 - For MapLibre control styling fixes, add scoped overrides in `apps/geolibre-desktop/src/index.css`, never edit `node_modules`.
-- UI strings are translatable via **react-i18next**; catalogs live in `apps/geolibre-desktop/src/i18n/locales/*.json` (`en.json` is the source of truth, typed by `i18next.d.ts`). Use `t()` for new user-facing strings; a `?locale`/`?lang` query param sets the embed language. See `docs/i18n.md`.
+- The Processing **menu** (`ProcessingMenu.tsx`) renders from a checked-in, auto-generated catalog, `apps/geolibre-desktop/src/lib/whitebox-menu-catalog.ts` (do not hand-edit). Whenever `geolibre-wasm` is bumped (in `packages/processing/package.json`) — including Dependabot PRs — run `node scripts/gen-whitebox-menu-catalog.mjs` and commit the result, or new/renamed WASM tools silently miss the menu (the Processing **dialog** lists them dynamically, so the gap only shows in the menu).
+- `MAX_VECTOR_PMTILES_ZOOM` (`packages/processing/src/wasm-convert.ts`) mirrors the deepest zoom `vector_to_pmtiles` accepts (18 — past it the tool exits with `validation error: max_zoom must be <= 18`). The cap lives inside the WASM binary and is not exported, so whenever `geolibre-wasm` is bumped — including Dependabot PRs — re-check it. If it drifts, the browser's Vector to PMTiles either refuses a zoom the tiler would now accept, or accepts one it will reject after the user has waited. Note this is **not** the sidecar's cap: freestiler allows 24 (`MAX_PMTILES_ZOOM` in `ConversionDialog.tsx`, mirroring `backend/geolibre_server/geolibre_server/app/conversion.py`), and the dialog validates against whichever engine is about to run. `tests/wasm-convert.test.ts` ("accepts the documented maximum zoom and rejects one deeper") fails in CI if the mirror drifts, so running the frontend suite after a bump is enough to catch it.
+- `MAX_VECTOR_BYTES` (`packages/plugins/src/plugins/remote-file-formats.ts`) mirrors `MAX_REMOTE_FILE_BYTES`, an **internal, unexported** constant in `maplibre-gl-vector` (2 GiB — DuckDB-WASM holds remote file sizes in 32 bits). It cannot be imported, so whenever `maplibre-gl-vector` is bumped (in `packages/plugins/package.json`) — including Dependabot PRs — re-check `src/lib/utils/remote.ts` in that package and update the mirror if it moved. If it drifts, the remote-browse panels (Source Cooperative, Hugging Face) silently block GeoParquet the engine could now open, or offer an Add that is certain to fail. Updating the constant is enough: the limit the user is shown is rendered from it, not written into the copy. `remote-file-formats.ts` is the **single** home for this and the other format/reader/size rules those panels share — a per-panel copy would miss this check, so add new browse panels against that module rather than duplicating it (`source-coop-api.ts` re-exports it under its own names for compatibility).
+- `MAP_PANEL_SELECTOR` (`apps/geolibre-desktop/src/components/layout/RecordVideoDialog.tsx`) mirrors the **rendered** control class names from `maplibre-gl-components` — `maplibre-gl-html-control`, `maplibre-gl-legend`, `maplibre-gl-colorbar` — so the Record Video "Include map panels" option can rasterize those on-map overlays into the recording. These are the display elements, deliberately **not** the `*-gui-control` authoring editors. The classes are internal and unexported, so whenever `maplibre-gl-components` is bumped (in `packages/plugins/package.json`) — including Dependabot PRs — re-check them against the rendered controls and update the selector if they moved. If a class drifts, the option silently stops burning that panel into the video (or the checkbox never appears) with no build error.
+- `propertySpecFor` (`packages/core/src/expressions.ts`) fabricates the **unexported** `StylePropertySpecification` shape that `@maplibre/maplibre-gl-style-spec`'s `createExpression` uses for expected-result-type enforcement (the Expression Builder's filter → boolean / color checks). The cast hides any contract change from the compiler, so whenever `@maplibre/maplibre-gl-style-spec` is bumped (including Dependabot PRs) run the frontend suite — the "enforces an expected result type" test in `tests/expressions.test.ts` fails if the shape stops being honored.
+- UI strings are translatable via **react-i18next**; catalogs live in `apps/geolibre-desktop/src/i18n/locales/*.json` (`en.json` is the source of truth, typed by `i18next.d.ts`). Use `t()` for new user-facing strings; a `?locale`/`?lang` query param sets the embed language. The UI mirrors for right-to-left locales (Arabic), so style new components with Tailwind's logical utilities (`ms-`/`me-`/`ps-`/`pe-`/`text-start`/`border-s`/`start-`…), not the physical `ml-`/`left-` forms. See `docs/i18n.md`.
 - Reference docs: `docs/architecture.md`, `docs/project-format.md`, `docs/plugin-api.md`, `docs/python.md`, `docs/i18n.md`, `docs/contributing.md`.

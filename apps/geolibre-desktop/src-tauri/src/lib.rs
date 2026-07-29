@@ -28,18 +28,20 @@ use flate2::read::{GzDecoder, ZlibDecoder};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{Cursor, Read};
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tauri::Manager;
+use tauri_plugin_fs::FsExt;
 
 // OAuth popups are a desktop-only, multi-window concept; Android/iOS have no
 // equivalent, and `WebviewWindowBuilder::{on_new_window, window_features}` do
@@ -81,6 +83,10 @@ struct MartinServerState {
 
 struct SidecarServerState {
     process: Mutex<Option<SidecarProcess>>,
+    // Serialize start/stop across every UI surface that can request the shared
+    // sidecar. Without this, two callers can both pass the reuse check and race
+    // to bind the fixed port, or a restart can overlap the previous teardown.
+    lifecycle: Mutex<()>,
 }
 
 struct JupyterServerState {
@@ -182,6 +188,20 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        // Must init after the fs plugin: it restores previously-granted fs
+        // scope (e.g. Browser-panel pinned folders) so they survive a restart.
+        //
+        // SECURITY / SCOPE NOTE (deliberate, maintainer-approved): this persists
+        // *every* dialog-granted fs scope for the life of the install, not just
+        // Browser-panel folder pins — "Open Vector File", "Open Raster", "Save
+        // Project As", etc. also extend fs scope to the picked path, and all of
+        // those now survive a restart. There is also no per-path "forget", so
+        // unpinning a folder in the Browser panel removes the UI pin but does
+        // not revoke its (persisted) read scope. Accepted for durable pins;
+        // revisit if a narrower per-source scope or a revoke path is wanted.
+        .plugin(tauri_plugin_persisted_scope::init())
+        .plugin(tauri_plugin_geolocation::init())
+        .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_opener::init())
         .manage(EarthEngineOAuthState::default())
         .manage(MartinServerState {
@@ -189,6 +209,7 @@ pub fn run() {
         })
         .manage(SidecarServerState {
             process: Mutex::new(None),
+            lifecycle: Mutex::new(()),
         })
         .manage(JupyterServerState {
             process: Mutex::new(None),
@@ -204,6 +225,8 @@ pub fn run() {
             native_duckdb::load_native_vector_file,
             load_external_plugin_bundles,
             read_admin_profile,
+            read_env_vars,
+            allow_raster_asset,
             read_local_file,
             read_project_file,
             read_shapefile_siblings,
@@ -227,9 +250,67 @@ pub fn run() {
         .expect("error while running GeoLibre Desktop");
 }
 
+/// Whether `read_project_file` may read `path`: an absolute local path (POSIX
+/// `/...` or a Windows drive-letter `C:\...`, never a UNC `\\host\share`), free
+/// of `..` traversal, ending in a GeoLibre project extension — `.geolibre` or
+/// `.geolibre.json`. These are the canonical formats `saveProject` writes and
+/// `isGeoLibreProjectPath` recognizes in `tauri-io.ts`.
+///
+/// Without this, the command was an arbitrary local-file reader: any webview JS
+/// or loaded plugin could `invoke("read_project_file", { path: "~/.ssh/id_rsa" })`
+/// and receive the contents. A bare `.json` extension is deliberately NOT
+/// accepted: plenty of real secrets are JSON (GCP service-account keys,
+/// `application_default_credentials.json`, editor/CLI configs with tokens), so
+/// requiring the `.geolibre` marker keeps those out while still reading every
+/// real project. Byte-oriented like `is_allowed_local_vector_path` so Windows
+/// paths behave the same on any host.
+pub(crate) fn is_allowed_project_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let is_separator = |byte: u8| byte == b'/' || byte == b'\\';
+
+    // Reject UNC paths ("\\server\share" and "//server/share").
+    if bytes.len() >= 2 && is_separator(bytes[0]) && is_separator(bytes[1]) {
+        return false;
+    }
+
+    let is_posix_absolute = bytes.first() == Some(&b'/');
+    let is_windows_drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && is_separator(bytes[2]);
+    if !is_posix_absolute && !is_windows_drive {
+        return false;
+    }
+
+    if path.split(['/', '\\']).any(|segment| segment == "..") {
+        return false;
+    }
+
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".geolibre") || lower.ends_with(".geolibre.json")
+}
+
 #[tauri::command]
 fn read_project_file(path: String) -> Result<String, String> {
-    fs::read_to_string(&path).map_err(|error| format!("Could not read project file: {error}"))
+    if !is_allowed_project_path(&path) {
+        return Err(format!(
+            "Refusing to read \"{path}\": not an absolute local project file path"
+        ));
+    }
+    // Resolve symlinks and re-check the extension, so a symlink named
+    // `*.geolibre`/`*.geolibre.json` can't redirect the read to an arbitrary
+    // target (e.g. `~/notes.geolibre.json -> ~/.ssh/id_rsa`). Only the resolved
+    // extension is re-checked (not the full guard): `canonicalize` yields a
+    // `\\?\C:\…` verbatim path on Windows, which the UNC check would reject.
+    let canonical =
+        fs::canonicalize(&path).map_err(|error| format!("Could not read project file: {error}"))?;
+    let resolved = canonical.to_string_lossy().to_ascii_lowercase();
+    if !(resolved.ends_with(".geolibre") || resolved.ends_with(".geolibre.json")) {
+        return Err(format!(
+            "Refusing to read \"{path}\": resolves to a non-project file"
+        ));
+    }
+    fs::read_to_string(&canonical).map_err(|error| format!("Could not read project file: {error}"))
 }
 
 /// Local vector file extensions the restore path may re-read (lowercased, no
@@ -274,31 +355,10 @@ const RESTORABLE_VECTOR_EXTENSIONS: [&str; 17] = [
 /// Windows-style paths a project may carry regardless of the host the binary
 /// runs on.
 pub(crate) fn is_allowed_local_vector_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    let is_separator = |byte: u8| byte == b'/' || byte == b'\\';
-
-    // Reject UNC paths first. Both the Windows form ("\\server\share") and the
-    // forward-slash form ("//server/share") start with two separators and can
-    // make Windows auto-authenticate against a remote host, so neither may slip
-    // through the POSIX-absolute check below.
-    if bytes.len() >= 2 && is_separator(bytes[0]) && is_separator(bytes[1]) {
-        return false;
-    }
-
-    // Absolute local path only: POSIX "/..." or a Windows drive-letter "C:\..."
-    // / "C:/...".
-    let is_posix_absolute = bytes.first() == Some(&b'/');
-    let is_windows_drive = bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && is_separator(bytes[2]);
-    if !is_posix_absolute && !is_windows_drive {
-        return false;
-    }
-
-    // Reject a "/../" or "\..\" traversal segment (but not a ".." inside a
-    // filename like "v1..2.gpkg"), matching `hasPathTraversal`.
-    if path.split(['/', '\\']).any(|segment| segment == "..") {
+    // Absolute, non-UNC, no `..` traversal — split into `is_safe_absolute_path`
+    // so the security-relevant byte-parsing lives in one place rather than being
+    // duplicated.
+    if !is_safe_absolute_path(path) {
         return false;
     }
 
@@ -335,6 +395,27 @@ fn read_local_file(path: String) -> Result<tauri::ipc::Response, String> {
     fs::read(&path)
         .map(tauri::ipc::Response::new)
         .map_err(|error| format!("Could not read local file: {error}"))
+}
+
+/// Add one user-selected GeoTIFF to the asset-protocol scope. The filesystem
+/// and asset scopes are separate in Tauri; dialogs and native drops grant the
+/// former, but maplibre-gl-raster fetches through the latter for range reads.
+#[tauri::command]
+fn allow_raster_asset(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let lower = path.to_ascii_lowercase();
+    if !is_safe_absolute_path(&path) || !(lower.ends_with(".tif") || lower.ends_with(".tiff")) {
+        return Err(format!(
+            "Refusing to expose \"{path}\": not an absolute GeoTIFF path"
+        ));
+    }
+    if !app.fs_scope().is_allowed(&path) {
+        return Err(format!(
+            "Refusing to expose \"{path}\": the file was not selected or dropped by the user"
+        ));
+    }
+    app.asset_protocol_scope()
+        .allow_file(&path)
+        .map_err(|error| format!("Could not authorize local raster: {error}"))
 }
 
 /// Shapefile sidecar extensions read alongside a `.shp` (lowercased, no dot).
@@ -406,6 +487,28 @@ fn read_shapefile_siblings(path: String) -> Result<Vec<ShapefileSibling>, String
     Ok(siblings)
 }
 
+/// Whether `path` is a safe absolute local path: an absolute POSIX (`/...`) or
+/// Windows drive-letter (`C:\...`) path, never a UNC (`\\host\share`) share, and
+/// free of `..` traversal segments. The shared absolute/non-UNC/no-traversal
+/// guard behind [`is_allowed_local_vector_path`], kept separate so that
+/// byte-parsing lives in one place rather than being duplicated per caller.
+fn is_safe_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let is_separator = |byte: u8| byte == b'/' || byte == b'\\';
+    if bytes.len() >= 2 && is_separator(bytes[0]) && is_separator(bytes[1]) {
+        return false;
+    }
+    let is_posix_absolute = bytes.first() == Some(&b'/');
+    let is_windows_drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && is_separator(bytes[2]);
+    if !is_posix_absolute && !is_windows_drive {
+        return false;
+    }
+    !path.split(['/', '\\']).any(|segment| segment == "..")
+}
+
 /// Read the optional admin UI-profile file (`<app_config_dir>/admin-profile.json`).
 ///
 /// Returns `Ok(None)` when the file is absent so a missing file is not an error;
@@ -423,6 +526,55 @@ fn read_admin_profile(app: tauri::AppHandle) -> Result<Option<String>, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("Could not read admin profile: {error}")),
     }
+}
+
+/// The only environment variable names `read_env_vars` will ever return. This
+/// is a hard, server-side boundary: external plugins and any other JavaScript
+/// run in the same (unsandboxed) webview can `invoke("read_env_vars", …)` with
+/// arbitrary names, so the allowlist cannot live in the frontend alone or a
+/// malicious caller could exfiltrate unrelated shell secrets (SSH_AUTH_SOCK,
+/// GITHUB_TOKEN, ambient cloud credentials, …). Kept in sync with
+/// `OS_ENV_VAR_NAMES` in `apps/geolibre-desktop/src/lib/assistant/provider.ts`
+/// — the `assistant-os-env` test parses this list and asserts the two match.
+const ALLOWED_ENV_VARS: &[&str] = &[
+    "GEOLIBRE_ASSISTANT_PROVIDER",
+    "GEOLIBRE_ASSISTANT_MODEL",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_GENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "OLLAMA_BASE_URL",
+    "OLLAMA_MODEL",
+    "OPENAI_COMPATIBLE_BASE_URL",
+    "OPENAI_COMPATIBLE_API_KEY",
+    "OPENAI_COMPATIBLE_MODEL",
+    "TAVILY_API_KEY",
+];
+
+/// Read the AI Assistant's allowlisted variables from the OS environment.
+///
+/// Only names in `ALLOWED_ENV_VARS` that the caller requests are returned,
+/// and only when present and non-empty, so the desktop app never leaks the full
+/// process environment — nor any variable outside the allowlist — into the
+/// webview. This lets the assistant source provider API keys from the user's
+/// system/shell environment instead of the project file (issue #1141), keeping
+/// secrets out of the saved `.geolibre.json`.
+#[tauri::command]
+fn read_env_vars(names: Vec<String>) -> std::collections::HashMap<String, String> {
+    names
+        .into_iter()
+        .filter(|name| ALLOWED_ENV_VARS.contains(&name.as_str()))
+        .filter_map(|name| {
+            let value = env::var(&name).ok()?;
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some((name, trimmed.to_string()))
+            }
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -443,6 +595,337 @@ fn close_oauth_popups(app: tauri::AppHandle) {
     }
 }
 
+/// Error surfaced when a fetch would reach a blocked address.
+const SSRF_BLOCKED_MESSAGE: &str =
+    "Refusing to fetch a link-local, unspecified, or multicast address";
+
+/// Path to a PEM bundle of extra CA certificate(s) to trust for server
+/// verification, on top of the OS trust store (issue #1220).
+const HTTP_CA_CERT_ENV: &str = "GEOLIBRE_HTTP_CA_CERT";
+/// Path to the client certificate to present for mutual TLS. A `.pem` file
+/// (certificate chain plus an unencrypted PKCS#8 private key) or a PKCS#12
+/// bundle (`.p12`/`.pfx`, optionally passphrase-protected).
+const HTTP_CLIENT_CERT_ENV: &str = "GEOLIBRE_HTTP_CLIENT_CERT";
+/// Passphrase for a PKCS#12 client certificate. Its presence also forces the
+/// PKCS#12 code path for a client cert that lacks a recognised extension.
+const HTTP_CLIENT_CERT_PASSWORD_ENV: &str = "GEOLIBRE_HTTP_CLIENT_CERT_PASSWORD";
+
+/// Whether an IP sits in a range a webview- or plugin-triggered fetch must not
+/// reach. This is the SSRF guard for [`fetch_url_bytes`] and
+/// [`resolve_url_redirect`]: those commands issue requests from the desktop
+/// process's network position and hand the body/redirect back to the webview, so
+/// without this a rogue plugin could read cloud metadata (169.254.169.254) — the
+/// classic SSRF target — that browser `fetch` cannot reach because of CORS.
+///
+/// Loopback and private/LAN ranges are deliberately NOT blocked: the app is
+/// built to load XYZ tiles, COGs, and PMTiles from a user's own
+/// `http://localhost:<port>` or LAN dev server (issue #387), and these commands
+/// are the desktop fetch path for that data. Blocking them would break a
+/// documented workflow. Sensitive loopback services (the Python sidecar, the
+/// Jupyter server) are individually token-gated, so the residual reachability of
+/// loopback/LAN is acceptable; link-local/metadata, which has no such guard, is
+/// blocked.
+fn is_disallowed_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_link_local() // 169.254.0.0/16 (incl. cloud metadata)
+                || v4.is_unspecified() // 0.0.0.0
+                || v4.is_broadcast()
+                || v4.is_multicast()
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_disallowed_ip(IpAddr::V4(mapped));
+            }
+            let segments = v6.segments();
+            // Deprecated IPv4-compatible form `::a.b.c.d` (all-zero 96-bit
+            // prefix, no `ffff` marker, and not `::`/`::1`). `to_ipv4_mapped`
+            // only covers `::ffff:a.b.c.d`, so classify the embedded IPv4 here
+            // too — otherwise `::169.254.169.254` would slip past the guard.
+            if segments[..6].iter().all(|&s| s == 0) && !(segments[6] == 0 && segments[7] <= 1) {
+                let embedded = std::net::Ipv4Addr::new(
+                    (segments[6] >> 8) as u8,
+                    (segments[6] & 0xff) as u8,
+                    (segments[7] >> 8) as u8,
+                    (segments[7] & 0xff) as u8,
+                );
+                return is_disallowed_ip(IpAddr::V4(embedded));
+            }
+            // Not handled: 6to4 (2002::/16) and Teredo (2001::/32) also embed an
+            // IPv4 address, so e.g. 2002:a9fe:a9fe:: could reach 169.254.169.254.
+            // These transition mechanisms are effectively defunct and unrouted on
+            // modern hosts, so the practical risk is negligible; noted so this
+            // isn't mistaken for full coverage of every IPv4-embedding form.
+            v6.is_unspecified()
+                || v6.is_multicast()
+                // fe80::/10 link-local
+                || (segments[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Reject a parsed URL that is non-HTTP(S) or whose host resolves to a
+/// private/loopback/link-local address. Hostname hosts are resolved and rejected
+/// if *any* resolved address is disallowed, so a name that points at an internal
+/// IP cannot slip through.
+fn url_is_fetchable(url: &reqwest::Url) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+    match url.scheme() {
+        "http" | "https" => {}
+        other => return Err(format!("Unsupported URL scheme: {other}")),
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return if is_disallowed_ip(ip) {
+            Err(SSRF_BLOCKED_MESSAGE.to_string())
+        } else {
+            Ok(())
+        };
+    }
+    let port = url.port_or_known_default().unwrap_or(0);
+    let mut resolved_any = false;
+    for addr in (bare, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("Could not resolve host {bare}: {error}"))?
+    {
+        resolved_any = true;
+        if is_disallowed_ip(addr.ip()) {
+            return Err(SSRF_BLOCKED_MESSAGE.to_string());
+        }
+    }
+    if resolved_any {
+        Ok(())
+    } else {
+        Err(format!("Could not resolve host {bare}"))
+    }
+}
+
+/// Parse and SSRF-validate a URL string before a request is issued.
+fn ensure_fetchable_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|error| format!("Invalid URL: {error}"))?;
+    url_is_fetchable(&parsed)
+}
+
+/// A redirect policy that re-applies [`url_is_fetchable`] to every hop, so a
+/// public URL that 3xx-redirects to an internal address is not followed.
+fn guarded_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.stop();
+        }
+        match url_is_fetchable(attempt.url()) {
+            Ok(()) => attempt.follow(),
+            Err(_) => attempt.stop(),
+        }
+    })
+}
+
+/// A DNS resolver that drops any address in a blocked range, so reqwest connects
+/// only to IPs that passed [`is_disallowed_ip`].
+///
+/// [`url_is_fetchable`] validates the host *before* the request, but reqwest
+/// re-resolves the name when it opens the connection, so a check-then-connect
+/// gap remains: an attacker controlling DNS (short TTL) could answer the
+/// pre-check with a public IP and the actual connection with `169.254.169.254`.
+/// Enforcing the filter inside the resolver reqwest actually uses — for the
+/// initial request and every redirect hop — closes that rebinding window.
+struct GuardedDnsResolver;
+
+impl reqwest::dns::Resolve for GuardedDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        use std::net::ToSocketAddrs;
+        Box::pin(async move {
+            let host = name.as_str().to_string();
+            // std getaddrinfo blocks, but these are low-volume tile/URL fetches.
+            let resolved = (host.as_str(), 0u16).to_socket_addrs();
+            let addrs: Vec<std::net::SocketAddr> = match resolved {
+                Ok(iter) => iter.filter(|addr| !is_disallowed_ip(addr.ip())).collect(),
+                Err(error) => {
+                    return Err(Box::new(error) as Box<dyn std::error::Error + Send + Sync>);
+                }
+            };
+            if addrs.is_empty() {
+                return Err(SSRF_BLOCKED_MESSAGE.into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// A client certificate for mutual TLS, tagged by the backend it needs.
+///
+/// The rustls backend (our default) reads a PEM identity directly. PKCS#12
+/// bundles, which is what Windows exports and what carries a passphrase, are
+/// only parseable by the native-tls backend, so those requests switch backends
+/// for that one client (issue #1220).
+enum ClientIdentity {
+    /// PEM identity (certificate chain plus an unencrypted PKCS#8 key), rustls.
+    Pem(reqwest::Identity),
+    /// PKCS#12 identity, native-tls. Not available on Android, which does not
+    /// ship the native-tls backend (openssl-sys has no NDK cross build).
+    #[cfg(not(target_os = "android"))]
+    Pkcs12(reqwest::Identity),
+}
+
+/// Whether a client certificate should be read as PKCS#12 rather than PEM.
+///
+/// A `.p12`/`.pfx` extension or a supplied passphrase selects PKCS#12; anything
+/// else is treated as PEM.
+fn client_cert_is_pkcs12(path: &std::path::Path, has_password: bool) -> bool {
+    if has_password {
+        return true;
+    }
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("p12") | Some("pfx")
+    )
+}
+
+/// A passphrase without a certificate path is a misconfiguration: the passphrase
+/// alone configures nothing, so it is surfaced as an error rather than silently
+/// dropped (issue #1220).
+fn client_cert_password_without_path(has_cert_path: bool, has_password: bool) -> bool {
+    has_password && !has_cert_path
+}
+
+/// Load extra CA certificate(s) named by [`HTTP_CA_CERT_ENV`], if any. A
+/// set-but-empty value (common from `CA_CERT=${SECRET:-}` env interpolation) is
+/// treated as unset rather than read as the path `""`.
+fn extra_ca_certificates() -> Result<Vec<reqwest::Certificate>, String> {
+    let Some(path) = env::var_os(HTTP_CA_CERT_ENV).filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let path = PathBuf::from(path);
+    let pem = fs::read(&path)
+        .map_err(|error| format!("Could not read CA certificate {}: {error}", path.display()))?;
+    reqwest::Certificate::from_pem_bundle(&pem)
+        .map_err(|error| format!("Could not parse CA certificate {}: {error}", path.display()))
+}
+
+/// Load the mutual-TLS client identity named by [`HTTP_CLIENT_CERT_ENV`], if any.
+fn client_identity() -> Result<Option<ClientIdentity>, String> {
+    // Treat missing or empty as unset: env interpolation in Docker/K8s/.env
+    // tooling (e.g. `PASSWORD=${SECRET:-}`) commonly yields "" rather than
+    // leaving the variable unset, which must not force the PKCS#12 path or trip
+    // the stray-passphrase error below. A non-UTF-8 value is surfaced as an error
+    // rather than dropped, since the PKCS#12 loader takes a `&str` passphrase.
+    let password = match env::var(HTTP_CLIENT_CERT_PASSWORD_ENV) {
+        Ok(value) if value.is_empty() => None,
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(format!(
+                "{HTTP_CLIENT_CERT_PASSWORD_ENV} is not valid UTF-8"
+            ));
+        }
+    };
+    // A set-but-empty cert path is likewise treated as unset, so it does not
+    // bypass the stray-passphrase guard below or fail later on `fs::read("")`.
+    let Some(path) = env::var_os(HTTP_CLIENT_CERT_ENV).filter(|value| !value.is_empty()) else {
+        if client_cert_password_without_path(false, password.is_some()) {
+            return Err(format!(
+                "{HTTP_CLIENT_CERT_PASSWORD_ENV} is set but {HTTP_CLIENT_CERT_ENV} is not; \
+                 set the client certificate path or unset the passphrase"
+            ));
+        }
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    let bytes = fs::read(&path).map_err(|error| {
+        format!(
+            "Could not read client certificate {}: {error}",
+            path.display()
+        )
+    })?;
+    if client_cert_is_pkcs12(&path, password.is_some()) {
+        #[cfg(not(target_os = "android"))]
+        {
+            let identity =
+                reqwest::Identity::from_pkcs12_der(&bytes, password.as_deref().unwrap_or(""))
+                    .map_err(|error| {
+                        format!(
+                            "Could not load PKCS#12 client certificate {}: {error}",
+                            path.display()
+                        )
+                    })?;
+            Ok(Some(ClientIdentity::Pkcs12(identity)))
+        }
+        // Android lacks the native-tls backend that parses PKCS#12, so surface a
+        // clear error rather than silently misreading the bundle as PEM.
+        #[cfg(target_os = "android")]
+        {
+            Err(format!(
+                "PKCS#12 client certificates are not supported on this platform: {}",
+                path.display()
+            ))
+        }
+    } else {
+        let identity = reqwest::Identity::from_pem(&bytes).map_err(|error| {
+            format!(
+                "Could not load PEM client certificate {}: {error}",
+                path.display()
+            )
+        })?;
+        Ok(Some(ClientIdentity::Pem(identity)))
+    }
+}
+
+/// A blocking HTTP client that enforces the SSRF guard at connect time (via
+/// [`GuardedDnsResolver`]) and re-validates redirect hops.
+///
+/// The client trusts the OS certificate store (via the `rustls-tls-native-roots`
+/// feature) so enterprise CAs work, and presents a client certificate for
+/// mutual TLS when one is configured (issue #1220).
+///
+/// It is built once and cached: the client carries a connection pool and, when
+/// mutual TLS is configured, certificate material read and parsed from disk,
+/// none of which changes during a run. Callers set their own per-request
+/// deadline with [`reqwest::blocking::RequestBuilder::timeout`]. reqwest's
+/// blocking `Client` is `Arc`-backed, so cloning the cached instance is cheap. A
+/// load error is cached too: the config is static, so re-reading a bad
+/// certificate would fail identically.
+fn guarded_http_client() -> Result<reqwest::blocking::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::blocking::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT.get_or_init(build_guarded_http_client).clone()
+}
+
+fn build_guarded_http_client() -> Result<reqwest::blocking::Client, String> {
+    // The SSRF guard (GuardedDnsResolver + redirect re-validation) is applied
+    // here, independent of the TLS backend chosen below, so it holds on both the
+    // rustls and native-tls paths.
+    let mut builder = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(REMOTE_TILE_CONNECT_TIMEOUT_SECS))
+        .redirect(guarded_redirect_policy())
+        .dns_resolver(std::sync::Arc::new(GuardedDnsResolver))
+        .user_agent("GeoLibre Desktop");
+
+    for certificate in extra_ca_certificates()? {
+        builder = builder.add_root_certificate(certificate);
+    }
+
+    builder = match client_identity()? {
+        // PKCS#12 identities are only understood by native-tls, which also reads
+        // the OS trust store on every platform; switch this one client over.
+        // (Not reachable on Android — client_identity errors out there.)
+        #[cfg(not(target_os = "android"))]
+        Some(ClientIdentity::Pkcs12(identity)) => builder.use_native_tls().identity(identity),
+        Some(ClientIdentity::Pem(identity)) => builder.use_rustls_tls().identity(identity),
+        None => builder.use_rustls_tls(),
+    };
+
+    builder
+        .build()
+        .map_err(|error| format!("Could not create HTTP client: {error}"))
+}
+
 #[tauri::command]
 async fn fetch_url_bytes(url: String) -> Result<Vec<u8>, String> {
     tauri::async_runtime::spawn_blocking(move || fetch_url_bytes_blocking(url))
@@ -451,19 +934,13 @@ async fn fetch_url_bytes(url: String) -> Result<Vec<u8>, String> {
 }
 
 fn fetch_url_bytes_blocking(url: String) -> Result<Vec<u8>, String> {
-    if !url.starts_with("https://") && !url.starts_with("http://") {
-        return Err("Only HTTP and HTTPS URLs can be fetched".to_string());
-    }
+    ensure_fetchable_url(&url)?;
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(REMOTE_TILE_TIMEOUT_SECS))
-        .connect_timeout(Duration::from_secs(REMOTE_TILE_CONNECT_TIMEOUT_SECS))
-        .user_agent("GeoLibre Desktop")
-        .build()
-        .map_err(|error| format!("Could not create HTTP client: {error}"))?;
+    let client = guarded_http_client()?;
 
     let response = client
         .get(&url)
+        .timeout(Duration::from_secs(REMOTE_TILE_TIMEOUT_SECS))
         .send()
         .map_err(|error| format!("Request failed: {error}"))?;
     let status = response.status();
@@ -762,7 +1239,7 @@ fn load_external_plugin_archive(
 /// full path within the archive, or None when no plugin.json is present.
 fn find_zip_manifest_path<R: Read + std::io::Seek>(archive: &zip::ZipArchive<R>) -> Option<String> {
     let names: Vec<&str> = archive.file_names().collect();
-    if names.iter().any(|name| *name == "plugin.json") {
+    if names.contains(&"plugin.json") {
         return Some("plugin.json".to_string());
     }
     let mut best: Option<&str> = None;
@@ -932,18 +1409,12 @@ async fn resolve_url_redirect(url: String) -> Result<String, String> {
 }
 
 fn resolve_url_redirect_blocking(url: String) -> Result<String, String> {
-    if !url.starts_with("https://") && !url.starts_with("http://") {
-        return Err("Only HTTP and HTTPS URLs can be resolved".to_string());
-    }
+    ensure_fetchable_url(&url)?;
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(URL_RESOLVE_TIMEOUT_SECS))
-        .connect_timeout(Duration::from_secs(REMOTE_TILE_CONNECT_TIMEOUT_SECS))
-        .user_agent("GeoLibre Desktop")
-        .build()
-        .map_err(|error| format!("Could not create HTTP client: {error}"))?;
+    let client = guarded_http_client()?;
+    let timeout = Duration::from_secs(URL_RESOLVE_TIMEOUT_SECS);
 
-    if let Ok(head_response) = client.head(&url).send() {
+    if let Ok(head_response) = client.head(&url).timeout(timeout).send() {
         if has_xyz_placeholders(head_response.url().as_str()) {
             return Ok(head_response.url().to_string());
         }
@@ -952,6 +1423,7 @@ fn resolve_url_redirect_blocking(url: String) -> Result<String, String> {
     let response = client
         .get(&url)
         .header("accept", "application/json, text/plain;q=0.9, */*;q=0.8")
+        .timeout(timeout)
         .send()
         .map_err(|error| format!("Request failed: {error}"))?;
     if has_xyz_placeholders(response.url().as_str()) {
@@ -1030,6 +1502,9 @@ struct MartinServerInfo {
 struct SidecarServerInfo {
     base_url: String,
     port: u16,
+    /// Per-launch bearer token the frontend must send on every sidecar request
+    /// (see [`sidecar_token`]).
+    token: String,
 }
 
 #[derive(Serialize)]
@@ -1137,6 +1612,10 @@ async fn start_geolibre_sidecar(app: tauri::AppHandle) -> Result<SidecarServerIn
 fn start_geolibre_sidecar_blocking(app: tauri::AppHandle) -> Result<SidecarServerInfo, String> {
     let base_url = sidecar_base_url();
     let state = app.state::<SidecarServerState>();
+    let _lifecycle = state
+        .lifecycle
+        .lock()
+        .map_err(|_| "Could not lock sidecar lifecycle.".to_string())?;
     {
         let mut process = state
             .process
@@ -1152,6 +1631,7 @@ fn start_geolibre_sidecar_blocking(app: tauri::AppHandle) -> Result<SidecarServe
                 return Ok(SidecarServerInfo {
                     base_url,
                     port: SIDECAR_PORT,
+                    token: sidecar_token().to_string(),
                 });
             }
             *process = None;
@@ -1159,10 +1639,31 @@ fn start_geolibre_sidecar_blocking(app: tauri::AppHandle) -> Result<SidecarServe
     }
 
     if sidecar_health_is_ready(&base_url) {
-        return Ok(SidecarServerInfo {
-            base_url,
-            port: SIDECAR_PORT,
-        });
+        if sidecar_accepts_token(&base_url, sidecar_token()) {
+            return Ok(SidecarServerInfo {
+                base_url,
+                port: SIDECAR_PORT,
+                token: sidecar_token().to_string(),
+            });
+        }
+        // A sidecar is listening but rejects this session's token — usually an
+        // orphan from a previous app launch. Reclaim it when the OS-specific
+        // listener inspection can prove it is one of our sidecars. The process
+        // identity guard prevents terminating an unrelated service that happens
+        // to use the same port.
+        terminate_sidecar_listeners_on_port(SIDECAR_PORT)?;
+        // Bind-testing the port is the authoritative check that the reclaim
+        // worked: a listener we could not terminate may also have stopped
+        // answering /health, and falling through to spawn would then surface as
+        // an opaque uvicorn "address already in use" instead of this message.
+        if !wait_for_port_free(SIDECAR_PORT) {
+            return Err(
+                "A GeoLibre processing server from a previous session is still \
+                 running on port 8765 but does not accept this session's token. \
+                 Quit any stray GeoLibre processes and try again."
+                    .to_string(),
+            );
+        }
     }
 
     let uv = ensure_managed_uv(&app)?;
@@ -1176,6 +1677,9 @@ fn start_geolibre_sidecar_blocking(app: tauri::AppHandle) -> Result<SidecarServe
     let mut command = Command::new(&uv);
     command
         .arg("run")
+        // Read the bundled uv.lock as-is: never re-lock, never write to the
+        // project directory. See the same flag in start_jupyter_server_blocking.
+        .arg("--frozen")
         .arg("--project")
         .arg(&project_dir)
         // The AI segmentation `/ml` endpoints proxy to samgeo-api from inside
@@ -1192,6 +1696,7 @@ fn start_geolibre_sidecar_blocking(app: tauri::AppHandle) -> Result<SidecarServe
         .arg(SIDECAR_PORT.to_string())
         .current_dir(&project_dir)
         .env("GEOLIBRE_UV", &uv)
+        .env("GEOLIBRE_SIDECAR_TOKEN", sidecar_token())
         .env("GEOLIBRE_RUNTIME_DIR", &runtime_dir)
         .env("UV_CACHE_DIR", runtime_dir.join("uv-cache"))
         .env("UV_PYTHON_INSTALL_DIR", runtime_dir.join("uv-python"))
@@ -1204,14 +1709,17 @@ fn start_geolibre_sidecar_blocking(app: tauri::AppHandle) -> Result<SidecarServe
     let mut child = command
         .spawn()
         .map_err(|error| format!("Could not start GeoLibre sidecar: {error}"))?;
+    // Drain both pipes from the moment we spawn. Reading them only after the
+    // child exits (the old shape) deadlocks a cold-cache `uv sync`, whose
+    // per-package output overflows the 64 KB pipe long before uvicorn can bind:
+    // the child blocks on write, never becomes ready, and the failure surfaces
+    // as a bare timeout with no output to explain it.
+    let output = CapturedOutput::attach(&mut child);
 
-    if let Err(error) = wait_for_sidecar_health(&base_url, &mut child) {
+    if let Err(error) = wait_for_sidecar_health(&base_url, &mut child, &output) {
         terminate_sidecar_child(&mut child);
         return Err(error);
     }
-
-    let _ = child.stdout.take();
-    let _ = child.stderr.take();
 
     let mut process = state
         .process
@@ -1227,6 +1735,7 @@ fn start_geolibre_sidecar_blocking(app: tauri::AppHandle) -> Result<SidecarServe
     Ok(SidecarServerInfo {
         base_url,
         port: SIDECAR_PORT,
+        token: sidecar_token().to_string(),
     })
 }
 
@@ -1239,6 +1748,10 @@ async fn stop_geolibre_sidecar(app: tauri::AppHandle) -> Result<(), String> {
 
 fn stop_geolibre_sidecar_blocking(app: tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<SidecarServerState>();
+    let _lifecycle = state
+        .lifecycle
+        .lock()
+        .map_err(|_| "Could not lock sidecar lifecycle.".to_string())?;
     {
         let mut process = state
             .process
@@ -1322,7 +1835,9 @@ fn start_jupyter_server_blocking(app: tauri::AppHandle) -> Result<JupyterServerI
     // and exit 1 ("exited before it was ready") while the orphan lingers. Clear
     // any stale listener and wait for the port to free before spawning.
     let _ = terminate_jupyter_listeners_on_port(JUPYTER_PORT);
-    wait_for_port_free(JUPYTER_PORT);
+    // Best-effort here: if the port never frees, the spawn below fails with
+    // Jupyter's own bind error, which is already reported to the user.
+    let _ = wait_for_port_free(JUPYTER_PORT);
 
     let uv = ensure_managed_uv(&app)?;
     let project_dir = sidecar_project_dir(&app)?;
@@ -1359,6 +1874,15 @@ fn start_jupyter_server_blocking(app: tauri::AppHandle) -> Result<JupyterServerI
     let mut command = Command::new(&uv);
     command
         .arg("run")
+        // Read the bundled uv.lock as-is. Without this uv re-locks whenever it
+        // thinks the lock is stale and WRITES uv.lock back into the project
+        // directory — which in an installed build is the read-only resource dir
+        // (C:\Program Files\..., /usr/lib/GeoLibre Desktop/...). That write fails
+        // with "Permission denied" and uv exits 2, which reached the user as the
+        // opaque "Jupyter server exited before it was ready (exit code: 2)".
+        // `--frozen` also keeps a released build pinned to the versions it was
+        // tested against instead of re-resolving against live PyPI per machine.
+        .arg("--frozen")
         .arg("--project")
         .arg(&project_dir)
         // The `notebook` extra carries JupyterLab. Synced into a dedicated
@@ -1386,21 +1910,27 @@ fn start_jupyter_server_blocking(app: tauri::AppHandle) -> Result<JupyterServerI
         // preserving any inherited PYTHONPATH rather than replacing it.
         .env("PYTHONPATH", prepend_pythonpath(&lib_dir))
         .stdin(Stdio::null())
-        // Inherit (don't capture) stdout/stderr. Unlike the sidecar's quiet
-        // uvicorn, `uv sync` of JupyterLab + JupyterLab's own startup write a lot;
-        // a captured 64 KB pipe we don't drain during the health wait would fill
-        // and block the child, so it would never become ready. Inheriting also
-        // surfaces the logs in the dev terminal for debugging.
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        // Pipe (don't inherit) stdout/stderr, and drain both on background
+        // threads via CapturedOutput. Inheriting used to be the only way to keep
+        // a chatty child — `uv sync` of JupyterLab plus JupyterLab's own startup
+        // write a lot — from filling an undrained 64 KB pipe and blocking before
+        // it could become ready. But release builds are GUI-subsystem
+        // (`windows_subsystem = "windows"`), and a desktop-launched app on Linux
+        // has no terminal either, so inherited output went nowhere and a startup
+        // failure surfaced as a bare exit status with no way to find the cause.
+        // Draining keeps the child unblocked, tees the log to the parent's stdio
+        // for dev terminals, and keeps the tail so the error can quote it.
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     configure_sidecar_process(&mut command);
 
     let mut child = command
         .spawn()
         .map_err(|error| format!("Could not start Jupyter server: {error}"))?;
+    let output = CapturedOutput::attach(&mut child);
 
     let base_url = jupyter_base_url();
-    if let Err(error) = wait_for_jupyter_health(&base_url, &token, &mut child) {
+    if let Err(error) = wait_for_jupyter_health(&base_url, &token, &mut child, &output) {
         terminate_sidecar_child(&mut child);
         return Err(error);
     }
@@ -1460,21 +1990,26 @@ fn jupyter_base_url() -> String {
 // Wait (briefly) until `port` can be bound, i.e. a just-terminated listener has
 // fully released it. Binding then dropping leaves a small race window, but it is
 // enough to avoid a `--port-retries=0` bind failure right after killing an orphan.
-fn wait_for_port_free(port: u16) {
+// Returns whether the port actually came free within the timeout, so a caller
+// that can report a better error than the failed spawn is able to bail out.
+fn wait_for_port_free(port: u16) -> bool {
     for _ in 0..20 {
         if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return;
+            return true;
         }
         thread::sleep(Duration::from_millis(100));
     }
+    false
 }
 
 // Prepend `dir` to any inherited PYTHONPATH (platform separator), so a user's
-// existing value is preserved rather than clobbered.
+// existing value is preserved rather than clobbered. The inherited value is
+// taken *after* AppImage sanitation, so the AppDir entry AppRun injects is not
+// carried into the child (see appdir_free_path_var).
 fn prepend_pythonpath(dir: &Path) -> String {
     let dir = dir.display().to_string();
-    match env::var("PYTHONPATH") {
-        Ok(existing) if !existing.is_empty() => {
+    match appdir_free_path_var("PYTHONPATH") {
+        Some(existing) if !existing.is_empty() => {
             let sep = if cfg!(windows) { ";" } else { ":" };
             format!("{dir}{sep}{existing}")
         }
@@ -1495,7 +2030,12 @@ fn jupyter_health_is_ready(
         .unwrap_or(false)
 }
 
-fn wait_for_jupyter_health(base_url: &str, token: &str, child: &mut Child) -> Result<(), String> {
+fn wait_for_jupyter_health(
+    base_url: &str,
+    token: &str,
+    child: &mut Child,
+    output: &CapturedOutput,
+) -> Result<(), String> {
     // Build the HTTP client once and reuse it across all health polls (this loop
     // runs up to JUPYTER_HEALTH_ATTEMPTS = 240 times).
     let client = reqwest::blocking::Client::builder()
@@ -1507,11 +2047,9 @@ fn wait_for_jupyter_health(base_url: &str, token: &str, child: &mut Child) -> Re
             .try_wait()
             .map_err(|error| format!("Could not inspect Jupyter process: {error}"))?
         {
-            // Output is inherited (visible in the terminal), not captured, so we
-            // surface only the exit status here.
-            return Err(format!(
-                "Jupyter server exited before it was ready (exit status: {status}). \
-                 Check the terminal for the Jupyter/uv startup output."
+            return Err(child_failure_message(
+                &format!("Jupyter server exited before it was ready (exit status: {status})."),
+                output,
             ));
         }
 
@@ -1522,7 +2060,27 @@ fn wait_for_jupyter_health(base_url: &str, token: &str, child: &mut Child) -> Re
         thread::sleep(Duration::from_secs(1));
     }
 
-    Err("Jupyter server did not become ready in time.".to_string())
+    Err(child_failure_message(
+        "Jupyter server did not become ready in time.",
+        output,
+    ))
+}
+
+// Append the tail of a managed child's output to a failure summary. That output
+// is the only thing that identifies *why* startup failed (a uv resolution error,
+// a missing `jupyter` executable, a port conflict...), and in an installed build
+// there is no terminal to read it from, so it has to travel with the error.
+// Shared by the Jupyter and sidecar waiters, and by both of their failure paths
+// (early exit and timeout), so no path can quietly drop the one useful detail.
+fn child_failure_message(summary: &str, output: &CapturedOutput) -> String {
+    // The child may have only just exited, with its last lines still in flight.
+    output.settle();
+    let tail = output.tail();
+    if tail.is_empty() {
+        format!("{summary} It produced no output.")
+    } else {
+        format!("{summary}\n\nLast output:\n{tail}")
+    }
 }
 
 // A loopback-bound, per-launch token for the desktop Jupyter server. It is the
@@ -1531,7 +2089,7 @@ fn wait_for_jupyter_health(base_url: &str, token: &str, child: &mut Child) -> Re
 // anything derived from the clock/pid.
 fn generate_jupyter_token() -> String {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).expect("OS CSPRNG (getrandom) unavailable");
+    getrandom::fill(&mut bytes).expect("OS CSPRNG (getrandom) unavailable");
     let mut token = String::with_capacity(32);
     for byte in bytes {
         use std::fmt::Write;
@@ -1542,6 +2100,21 @@ fn generate_jupyter_token() -> String {
 
 fn sidecar_base_url() -> String {
     format!("http://127.0.0.1:{SIDECAR_PORT}")
+}
+
+/// A per-launch shared secret the frontend must present on every sidecar
+/// request. The sidecar binds loopback and is CORS-restricted, but neither stops
+/// a cross-origin simple POST (CSRF) or a DNS-rebinding read; this token does.
+///
+/// Generated once per desktop process (128 CSPRNG bits) and reused for the
+/// process lifetime so the early-return paths of `start_geolibre_sidecar` (when
+/// the sidecar is already running) hand back the same token that was injected
+/// via `GEOLIBRE_SIDECAR_TOKEN` at spawn time. A sidecar started outside this
+/// process (e.g. a `python -m` dev run) leaves the env var unset and simply does
+/// not enforce the token, so those flows keep working.
+fn sidecar_token() -> &'static str {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(generate_jupyter_token)
 }
 
 fn sidecar_health_is_ready(base_url: &str) -> bool {
@@ -1558,12 +2131,43 @@ fn sidecar_health_is_ready(base_url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the sidecar already listening at `base_url` accepts `token`.
+///
+/// `/health` is token-exempt, so it cannot reveal a token mismatch. This probes
+/// `/algorithms` (a cheap authenticated endpoint) *with* the token so an orphan
+/// sidecar from a previous launch — started with a different per-launch token,
+/// and not killed because `Drop` doesn't run on `SIGKILL` — is detected rather
+/// than silently 401ing every later request. A tokenless dev sidecar
+/// (`GEOLIBRE_SIDECAR_TOKEN` unset) accepts any header and returns 200, so it is
+/// still reused.
+fn sidecar_accepts_token(base_url: &str, token: &str) -> bool {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(format!("{base_url}/algorithms"))
+        .header("x-geolibre-token", token)
+        .send()
+        .map(|response| response.status().is_success())
+        .unwrap_or(false)
+}
+
 fn request_sidecar_shutdown(base_url: &str) {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_millis(500))
         .build();
     if let Ok(client) = client {
-        let _ = client.post(format!("{base_url}/shutdown")).send();
+        // /shutdown is token-protected (only /health is exempt), so attach this
+        // session's token. This shuts down a sidecar we started or adopted (same
+        // token); a true cross-launch orphan (different token) 401s and falls
+        // through to the force-kill path, as before.
+        let _ = client
+            .post(format!("{base_url}/shutdown"))
+            .header("x-geolibre-token", sidecar_token())
+            .send();
     }
 }
 
@@ -1576,18 +2180,20 @@ fn wait_for_sidecar_stop(base_url: &str) {
     }
 }
 
-fn wait_for_sidecar_health(base_url: &str, child: &mut Child) -> Result<(), String> {
+fn wait_for_sidecar_health(
+    base_url: &str,
+    child: &mut Child,
+    output: &CapturedOutput,
+) -> Result<(), String> {
     for _ in 0..SIDECAR_HEALTH_ATTEMPTS {
         if let Some(status) = child
             .try_wait()
             .map_err(|error| format!("Could not inspect sidecar process: {error}"))?
         {
-            let output = read_child_output(child);
-            return Err(if output.trim().is_empty() {
-                format!("GeoLibre sidecar exited before it was ready: {status}")
-            } else {
-                format!("GeoLibre sidecar exited before it was ready: {output}")
-            });
+            return Err(child_failure_message(
+                &format!("GeoLibre sidecar exited before it was ready: {status}"),
+                output,
+            ));
         }
 
         if sidecar_health_is_ready(base_url) {
@@ -1597,10 +2203,205 @@ fn wait_for_sidecar_health(base_url: &str, child: &mut Child) -> Result<(), Stri
         thread::sleep(Duration::from_secs(1));
     }
 
-    Err("GeoLibre sidecar did not become ready in time.".to_string())
+    Err(child_failure_message(
+        "GeoLibre sidecar did not become ready in time.",
+        output,
+    ))
+}
+
+// How many trailing output lines a captured child keeps, and how many of them a
+// failure message quotes. The log is a ring buffer so a chatty child (uv sync +
+// JupyterLab startup write hundreds of lines) can never grow without bound, and
+// the tail is what matters: the error that killed the process is at the end.
+const CAPTURED_LOG_MAX_LINES: usize = 200;
+const CAPTURED_LOG_REPORTED_LINES: usize = 20;
+// How long a failure report waits for the reader threads to reach EOF before
+// quoting what they have. `try_wait` reports the exit as soon as the process is
+// reaped, which can be before the readers have consumed the last lines still
+// sitting in the pipe — and those last lines are the error itself. Waiting is
+// necessarily *bounded*: `uv` spawns `jupyter`, which spawns kernels that
+// inherit these same pipe handles, so a grandchild outliving the child keeps the
+// write end open and EOF never arrives. An unbounded join would hang the Tauri
+// command forever, which is worse than a truncated tail.
+const CAPTURED_LOG_SETTLE: Duration = Duration::from_millis(500);
+const CAPTURED_LOG_SETTLE_POLL: Duration = Duration::from_millis(10);
+
+/// The trailing output of a spawned child, drained on background threads.
+///
+/// `Stdio::piped()` alone is not enough for a child we only poll for health: an
+/// undrained OS pipe fills at ~64 KB and blocks the writer forever, so a chatty
+/// child would hang instead of becoming ready. These readers consume both
+/// streams continuously, keep the last `CAPTURED_LOG_MAX_LINES` in memory, and
+/// echo each line to the parent's own stdio so a dev terminal still shows the
+/// live log.
+#[derive(Clone)]
+struct CapturedOutput {
+    lines: Arc<Mutex<VecDeque<String>>>,
+    // Reader threads that have not yet seen EOF. Drives `settle`.
+    draining: Arc<AtomicUsize>,
+}
+
+impl CapturedOutput {
+    fn new() -> Self {
+        Self {
+            lines: Arc::new(Mutex::new(VecDeque::with_capacity(CAPTURED_LOG_MAX_LINES))),
+            draining: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Take the child's piped stdout/stderr and start draining them.
+    fn attach(child: &mut Child) -> Self {
+        let captured = Self::new();
+        if let Some(stdout) = child.stdout.take() {
+            captured.drain(stdout, false);
+        }
+        if let Some(stderr) = child.stderr.take() {
+            captured.drain(stderr, true);
+        }
+        captured
+    }
+
+    fn drain<R>(&self, stream: R, is_stderr: bool)
+    where
+        R: Read + Send + 'static,
+    {
+        let captured = self.clone();
+        // Registered before the thread starts, so a `settle` racing the spawn
+        // still sees this reader as outstanding.
+        self.draining.fetch_add(1, Ordering::SeqCst);
+        // Detached: the thread ends on its own when the pipe closes at child
+        // exit. `settle` waits on the counter rather than a JoinHandle so the
+        // wait can be bounded (see CAPTURED_LOG_SETTLE).
+        thread::spawn(move || {
+            for line in BufReader::new(stream).lines() {
+                let Ok(line) = line else { break };
+                // Tee to the parent's stdio. In a dev terminal this preserves
+                // the old inherit-style live log; in a bundled GUI build (no
+                // console on Windows) it is simply discarded.
+                if is_stderr {
+                    let _ = writeln!(std::io::stderr(), "{line}");
+                } else {
+                    let _ = writeln!(std::io::stdout(), "{line}");
+                }
+                captured.push(line);
+            }
+            captured.draining.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+
+    /// Give the reader threads a bounded moment to reach EOF, so a report made
+    /// right after `try_wait` sees the child's final lines instead of racing
+    /// them. Returns early once every reader is done; otherwise gives up at
+    /// `CAPTURED_LOG_SETTLE` and lets the caller quote a partial tail.
+    fn settle(&self) {
+        let deadline = CAPTURED_LOG_SETTLE.as_millis() / CAPTURED_LOG_SETTLE_POLL.as_millis();
+        for _ in 0..deadline {
+            if self.draining.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            thread::sleep(CAPTURED_LOG_SETTLE_POLL);
+        }
+    }
+
+    /// Record one line, evicting the oldest once the ring buffer is full.
+    fn push(&self, line: String) {
+        let Ok(mut lines) = self.lines.lock() else {
+            return;
+        };
+        while lines.len() >= CAPTURED_LOG_MAX_LINES {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+
+    /// The last few captured lines, blank-trimmed, for an error message.
+    /// Empty when the child produced no output at all.
+    fn tail(&self) -> String {
+        let Ok(lines) = self.lines.lock() else {
+            return String::new();
+        };
+        let start = lines.len().saturating_sub(CAPTURED_LOG_REPORTED_LINES);
+        lines
+            .iter()
+            .skip(start)
+            .map(|line| line.trim_end())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// The AppImage mount root, when running from an AppImage. `APPDIR` is exported
+/// by AppRun and is the prefix of everything it injects.
+fn appimage_dir() -> Option<String> {
+    env::var("APPDIR").ok().filter(|dir| !dir.is_empty())
+}
+
+/// Read a `PATH`-style variable with any entry that points inside the AppImage
+/// mount removed. Returns `None` when the variable is unset or every entry was
+/// an AppDir entry (so the caller unsets it rather than passing an empty value).
+/// Outside an AppImage the value is returned untouched.
+fn appdir_free_path_var(name: &str) -> Option<String> {
+    let value = env::var(name).ok()?;
+    let Some(appdir) = appimage_dir() else {
+        return Some(value);
+    };
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let kept: Vec<&str> = value
+        .split(sep)
+        .filter(|entry| !entry.is_empty() && !entry.starts_with(appdir.as_str()))
+        .collect();
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join(&sep.to_string()))
+    }
+}
+
+/// Undo the environment an AppImage forces on every child process.
+///
+/// AppImageKit's AppRun exports a fixed set of variables so the bundled GUI can
+/// find its own libraries, including:
+///
+/// ```text
+/// PYTHONHOME=$APPDIR/usr/
+/// PYTHONPATH=$APPDIR/usr/share/pyshared/:$PYTHONPATH
+/// LD_LIBRARY_PATH=$APPDIR/usr/lib/:…:$LD_LIBRARY_PATH
+/// ```
+///
+/// They leak into everything we spawn. `PYTHONHOME` is the fatal one: a Python
+/// that honours it looks for its standard library under the AppImage mount,
+/// finds no `encodings` module, and aborts with "Failed to import encodings
+/// module" before executing a line of code. That killed `uv`'s build backend —
+/// and so the Notebook panel and the sidecar — in every AppImage build, while
+/// the .deb/.rpm (which have no AppRun) were unaffected.
+///
+/// We never want an inherited `PYTHONHOME`: the interpreter is chosen by uv and
+/// the project environment we point it at, so drop it unconditionally rather
+/// than only under an AppImage. The two search paths keep any entries the user
+/// legitimately set and lose only the AppDir ones.
+fn clear_appimage_python_env(command: &mut Command) {
+    command.env_remove("PYTHONHOME");
+    for name in ["LD_LIBRARY_PATH", "PYTHONPATH"] {
+        // The Jupyter launch sets its own PYTHONPATH (already AppDir-free, via
+        // prepend_pythonpath) before this runs, and overwriting it here would
+        // drop the notebook-lib directory that makes `import geolibre` work.
+        if command
+            .get_envs()
+            .any(|(key, value)| key == OsStr::new(name) && value.is_some())
+        {
+            continue;
+        }
+        match appdir_free_path_var(name) {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
 }
 
 fn configure_sidecar_process(command: &mut Command) {
+    // Both callers (the sidecar and Jupyter launches) run Python through uv.
+    clear_appimage_python_env(command);
     configure_sidecar_process_impl(command);
 }
 
@@ -1797,12 +2598,7 @@ fn sidecar_project_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     }
 
     if let Ok(resource_dir) = app.path().resource_dir() {
-        if let Ok(path) =
-            validate_sidecar_project_dir(resource_dir.join("backend").join("geolibre_server"))
-        {
-            return Ok(path);
-        }
-        if let Ok(path) = validate_sidecar_project_dir(resource_dir.join("geolibre_server")) {
+        if let Some(path) = resolve_sidecar_in_resource_dir(&resource_dir) {
             return Ok(path);
         }
     }
@@ -1815,6 +2611,34 @@ fn sidecar_project_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
             .join("backend")
             .join("geolibre_server"),
     )
+}
+
+/// Locate the bundled Python sidecar project under a Tauri resource directory.
+///
+/// Tauri bundles the `../../../backend/geolibre_server` resource by rewriting
+/// every leading `..` in the source path to an `_up_` directory, so in an
+/// installed build the project lands at
+/// `<resource_dir>/_up_/_up_/_up_/backend/geolibre_server` rather than directly
+/// under the resource dir (issue #1223). We probe the plain locations first,
+/// then a few `_up_` depths so the lookup keeps working if the number of `..`
+/// segments in the resource path ever changes.
+fn resolve_sidecar_in_resource_dir(resource_dir: &std::path::Path) -> Option<PathBuf> {
+    // Plain resource root plus a few `_up_` levels of margin over the observed
+    // 3-level bundle depth, so the lookup survives a change in Tauri's bundling.
+    const MAX_UP_DEPTH: usize = 4;
+    let mut prefix = resource_dir.to_path_buf();
+    for _ in 0..=MAX_UP_DEPTH {
+        if let Ok(path) =
+            validate_sidecar_project_dir(prefix.join("backend").join("geolibre_server"))
+        {
+            return Some(path);
+        }
+        if let Ok(path) = validate_sidecar_project_dir(prefix.join("geolibre_server")) {
+            return Some(path);
+        }
+        prefix = prefix.join("_up_");
+    }
+    None
 }
 
 fn validate_sidecar_project_dir(path: PathBuf) -> Result<PathBuf, String> {
@@ -2505,11 +3329,24 @@ fn create_oauth_popup_window(
 
 #[cfg(target_os = "linux")]
 fn configure_linux_webkit() {
-    // WebKitGTK's DMABUF renderer can fail to allocate GBM buffers on some
-    // Linux graphics stacks, leaving the Tauri window blank. Only set the
-    // default when unset so an explicit user/distributor value wins.
+    // WebKitGTK's DMABUF renderer could fail to allocate GBM buffers on older
+    // graphics stacks, leaving the Tauri window blank, so it used to be
+    // disabled here unconditionally. Disabling it also forces a slow readback
+    // compositing path that visibly drops MapLibre pan/zoom FPS, and the
+    // allocation bugs are fixed in current WebKitGTK, so keep the workaround
+    // only for versions older than 2.48. An explicit user/distributor value
+    // always wins (per WebKit semantics, "0" keeps DMABUF on and any other
+    // value disables it). Only set the default when unset.
     if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        let webkit_version = unsafe {
+            (
+                webkit2gtk_sys::webkit_get_major_version(),
+                webkit2gtk_sys::webkit_get_minor_version(),
+            )
+        };
+        if webkit_version < (2, 48) {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
     }
     // Prefer portal-backed native dialogs on Linux. This avoids GTK/GIO file
     // metadata warnings that can appear around file and folder pickers.
@@ -2523,8 +3360,188 @@ fn configure_linux_webkit() {}
 
 #[cfg(test)]
 mod tests {
-    use super::{find_zip_manifest_path, is_allowed_local_vector_path, plugin_archive_file_name};
+    use super::{
+        child_failure_message, clear_appimage_python_env, client_cert_is_pkcs12,
+        client_cert_password_without_path, ensure_fetchable_url, find_zip_manifest_path,
+        is_allowed_local_vector_path, is_allowed_project_path, is_disallowed_ip,
+        is_safe_absolute_path, plugin_archive_file_name, resolve_sidecar_in_resource_dir,
+        CapturedOutput, CAPTURED_LOG_MAX_LINES, CAPTURED_LOG_REPORTED_LINES, CAPTURED_LOG_SETTLE,
+    };
+    use std::env;
+    use std::ffi::OsStr;
     use std::io::{Cursor, Write};
+    use std::net::IpAddr;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    // `std::env::set_var` is process-global, so the tests that stage an AppImage
+    // environment must not run concurrently with each other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // A throwaway directory tree under the system temp dir that removes itself
+    // on drop, so scratch dirs are cleaned up even when an assertion panics.
+    // Uses the process id (no rand dependency) and clears any leftover from a
+    // prior run at construction.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("geolibre-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // Regression for issue #1223: installed builds place the bundled sidecar at
+    // `<resource_dir>/_up_/_up_/_up_/backend/geolibre_server`, so the resolver
+    // must follow the `_up_` chain rather than only checking the resource root.
+    #[test]
+    fn resolves_bundled_sidecar_under_up_prefix() {
+        let root = ScratchDir::new("sidecar-up");
+        let project = root
+            .path()
+            .join("_up_")
+            .join("_up_")
+            .join("_up_")
+            .join("backend")
+            .join("geolibre_server");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("pyproject.toml"), "[project]\n").unwrap();
+
+        let resolved =
+            resolve_sidecar_in_resource_dir(root.path()).expect("sidecar should be found");
+        assert_eq!(resolved, project.canonicalize().unwrap());
+
+        // The plain (0-level) layout used by portable builds, where the sidecar
+        // sits at `backend/geolibre_server` directly under the resource dir.
+        let plain_root = ScratchDir::new("sidecar-plain");
+        let plain_project = plain_root.path().join("backend").join("geolibre_server");
+        std::fs::create_dir_all(&plain_project).unwrap();
+        std::fs::write(plain_project.join("pyproject.toml"), "[project]\n").unwrap();
+        let plain_resolved = resolve_sidecar_in_resource_dir(plain_root.path())
+            .expect("plain sidecar should be found");
+        assert_eq!(plain_resolved, plain_project.canonicalize().unwrap());
+
+        // A resource dir without the project (and without a pyproject marker)
+        // resolves to nothing rather than a false positive.
+        let empty = ScratchDir::new("sidecar-empty");
+        assert!(resolve_sidecar_in_resource_dir(empty.path()).is_none());
+    }
+
+    // Issue #1220: a client certificate is read as PKCS#12 when its extension is
+    // `.p12`/`.pfx` (case-insensitively) or a passphrase is supplied; everything
+    // else is treated as PEM.
+    #[test]
+    fn classifies_client_cert_format() {
+        use std::path::Path;
+        // Extension selects PKCS#12, case-insensitively.
+        assert!(client_cert_is_pkcs12(Path::new("/certs/id.p12"), false));
+        assert!(client_cert_is_pkcs12(Path::new("/certs/id.PFX"), false));
+        // PEM (and unrecognised) extensions stay PEM without a passphrase.
+        assert!(!client_cert_is_pkcs12(Path::new("/certs/id.pem"), false));
+        assert!(!client_cert_is_pkcs12(Path::new("/certs/id.crt"), false));
+        assert!(!client_cert_is_pkcs12(Path::new("/certs/id"), false));
+        // A passphrase forces PKCS#12 even for a PEM-looking or extensionless path.
+        assert!(client_cert_is_pkcs12(Path::new("/certs/id.pem"), true));
+        assert!(client_cert_is_pkcs12(Path::new("/certs/id"), true));
+    }
+
+    // Issue #1220: a passphrase without a certificate path is a misconfiguration
+    // (it configures nothing on its own) and must be surfaced, not dropped.
+    #[test]
+    fn flags_passphrase_without_certificate_path() {
+        assert!(client_cert_password_without_path(false, true));
+        // A passphrase with a cert path, or no passphrase at all, is fine.
+        assert!(!client_cert_password_without_path(true, true));
+        assert!(!client_cert_password_without_path(false, false));
+        assert!(!client_cert_password_without_path(true, false));
+    }
+
+    #[test]
+    fn blocks_link_local_and_metadata_ips() {
+        for ip in [
+            "169.254.169.254",        // cloud metadata (link-local)
+            "169.254.0.1",            // link-local
+            "0.0.0.0",                // unspecified
+            "255.255.255.255",        // broadcast
+            "::",                     // unspecified
+            "fe80::1",                // link-local
+            "::ffff:169.254.169.254", // IPv4-mapped metadata
+            "::169.254.169.254",      // IPv4-compatible metadata (deprecated)
+        ] {
+            assert!(
+                is_disallowed_ip(ip.parse::<IpAddr>().unwrap()),
+                "expected {ip} to be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_public_loopback_and_lan_ips() {
+        // Public plus loopback/LAN, which stay reachable for local tile/COG
+        // data (issue #387). Only link-local/metadata is blocked.
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+            "127.0.0.1",    // loopback (local dev tile server)
+            "192.168.1.10", // LAN
+            "10.0.0.5",     // LAN
+            "::1",          // loopback
+        ] {
+            assert!(
+                !is_disallowed_ip(ip.parse::<IpAddr>().unwrap()),
+                "expected {ip} to be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_fetchable_url_blocks_metadata_and_bad_schemes() {
+        assert!(ensure_fetchable_url("http://169.254.169.254/latest/meta-data").is_err());
+        assert!(ensure_fetchable_url("file:///etc/passwd").is_err());
+        assert!(ensure_fetchable_url("ftp://example.com/x").is_err());
+        // Public and loopback/LAN literals are allowed (local data workflow).
+        assert!(ensure_fetchable_url("https://1.1.1.1/").is_ok());
+        assert!(ensure_fetchable_url("http://127.0.0.1:8081/tiles/0/0/0.png").is_ok());
+        assert!(ensure_fetchable_url("http://[::1]:8081/data.pmtiles").is_ok());
+    }
+
+    #[test]
+    fn project_path_guard_allows_projects_and_blocks_secrets() {
+        assert!(is_allowed_project_path("/home/u/map.geolibre.json"));
+        assert!(is_allowed_project_path("/home/u/map.geolibre"));
+        assert!(is_allowed_project_path("C:\\Users\\u\\map.geolibre.json"));
+        // Secrets and traversal are refused.
+        assert!(!is_allowed_project_path("/home/u/.ssh/id_rsa"));
+        assert!(!is_allowed_project_path("/home/u/.aws/credentials"));
+        assert!(!is_allowed_project_path(
+            "/home/u/../../etc/hosts.geolibre.json"
+        ));
+        assert!(!is_allowed_project_path("relative/map.geolibre.json"));
+        assert!(!is_allowed_project_path(
+            "\\\\server\\share\\map.geolibre.json"
+        ));
+        // A bare .json file (e.g. a JSON credential store) is NOT a project.
+        assert!(!is_allowed_project_path(
+            "/home/u/.config/gcloud/application_default_credentials.json"
+        ));
+        assert!(!is_allowed_project_path("C:\\Users\\u\\map.json"));
+    }
 
     #[test]
     fn allows_absolute_vector_paths() {
@@ -2628,5 +3645,251 @@ mod tests {
         assert_eq!(plugin_archive_file_name("..hidden"), "hidden.zip");
         // A name that sanitizes away entirely falls back to a fixed stem.
         assert_eq!(plugin_archive_file_name("..."), "plugin.zip");
+    }
+
+    #[test]
+    fn is_safe_absolute_path_accepts_absolute_local_dirs() {
+        assert!(is_safe_absolute_path("/home/user/data"));
+        assert!(is_safe_absolute_path("/data"));
+        assert!(is_safe_absolute_path("C:\\Users\\me\\gis"));
+        assert!(is_safe_absolute_path("C:/Users/me/gis"));
+        // A ".." inside a name (not a traversal segment) is fine.
+        assert!(is_safe_absolute_path("/home/user/v1..2"));
+    }
+
+    #[test]
+    fn is_safe_absolute_path_rejects_unc_traversal_and_relative() {
+        // UNC shares (both forms) can auto-authenticate against a remote host.
+        assert!(!is_safe_absolute_path("\\\\server\\share"));
+        assert!(!is_safe_absolute_path("//server/share"));
+        // `..` traversal segments.
+        assert!(!is_safe_absolute_path("/home/user/../etc"));
+        assert!(!is_safe_absolute_path("C:\\a\\..\\b"));
+        // Relative / non-absolute and empty input.
+        assert!(!is_safe_absolute_path("home/user"));
+        assert!(!is_safe_absolute_path("./data"));
+        assert!(!is_safe_absolute_path(""));
+        assert!(!is_safe_absolute_path("C:")); // drive letter without a separator
+    }
+
+    #[test]
+    fn captured_output_keeps_only_the_trailing_lines() {
+        let captured = CapturedOutput::new();
+        for index in 0..(CAPTURED_LOG_MAX_LINES * 3) {
+            captured.push(format!("line {index}"));
+        }
+        let tail = captured.tail();
+        let lines: Vec<_> = tail.lines().collect();
+        // The buffer is bounded and the report quotes only its end, so a child
+        // that writes thousands of lines still yields a short, recent tail.
+        assert_eq!(lines.len(), CAPTURED_LOG_REPORTED_LINES);
+        let last = CAPTURED_LOG_MAX_LINES * 3 - 1;
+        assert_eq!(lines[lines.len() - 1], format!("line {last}"));
+        assert_eq!(
+            lines[0],
+            format!("line {}", last + 1 - CAPTURED_LOG_REPORTED_LINES)
+        );
+    }
+
+    #[test]
+    fn captured_output_drops_blank_lines_from_the_tail() {
+        let captured = CapturedOutput::new();
+        captured.push("error: Failed to spawn: `jupyter`".to_string());
+        captured.push("   ".to_string());
+        captured.push(String::new());
+        captured.push("  Caused by: No such file or directory (os error 2)  ".to_string());
+        assert_eq!(
+            captured.tail(),
+            "error: Failed to spawn: `jupyter`\n  Caused by: No such file or directory (os error 2)"
+        );
+    }
+
+    #[test]
+    fn child_failure_message_quotes_the_child_output() {
+        let captured = CapturedOutput::new();
+        captured.push("error: Extra `notebook` is not defined".to_string());
+        let message = child_failure_message("Jupyter server exited.", &captured);
+        assert!(message.starts_with("Jupyter server exited."));
+        // The cause has to travel with the error: an installed build is
+        // GUI-subsystem on Windows and has no terminal to read it from.
+        assert!(message.contains("error: Extra `notebook` is not defined"));
+    }
+
+    #[test]
+    fn child_failure_message_says_so_when_there_was_no_output() {
+        let message = child_failure_message("Jupyter server exited.", &CapturedOutput::new());
+        assert_eq!(message, "Jupyter server exited. It produced no output.");
+    }
+
+    // The whole point of the capture is that the child's *last* lines — the
+    // error that killed it — reach the report. `try_wait` can observe the exit
+    // while those lines are still in the pipe, so the report has to wait for the
+    // readers to drain. Uses a real child so the race is real: a spawn that
+    // writes and exits immediately, reported the way the health waiters do.
+    #[cfg(unix)]
+    #[test]
+    fn child_failure_message_waits_for_output_still_in_the_pipe() {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("echo 'error: the cause'; echo 'to stderr' >&2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn a child that writes and exits");
+        let output = CapturedOutput::attach(&mut child);
+        // Mirror the waiters: report as soon as the exit is observed.
+        while child.try_wait().expect("inspect child").is_none() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let message = child_failure_message("Child exited.", &output);
+        assert!(message.contains("error: the cause"), "got: {message}");
+        assert!(message.contains("to stderr"), "got: {message}");
+    }
+
+    // The race the report has to win, made deterministic. A reader that is
+    // provably still behind at report time stands in for bytes sitting in the
+    // OS pipe after `try_wait` has already reported the child gone. Without
+    // `settle` the report races past it and quotes nothing — which is the
+    // failure mode the capture exists to prevent. (The real-child test above
+    // exercises the same path end to end, but its timing is not guaranteed:
+    // on a fast machine the reader usually wins on its own.)
+    #[test]
+    fn child_failure_message_waits_for_output_still_in_flight() {
+        struct SlowThenEof {
+            sent: bool,
+        }
+        impl std::io::Read for SlowThenEof {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.sent {
+                    return Ok(0); // EOF
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                let line = b"error: the cause\n";
+                buf[..line.len()].copy_from_slice(line);
+                self.sent = true;
+                Ok(line.len())
+            }
+        }
+
+        let captured = CapturedOutput::new();
+        captured.drain(SlowThenEof { sent: false }, false);
+        let message = child_failure_message("Child exited.", &captured);
+        assert!(message.contains("error: the cause"), "got: {message}");
+    }
+
+    // AppImageKit's AppRun exports PYTHONHOME=$APPDIR/usr/ into every child. A
+    // Python that honours it looks for its stdlib inside the AppImage mount and
+    // aborts with "Failed to import encodings module" before running any code,
+    // which is how the Notebook panel and the sidecar died in AppImage builds.
+    // Serialized with the other env-mutating test: these share process env.
+    #[test]
+    fn appimage_python_env_is_stripped_from_children() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let appdir = "/tmp/.mount_GeoLibreXXXX";
+        // Reproduce what AppRun exports.
+        env::set_var("APPDIR", appdir);
+        env::set_var("PYTHONHOME", format!("{appdir}/usr/"));
+        env::set_var(
+            "PYTHONPATH",
+            format!("{appdir}/usr/share/pyshared/:/home/me/lib"),
+        );
+        env::set_var(
+            "LD_LIBRARY_PATH",
+            format!("{appdir}/usr/lib/:{appdir}/lib/"),
+        );
+
+        let mut command = Command::new("true");
+        clear_appimage_python_env(&mut command);
+        let envs: Vec<_> = command.get_envs().collect();
+        let lookup = |name: &str| {
+            envs.iter()
+                .find(|(key, _)| *key == OsStr::new(name))
+                .map(|(_, value)| *value)
+        };
+
+        // PYTHONHOME is dropped outright — it is the fatal one.
+        assert_eq!(lookup("PYTHONHOME"), Some(None));
+        // The user's own PYTHONPATH entry survives; the AppDir one does not.
+        assert_eq!(lookup("PYTHONPATH"), Some(Some(OsStr::new("/home/me/lib"))));
+        // Every LD_LIBRARY_PATH entry was an AppDir entry, so the variable is
+        // unset rather than passed through empty.
+        assert_eq!(lookup("LD_LIBRARY_PATH"), Some(None));
+
+        env::remove_var("APPDIR");
+        env::remove_var("PYTHONHOME");
+        env::remove_var("PYTHONPATH");
+        env::remove_var("LD_LIBRARY_PATH");
+    }
+
+    // Outside an AppImage nothing is filtered: a user who deliberately set these
+    // for their own Python must keep them.
+    #[test]
+    fn python_env_is_untouched_outside_an_appimage() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        env::remove_var("APPDIR");
+        env::set_var("PYTHONPATH", "/home/me/lib:/opt/other");
+
+        let mut command = Command::new("true");
+        clear_appimage_python_env(&mut command);
+        let value = command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("PYTHONPATH"))
+            .map(|(_, value)| value);
+        assert_eq!(value, Some(Some(OsStr::new("/home/me/lib:/opt/other"))));
+
+        env::remove_var("PYTHONPATH");
+    }
+
+    // The Jupyter launch sets PYTHONPATH itself (notebook-lib, so `import
+    // geolibre` works) before the sanitizer runs; the sanitizer must not
+    // overwrite it.
+    #[test]
+    fn a_pythonpath_the_caller_already_set_is_preserved() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("APPDIR", "/tmp/.mount_GeoLibreXXXX");
+        env::set_var("PYTHONPATH", "/tmp/.mount_GeoLibreXXXX/usr/share/pyshared/");
+
+        let mut command = Command::new("true");
+        command.env("PYTHONPATH", "/app/runtime/notebook-lib");
+        clear_appimage_python_env(&mut command);
+        let value = command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("PYTHONPATH"))
+            .map(|(_, value)| value);
+        assert_eq!(value, Some(Some(OsStr::new("/app/runtime/notebook-lib"))));
+
+        env::remove_var("APPDIR");
+        env::remove_var("PYTHONPATH");
+    }
+
+    // A reader that never reaches EOF must not hang the report: `uv` spawns
+    // `jupyter`, which spawns kernels holding these same pipe handles, so a
+    // grandchild outliving the child keeps the write end open forever. `settle`
+    // is bounded for exactly this case.
+    #[test]
+    fn settle_gives_up_on_a_reader_that_never_reaches_eof() {
+        struct NeverEnds;
+        impl std::io::Read for NeverEnds {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(50));
+                buf[0] = b'\n';
+                Ok(1)
+            }
+        }
+
+        let captured = CapturedOutput::new();
+        captured.drain(NeverEnds, false);
+        let started = std::time::Instant::now();
+        captured.settle();
+        // Bounded: returns at the deadline rather than blocking forever. The
+        // generous upper bound keeps this from flaking on a loaded CI runner.
+        assert!(
+            started.elapsed() < CAPTURED_LOG_SETTLE * 10,
+            "settle blocked for {:?}",
+            started.elapsed()
+        );
     }
 }

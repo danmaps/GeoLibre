@@ -38,13 +38,43 @@ import { TooltipProvider } from "@geolibre/ui";
 import { I18nextProvider } from "react-i18next";
 // Initializes i18next (resolves the UI language from the `?locale`/`?lang` query
 // param, stored settings, or the browser) before React renders, so the first
-// paint is already in the right language.
-import i18n from "./i18n";
+// paint is already in the right language. English is bundled; other locales are
+// lazily imported, so `i18nReady` resolves once the initial locale's catalog has
+// loaded and init has run — the render below awaits it.
+import i18n, { i18nReady } from "./i18n";
 import { installDiagnosticsCapture } from "./lib/diagnostics";
+import { isTauri } from "./lib/is-tauri";
 import { installStaleChunkReload } from "./lib/stale-chunk-reload";
 import { handleOAuthCallbackIfNeeded } from "./lib/arcgis-oauth";
 
 installDiagnosticsCapture();
+// In the desktop build, route geocoding (place search / reverse geocode)
+// through Tauri's native HTTP client so it bypasses WebView CORS: public
+// Nominatim's CDN intermittently omits the CORS header on cached responses,
+// which the WebView rejects as "Search failed. Try again." Lazy + desktop-only
+// so the web/embedded bundles never import the Tauri HTTP plugin.
+if (isTauri()) {
+  void import("./lib/geocoding-fetch")
+    .then(({ installNativeGeocodingFetch }) => installNativeGeocodingFetch())
+    .catch((error: unknown) => {
+      // If the install fails, geocoding stays on the browser fetch (the
+      // CORS-buggy path this fixes), so surface it rather than let it become a
+      // silent unhandled rejection.
+      console.error("[GeoLibre] Failed to install native geocoding fetch", error);
+    });
+  // Likewise route share.geolibre.app (project Share + gallery) through the
+  // native HTTP client: the share server's CORS policy allows the web origin but
+  // not the Tauri WebView origin, so a browser fetch fails as "Could not reach
+  // share.geolibre.app." Lazy + desktop-only so web/embedded never import the
+  // Tauri HTTP plugin.
+  void import("./lib/share-fetch")
+    .then(({ installNativeShareFetch }) => installNativeShareFetch())
+    .catch((error: unknown) => {
+      // On failure the share client stays on the browser fetch (the CORS-blocked
+      // path this fixes); surface it rather than swallow the rejection.
+      console.error("[GeoLibre] Failed to install native share fetch", error);
+    });
+}
 // Recover from chunks orphaned by a web redeploy (stale lazy import → 404). A
 // no-op in the desktop build, whose chunks are bundled locally.
 installStaleChunkReload();
@@ -93,7 +123,13 @@ if (handleOAuthCallbackIfNeeded()) {
   // Fetch both chunks in parallel rather than waterfalling the boundary import
   // after App resolves — a free win, and it matters over the network in the web
   // build where these are separate fetches.
-  void Promise.all([import("./App"), import("./components/common/error-boundaries")])
+  void Promise.all([
+    import("./App"),
+    import("./components/common/error-boundaries"),
+    // Gate the first render on i18next being initialized with the active locale's
+    // (lazily loaded) catalog, so the UI never paints raw translation keys.
+    i18nReady,
+  ])
     .then(([{ default: App }, { AppErrorBoundary }]) => {
       ReactDOM.createRoot(document.getElementById("root")!).render(
         <React.StrictMode>

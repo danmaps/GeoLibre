@@ -45,9 +45,7 @@ export function AddDataMenu({
   onOpenOsmPbfDialog,
 }: AddDataMenuProps) {
   const { t } = useTranslation();
-  const uiProfile = useDesktopSettingsStore(
-    (state) => state.desktopSettings.uiProfile,
-  );
+  const uiProfile = useDesktopSettingsStore((state) => state.desktopSettings.uiProfile);
   // PostgreSQL layers are served through the Martin tile server, a local helper
   // binary with no Android build, so hide the source on mobile.
   // The user agent is stable for the session, so evaluate once.
@@ -60,6 +58,7 @@ export function AddDataMenu({
     raster: { onSelect: addLayer.raster },
     "delimited-text": { onSelect: () => onSetAddDataKind("delimited-text") },
     cad: { onSelect: () => onSetAddDataKind("cad") },
+    gdb: { onSelect: () => onSetAddDataKind("gdb") },
     photos: { onSelect: () => onSetAddDataKind("photos") },
     gpx: { onSelect: () => onSetAddDataKind("gpx") },
     mbtiles: { onSelect: () => onSetAddDataKind("mbtiles") },
@@ -68,6 +67,10 @@ export function AddDataMenu({
     wms: { onSelect: () => onSetAddDataKind("wms") },
     wfs: { onSelect: () => onSetAddDataKind("wfs") },
     wmts: { onSelect: () => onSetAddDataKind("wmts") },
+    "ogc-features": { onSelect: () => onSetAddDataKind("ogc-features") },
+    "ogc-vector-tiles": {
+      onSelect: () => onSetAddDataKind("ogc-vector-tiles"),
+    },
     arcgis: { onSelect: () => onSetAddDataKind("arcgis") },
     georss: { onSelect: () => onSetAddDataKind("georss") },
     stac: { onSelect: addLayer.stac },
@@ -127,11 +130,7 @@ export function AddDataMenu({
               const item = handlers[entry.id];
               if (!item) return null;
               return (
-                <DropdownMenuItem
-                  key={entry.id}
-                  disabled={item.disabled}
-                  onSelect={item.onSelect}
-                >
+                <DropdownMenuItem key={entry.id} disabled={item.disabled} onSelect={item.onSelect}>
                   {t(entry.labelKey)}
                 </DropdownMenuItem>
               );

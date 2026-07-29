@@ -3,6 +3,7 @@
 // user created on the website. Used by the Project > Share action.
 
 import { DEFAULT_PROJECT_NAME } from "@geolibre/core";
+import { getShareFetch } from "./share-fetch";
 
 export type ShareVisibility = "public" | "unlisted" | "private";
 
@@ -54,7 +55,7 @@ export interface ShareUploadOptions {
   /** Override the share host; defaults to the configured/production URL. */
   baseUrl?: string;
   signal?: AbortSignal;
-  /** Injected for testing; defaults to the global fetch. */
+  /** Injected for testing; defaults to the share fetch (see share-fetch.ts). */
   fetchImpl?: typeof fetch;
 }
 
@@ -107,8 +108,7 @@ export function resolveShareBaseUrl(
       const url = new URL(trimmed);
       if (
         url.protocol === "https:" ||
-        (url.protocol === "http:" &&
-          (url.hostname === "localhost" || url.hostname === "127.0.0.1"))
+        (url.protocol === "http:" && (url.hostname === "localhost" || url.hostname === "127.0.0.1"))
       ) {
         return trimmed;
       }
@@ -134,20 +134,18 @@ export async function uploadProjectToShare(
 ): Promise<ShareUploadResult> {
   const token = options.token.trim();
   if (!token) {
-    throw new Error(
-      "Add a share.geolibre.app API token in Settings before sharing.",
-    );
+    throw new Error("Add a share.geolibre.app API token in Settings before sharing.");
   }
 
   const base = (options.baseUrl ?? resolveShareBaseUrl()).replace(/\/+$/, "");
-  const fetchImpl = options.fetchImpl ?? fetch;
+  // Defaults to the share fetch, which the desktop build routes through Tauri's
+  // native HTTP client to bypass WebView CORS (see share-fetch.ts).
+  const fetchImpl = options.fetchImpl ?? getShareFetch();
 
   // Bound the request so a stalled server can't leave the dialog spinning
   // forever; combine it with the caller's abort signal (dialog close).
   const timeout = AbortSignal.timeout(UPLOAD_TIMEOUT_MS);
-  const signal = options.signal
-    ? AbortSignal.any([options.signal, timeout])
-    : timeout;
+  const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
 
   let response: Response;
   try {
@@ -172,9 +170,7 @@ export async function uploadProjectToShare(
         throw new Error("Upload timed out. Please try again.");
       }
     }
-    throw new Error(
-      "Could not reach share.geolibre.app. Check your internet connection.",
-    );
+    throw new Error("Could not reach share.geolibre.app. Check your internet connection.");
   }
 
   if (!response.ok) {
@@ -208,9 +204,7 @@ async function uploadErrorInfo(
   if (response.status === 429) {
     return { message: "Too many uploads. Please wait a while and try again." };
   }
-  const body = (await response.json().catch(() => null)) as
-    | { error?: string }
-    | null;
+  const body = (await response.json().catch(() => null)) as { error?: string } | null;
   // Cap the server-provided string so a misconfigured host or MITM on a
   // non-HTTPS share URL cannot render a wall of text in the dialog. Slice by
   // code point so the cap can't orphan a UTF-16 surrogate pair.

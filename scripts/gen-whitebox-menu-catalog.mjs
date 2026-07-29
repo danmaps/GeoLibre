@@ -42,33 +42,16 @@ const SNAPSHOT_OUT = resolve(
 const GROUPS = [
   ["conversion", "toolbar.item.conversion", (c) => c.startsWith("Conversion")],
   ["hydrology", "toolbar.item.hydrology", (c) => c.startsWith("Hydrology")],
-  ["lidar", "toolbar.item.lidar", (c) => c.startsWith("LiDAR")],
+  // Whitebox catalog tools use "LiDAR"; GeoLibre-authored WASM tools carry the
+  // bare `ToolCategory::Lidar` form "Lidar" (e.g. assign_projection_lidar), so
+  // match both or the geolibre-authored LiDAR tools drop out of the menu.
+  ["lidar", "toolbar.item.lidar", (c) => c.startsWith("LiDAR") || c === "Lidar"],
   ["network", "toolbar.item.network", (c) => c === "Vector - Network Analysis"],
-  [
-    "projection",
-    "toolbar.item.projection",
-    (c) => c.startsWith("Projection"),
-  ],
-  [
-    "raster",
-    "toolbar.item.raster",
-    (c) => c === "Raster" || c.startsWith("Raster -"),
-  ],
-  [
-    "remoteSensing",
-    "toolbar.item.remoteSensing",
-    (c) => c.startsWith("Remote Sensing"),
-  ],
-  [
-    "terrain",
-    "toolbar.item.terrain",
-    (c) => c === "Terrain" || c.startsWith("Terrain -"),
-  ],
-  [
-    "vector",
-    "toolbar.item.vector",
-    (c) => c.startsWith("Vector") && !c.includes("Network"),
-  ],
+  ["projection", "toolbar.item.projection", (c) => c.startsWith("Projection")],
+  ["raster", "toolbar.item.raster", (c) => c === "Raster" || c.startsWith("Raster -")],
+  ["remoteSensing", "toolbar.item.remoteSensing", (c) => c.startsWith("Remote Sensing")],
+  ["terrain", "toolbar.item.terrain", (c) => c === "Terrain" || c.startsWith("Terrain -")],
+  ["vector", "toolbar.item.vector", (c) => c.startsWith("Vector") && !c.includes("Network")],
 ];
 
 const subcatLabel = (cat) =>
@@ -76,25 +59,30 @@ const subcatLabel = (cat) =>
 
 const esc = (s) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 
-// Load the GeoLibre-authored WASM tools from the geolibre-wasm binary's own
-// manifests (they are not in the Whitebox snapshot). Returns [] if the package
-// or wasm is unavailable, so the generator still produces a snapshot-only menu.
-async function loadGeolibreWasmTools() {
+// Load every runnable tool from the geolibre-wasm binary's own manifests.
+// Returns [] if the package or wasm is unavailable, so the generator still
+// produces a snapshot-only menu.
+//
+// Deliberately NOT filtered to `source === "geolibre"`. The WASM also carries
+// Whitebox-sourced tools that the Whitebox Next Gen snapshot does not list
+// (buffer_vector, the variogram/cokriging tools, greater_than_or_equal_to...).
+// Those used to fall through both halves of the merge — absent from the
+// snapshot, and excluded here by the source filter — so they were runnable and
+// listed by the Processing *dialog* while silently missing from the menu.
+async function loadWasmTools() {
   try {
     const { initTools, listManifests } = await import("geolibre-wasm/tools");
     const toolsUrl = import.meta.resolve("geolibre-wasm/tools");
-    const wasmPath = join(
-      dirname(fileURLToPath(toolsUrl)),
-      "geolibre-cli.wasm",
-    );
+    const wasmPath = join(dirname(fileURLToPath(toolsUrl)), "geolibre-cli.wasm");
     await initTools(readFileSync(wasmPath));
     const manifests = await listManifests();
     return manifests
-      .filter((m) => (m.source ?? "").toLowerCase() === "geolibre" && !m.locked)
+      .filter((m) => !m.locked)
       .map((m) => ({
         id: m.id,
         name: m.display_name || m.id,
         category: m.category ?? "",
+        source: (m.source ?? "").toLowerCase(),
       }));
   } catch (err) {
     console.warn(
@@ -125,9 +113,7 @@ async function main() {
       Array.isArray(t.params)
         ? {
             ...t,
-            params: t.params.filter(
-              (p) => !String(p?.name ?? "").startsWith("*"),
-            ),
+            params: t.params.filter((p) => !String(p?.name ?? "").startsWith("*")),
           }
         : t,
     ),
@@ -139,8 +125,15 @@ async function main() {
     )} KB).`,
   );
 
-  const geolibre = await loadGeolibreWasmTools();
+  const wasmTools = await loadWasmTools();
+  const geolibre = wasmTools.filter((t) => t.source === "geolibre");
   const geolibreIds = new Set(geolibre.map((t) => t.id));
+  // Whitebox-sourced WASM tools the snapshot has never heard of. They belong in
+  // the menu under their own category's regular subheading (not the "GeoLibre"
+  // one — they are not GeoLibre-authored), and they are the reason the menu
+  // could list fewer tools than the WASM actually ships.
+  const snapshotIds = new Set(tools.map((t) => t.id));
+  const wasmOnly = wasmTools.filter((t) => t.source !== "geolibre" && !snapshotIds.has(t.id));
 
   // Only free tools: locked/"pro"-tier Whitebox tools cannot run, so omit them
   // from the menu entirely (the dialog hides them too). Also drop any snapshot
@@ -153,11 +146,14 @@ async function main() {
   let total = 0;
   for (const [key, labelKey, pred] of GROUPS) {
     const sel = free.filter((t) => pred(t.category ?? ""));
+    // WASM-only Whitebox tools join the snapshot tools, grouped the same way
+    // (a bare category like "Vector" lands under "General").
+    const wasmHere = wasmOnly.filter((t) => pred(t.category));
     const bySub = new Map();
-    for (const t of sel) {
+    for (const t of [...sel, ...wasmHere]) {
       const label = subcatLabel(t.category ?? "");
       if (!bySub.has(label)) bySub.set(label, []);
-      bySub.get(label).push({ id: t.id, name: t.display_name || t.id });
+      bySub.get(label).push({ id: t.id, name: t.display_name || t.name || t.id });
     }
     // GeoLibre-authored tools whose bare category falls in this group go under
     // the dedicated GeoLibre heading.
@@ -168,8 +164,7 @@ async function main() {
     }
     // GeoLibre first, then "General" (bare category), then named subcategories
     // alphabetically.
-    const rank = (s) =>
-      s === GEOLIBRE_SUBCATEGORY ? 0 : s === "General" ? 1 : 2;
+    const rank = (s) => (s === GEOLIBRE_SUBCATEGORY ? 0 : s === "General" ? 1 : 2);
     const subLabels = [...bySub.keys()].sort((a, b) => {
       const ra = rank(a);
       const rb = rank(b);
@@ -181,14 +176,12 @@ async function main() {
         label,
         tools: bySub
           .get(label)
-          .sort((a, b) =>
-            a.name.toLowerCase().localeCompare(b.name.toLowerCase()),
-          ),
+          .sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase())),
       }))
       .filter((s) => s.tools.length > 0);
     if (subcategories.length === 0) continue;
     cats.push({ key, labelKey, subcategories });
-    total += sel.length + glHere.length;
+    total += sel.length + wasmHere.length + glHere.length;
   }
 
   const L = [];
@@ -196,7 +189,7 @@ async function main() {
   L.push("// Whitebox tools come from the Whitebox Next Gen catalog snapshot");
   L.push("// (opengeos/Whitebox-Next-Gen-ArcGIS WNG/data/catalog_snapshot.json);");
   L.push("// GeoLibre-authored WASM tools come from the geolibre-wasm manifests and");
-  L.push("// are grouped under a \"GeoLibre\" subheading. Tool ids match the");
+  L.push('// are grouped under a "GeoLibre" subheading. Tool ids match the');
   L.push("// runtime/sidecar/WASM catalog used by ProcessingDialog.");
   L.push("// Regenerate with scripts/gen-whitebox-menu-catalog.mjs; do not hand-edit.");
   L.push("// Tool/subcategory names are catalog data and are intentionally not");

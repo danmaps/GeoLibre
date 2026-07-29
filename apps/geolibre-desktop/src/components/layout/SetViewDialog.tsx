@@ -15,7 +15,7 @@ import {
 } from "@geolibre/ui";
 import type { MapController } from "@geolibre/map";
 import type { ParseKeys } from "i18next";
-import { ClipboardPaste, Info } from "lucide-react";
+import { ChevronDown, ClipboardPaste, Info } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { parseLatLon } from "../../lib/coordinates";
@@ -92,11 +92,7 @@ function round(value: number, digits: number): string {
  * State readout. Prefilled with the live camera each time it opens; submitting
  * animates the map there via the controller's `flyTo`.
  */
-export function SetViewDialog({
-  open,
-  onOpenChange,
-  mapControllerRef,
-}: SetViewDialogProps) {
+export function SetViewDialog({ open, onOpenChange, mapControllerRef }: SetViewDialogProps) {
   const { t } = useTranslation();
   const [fields, setFields] = useState<ViewFields>(EMPTY_FIELDS);
   const [dms, setDms] = useState<DmsFields>(EMPTY_DMS);
@@ -111,14 +107,12 @@ export function SetViewDialog({
   // Outcome of the most recent Process: "idle" (untouched), "ok" (fields
   // filled), or "error" (string could not be parsed). Reset to "idle" on any
   // edit so a stale confirmation/warning never lingers.
-  const [pasteStatus, setPasteStatus] = useState<"idle" | "ok" | "error">(
-    "idle",
-  );
-  // The smart-paste field is hidden until the user reveals it from the paste
-  // icon next to the heading (hover, click, or keyboard focus), so the dialog
-  // leads with the precise fields and the paste shortcut adds no clutter by
-  // default (#828). Once open it stays open so it never covers or shifts the
-  // controls below mid-interaction; it resets closed each time the dialog opens.
+  const [pasteStatus, setPasteStatus] = useState<"idle" | "ok" | "error">("idle");
+  // The smart-paste field lives behind a clearly labeled, always-visible toggle
+  // button under the heading: the dialog still leads with the precise fields and
+  // the paste shortcut adds no clutter by default (#828), while the button gives
+  // the shortcut an obvious affordance instead of hiding it behind a hover-only
+  // icon (#1033). Collapsed each time the dialog opens; clicking toggles it.
   const [pasteOpen, setPasteOpen] = useState(false);
 
   // Fill all three center representations from one decimal lon/lat, so the value
@@ -179,31 +173,28 @@ export function SetViewDialog({
     setFields((current) => ({ ...current, [key]: value }));
   };
 
-  const updateDms =
-    (axis: keyof DmsFields, part: keyof DmsAxis) => (value: string) => {
-      setPasteStatus("idle");
-      setDms((current) => ({
-        ...current,
-        [axis]: { ...current[axis], [part]: value },
-      }));
-    };
+  const updateDms = (axis: keyof DmsFields, part: keyof DmsAxis) => (value: string) => {
+    setPasteStatus("idle");
+    setDms((current) => ({
+      ...current,
+      [axis]: { ...current[axis], [part]: value },
+    }));
+  };
 
-  const updateDdm =
-    (axis: keyof DdmFields, part: keyof DdmAxis) => (value: string) => {
-      setPasteStatus("idle");
-      setDdm((current) => ({
-        ...current,
-        [axis]: { ...current[axis], [part]: value },
-      }));
-    };
+  const updateDdm = (axis: keyof DdmFields, part: keyof DdmAxis) => (value: string) => {
+    setPasteStatus("idle");
+    setDdm((current) => ({
+      ...current,
+      [axis]: { ...current[axis], [part]: value },
+    }));
+  };
 
   // The center as decimal lon/lat read from whichever format is active. A blank
   // field becomes NaN (not 0, since Number("") is 0), and the DMS/DDM helpers
   // return NaN for out-of-range parts, both caught by the finite check on submit.
   const readCenterDecimal = (): { lon: number; lat: number } => {
     if (format === "dd") {
-      const toNum = (value: string) =>
-        value.trim() === "" ? Number.NaN : Number(value);
+      const toNum = (value: string) => (value.trim() === "" ? Number.NaN : Number(value));
       return { lon: toNum(fields.longitude), lat: toNum(fields.latitude) };
     }
     if (format === "dms") {
@@ -355,12 +346,7 @@ export function SetViewDialog({
     hemispheres: readonly [string, string],
   ) => {
     const parts = dms[axis];
-    const part = (
-      partKey: keyof DmsAxis,
-      partLabel: ParseKeys,
-      max: number,
-      symbol: string,
-    ) => (
+    const part = (partKey: keyof DmsAxis, partLabel: ParseKeys, max: number, symbol: string) => (
       <Input
         id={`set-view-${axis}-${partKey}`}
         type="number"
@@ -409,12 +395,7 @@ export function SetViewDialog({
     hemispheres: readonly [string, string],
   ) => {
     const parts = ddm[axis];
-    const part = (
-      partKey: "deg" | "min",
-      partLabel: ParseKeys,
-      max: number,
-      symbol: string,
-    ) => (
+    const part = (partKey: "deg" | "min", partLabel: ParseKeys, max: number, symbol: string) => (
       <Input
         id={`set-view-ddm-${axis}-${partKey}`}
         type="number"
@@ -460,9 +441,7 @@ export function SetViewDialog({
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>{t("toolbar.setView.title")}</DialogTitle>
-          <DialogDescription>
-            {t("toolbar.setView.description")}
-          </DialogDescription>
+          <DialogDescription>{t("toolbar.setView.description")}</DialogDescription>
         </DialogHeader>
 
         {/*
@@ -478,34 +457,34 @@ export function SetViewDialog({
         <form className="space-y-5" noValidate onSubmit={handleSubmit}>
           {/* Segment A: coordinates, with a DD/DMS/DDM manual-entry toggle. */}
           <section className="space-y-3">
-            {/* Smart paste is tucked behind the paste icon next to the heading:
-                the field stays hidden so the dialog leads with the precise
-                fields. Hovering, clicking, or keyboard-focusing the icon reveals
-                it inline on demand (#828). Revealing inline (rather than as a
-                floating overlay) means the panel never covers or intercepts the
-                controls below it. */}
-            <div className="flex items-center gap-1.5">
-              <SectionHeading>
-                {t("toolbar.setView.sectionCoordinates")}
-              </SectionHeading>
-              <button
-                type="button"
-                aria-label={t("toolbar.setView.smartPaste")}
-                aria-expanded={pasteOpen}
-                aria-controls="set-view-paste-panel"
-                // Hover, click, and keyboard activation all simply reveal the
-                // panel; it then stays open (until the dialog reopens) rather
-                // than toggling, so a hover-then-click never closes it.
-                onClick={() => setPasteOpen(true)}
-                onMouseEnter={() => setPasteOpen(true)}
-                className={cn(
-                  "inline-flex cursor-pointer rounded hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                  pasteOpen ? "text-foreground" : "text-muted-foreground",
-                )}
-              >
-                <ClipboardPaste className="h-3.5 w-3.5" aria-hidden="true" />
-              </button>
-            </div>
+            <SectionHeading>{t("toolbar.setView.sectionCoordinates")}</SectionHeading>
+            {/* Smart paste sits behind a clearly labeled, always-visible toggle
+                button: the panel stays collapsed so the dialog leads with the
+                precise fields (#828), but the button gives the shortcut an
+                obvious affordance rather than hiding it behind a hover-only icon
+                (#1033). Clicking toggles the panel, which expands inline (not as
+                a floating overlay) so it never covers the controls below it. */}
+            <Button
+              type="button"
+              variant="outline"
+              aria-expanded={pasteOpen}
+              // Only reference the panel while it is actually mounted: it is
+              // conditionally rendered below, so pointing aria-controls at a
+              // missing id when collapsed would be a dangling reference.
+              aria-controls={pasteOpen ? "set-view-paste-panel" : undefined}
+              onClick={() => setPasteOpen((isOpen) => !isOpen)}
+              className={cn(
+                "w-full justify-start",
+                pasteOpen ? "text-foreground" : "text-muted-foreground",
+              )}
+            >
+              <ClipboardPaste className="h-4 w-4 shrink-0" aria-hidden="true" />
+              <span className="flex-1 text-start">{t("toolbar.setView.smartPaste")}</span>
+              <ChevronDown
+                className={cn("h-4 w-4 shrink-0 transition-transform", pasteOpen && "rotate-180")}
+                aria-hidden="true"
+              />
+            </Button>
             {pasteOpen && (
               <div
                 id="set-view-paste-panel"
@@ -513,7 +492,7 @@ export function SetViewDialog({
               >
                 <div className="flex items-center gap-1.5">
                   <Label htmlFor="set-view-paste">
-                    {t("toolbar.setView.smartPaste")}
+                    {t("toolbar.setView.smartPasteInputLabel")}
                   </Label>
                   <InfoTooltip
                     title={t("toolbar.setView.smartPasteInfoLabel")}
@@ -542,9 +521,7 @@ export function SetViewDialog({
                   <p
                     className={cn(
                       "text-xs",
-                      pasteFailed
-                        ? "text-destructive"
-                        : "text-muted-foreground",
+                      pasteFailed ? "text-destructive" : "text-muted-foreground",
                     )}
                     aria-live="polite"
                   >
@@ -568,10 +545,7 @@ export function SetViewDialog({
               </div>
             )}
             <div className="flex items-center gap-1.5">
-              <span
-                id="set-view-format-label"
-                className="text-sm font-medium leading-none"
-              >
+              <span id="set-view-format-label" className="text-sm font-medium leading-none">
                 {t("toolbar.setView.format")}
               </span>
               <InfoTooltip
@@ -651,26 +625,18 @@ export function SetViewDialog({
 
           {/* Segment C: pitch and bearing paired, the camera rotation controls. */}
           <section className="space-y-3">
-            <SectionHeading>
-              {t("toolbar.setView.sectionOrientation")}
-            </SectionHeading>
+            <SectionHeading>{t("toolbar.setView.sectionOrientation")}</SectionHeading>
             <div className="grid grid-cols-2 gap-3">
               {field("pitch", "toolbar.setView.pitch", "1", { min: 0 })}
               {field("bearing", "toolbar.setView.bearing", "1")}
             </div>
-            <p className="text-xs text-muted-foreground">
-              {t("toolbar.setView.orientationHint")}
-            </p>
+            <p className="text-xs text-muted-foreground">{t("toolbar.setView.orientationHint")}</p>
           </section>
 
           {error && <p className="text-sm text-destructive">{error}</p>}
 
           <div className="flex justify-end gap-2">
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => onOpenChange(false)}
-            >
+            <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
               {t("common.cancel")}
             </Button>
             <Button type="submit">{t("toolbar.setView.go")}</Button>
@@ -708,9 +674,7 @@ function InfoTooltip({ title, label }: { title: string; label: string }) {
           <Info className="h-3.5 w-3.5" aria-hidden="true" />
         </button>
       </TooltipTrigger>
-      <TooltipContent className="max-w-xs whitespace-pre-line">
-        {label}
-      </TooltipContent>
+      <TooltipContent className="max-w-xs whitespace-pre-line">{label}</TooltipContent>
     </Tooltip>
   );
 }

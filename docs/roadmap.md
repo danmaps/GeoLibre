@@ -255,7 +255,7 @@
 - [x] On-canvas collaboration session-status badge and roster (a pulsing live dot, connected-participant count, and an expandable client list that announces joins and leaves), plus a clear "Go to map and collaborate" button so the host has a non-destructive way back to the map
 - [x] Welcome wizard is suppressed for embeds: project deep links (`?url=`) skip onboarding automatically, and a new `?welcome=0` parameter lets any embed opt out
 
-## v1.8: Camera tours, live story maps, standalone HTML export, and map annotations (current)
+## v1.8: Camera tours, live story maps, standalone HTML export, and map annotations
 
 - [x] Record an animated camera tour to video straight from the Controls menu, with a clearer keyframe layout, per-keyframe recapture, a two-step save, and the ability to save and reload the entire tour setup as a JSON file
 - [x] Story Map plugin can now compose its chapters directly on the live map instead of a separate editor, and generates a printable PDF handout of the finished story
@@ -278,6 +278,120 @@
 - [x] Raster paint controls gain a greyscale toggle, a reset action, and numeric inputs, plus info icons explaining layer zoom-visibility controls
 - [x] Inline numeric opacity input in the layer control, with a fixed-name notice on the Background layer
 - [x] Windows portable zip build, so the desktop app can run without installation
+
+## v1.9: CAD import, smarter service discovery, and a docked SQL workspace
+
+- [x] Add CAD drawings (DXF/DWG) as a layer, with a layer picker for choosing which drawing layers to load and a CRS selector for placing the geometry correctly on the map
+- [x] WMS and WFS panels now read the service's GetCapabilities document to list the available layers and feature types, so you pick from a populated dropdown instead of typing layer names by hand
+- [x] Generic Vector to Vector conversion tool that converts between any supported vector formats by file extension, alongside the existing targeted converters
+- [x] SQL Workspace docks as a resizable panel beside the map (rather than a floating window) and gains editor autocomplete for tables, columns, and SQL keywords
+- [x] Camera tours gain per-keyframe hold and transition duration controls for finer pacing, plus the ability to save and reload a named tour setup
+- [x] Story Map plugin adds a hide-itinerary toggle, subtitle and byline fields on the printable handout, and dedicated start and closing slides for a more polished presentation
+- [x] Transparent fill and outline option in the color picker, so features can be styled with no fill or no stroke without leaving the picker
+- [x] Plugins can now use the maplibre-gl-raster stack and the projection control, expanding what external plugins can render and configure (see [Plugin API](plugin-api.md))
+- [x] Legend populates automatically from a paletted raster's embedded color table, matching the map colors without manual entry
+- [x] Website and GitHub links added to the Help menu for quick access to the project home and source
+
+## v1.10: I3S scene layers, OGC API vector tiles, and local NetCDF/HDF loading
+
+- [x] Add ArcGIS I3S scene layers (Integrated Mesh and 3D Object layers) as a data source, streamed and rendered in 3D on the shared deck.gl instance through a Tile3DLayer with the I3SLoader
+- [x] Add Data now supports OGC API - Tiles vector tile services as a remote source, so standards-based vector tile endpoints can be added alongside XYZ and ArcGIS vector tiles
+- [x] Load local HDF5 and NetCDF-4 files directly from disk, extending the NetCDF/HDF workflow beyond Cloud-Optimized references to files already on your machine
+- [x] GeoEditor plugin can pull the vector features currently visible in the map view into the editor, so you can start editing what you are looking at without re-importing the source data
+
+## v2.0: A 3D globe, planetary mapping, symbology interchange, and editable source layers
+
+- [x] Switch any map pane to a **CesiumJS 3D globe** view that stays camera-synced with the 2D maps and mirrors the layer stack, adding a true photorealistic globe alongside the flat workspace (requires a Cesium Ion token)
+- [x] Planetary mapping with the OpenPlanetaryMap basemap set (Mars and the Moon) plus USGS Astrogeology basemaps for Mercury, Venus, the Galilean moons, Titan, Pluto, and Charon reprojected to Web Mercator, a per-project ellipsoid whose radius drives distance/area/scale, and a planet switcher in the Layers panel, plus an expanded EOX Maps catalog and dark-mode-aware basemap theming
+- [x] Import and export vector layer symbology as OGC SLD, QGIS QML, and Mapbox GL style JSON, so styles round-trip between GeoLibre, QGIS, and the Mapbox/MapLibre ecosystem
+- [x] Edit vector layers and write the changes back to their source, covering GeoPackage and GeoJSON files as well as PostGIS database tables
+- [x] New Weather menu with live cloud and precipitation radar overlays (RainViewer), a Clouds overlay in the Controls menu, and a Google Earth-style sun position simulation for realistic lighting
+- [x] Richer KML/KMZ support: render GroundOverlay images as map overlays (animated through the Time Slider when time-tagged) and display embedded Collada (.dae) 3D models
+- [x] Render vector layers that carry Z coordinates in true 3D rather than flattening them onto the ground plane
+- [x] Extract COG, WMS, and XYZ bounding-box subsets directly in the browser, and build a normalized-difference index from any HTTP COG
+- [x] New built-in plugins: a Mapillary coverage and street-level image viewer, a Historical Imagery panel, and an Elevation Profile tool, plus a UTM easting/northing grid mode for the Gridlines overlay
+- [x] Field Calculator can compute geometry length and area, and the attribute table supports Ctrl- and Shift-click multi-row selection
+- [x] Google Earth-style camera-reset keyboard shortcuts, View in Google Maps and View in Google Earth actions, and a double-click terrain control for setting vertical exaggeration
+- [x] Import delimited text (CSV) without coordinates as a standalone attribute table
+- [x] All 13 locale catalogs completed, with the remaining hardcoded panel and dialog strings migrated to the translation system
+- [x] The AI assistant can read provider API keys from OS environment variables, and the desktop diagnostics network log now captures native Tauri HTTP requests and classifies failed `fetch()` errors
+
+## v2.1: A data-source Browser panel, route animation, in-browser object detection, and map recording
+
+- [x] A QGIS-style **Browser panel** (Data Source Manager) for exploring and adding data from one place: browse map Services and Recent items, connect to PostGIS databases and browse their schemas and tables, drill into local files, save and reopen Favorites, add a New connection per service kind, and navigate the whole tree from the keyboard
+- [x] **Route animation**: animate a marker along any line layer, follow the track in 3D with camera controls, and export the whole animation as an MP4 video
+- [x] **In-browser object detection** that runs ONNX/YOLO models directly in the webview, no server or Python required
+- [x] Record the map canvas (or a drawn bounding box) to a video file straight from the browser
+- [x] A true native-resolution viewer for geotagged photos, so full-detail imagery stays crisp on the map
+- [x] Wikipedia knowledge cards: click a place on the map to pull up its Wikipedia summary and info card
+- [x] USGS planetary basemaps for nine more celestial bodies, extending the planetary mapping catalog
+- [x] New OpenAerialMap plugin for searching open aerial imagery, plus a GEBCO ocean-bathymetry WMS sample with proper attribution
+- [x] New Source Cooperative plugin for browsing [source.coop](https://source.coop) open data: search the catalog, walk a product's files, and add GeoParquet, PMTiles, COG, GeoJSON, and FlatGeobuf straight to the map (streamed from the source) or download them
+- [x] The Whitebox toolbox is now a floating panel, and Processing subset tools can populate their bounding box from the current map view
+- [x] Scale bar switches between metric, imperial, and nautical units
+- [x] Bundled plugin drop-ins can set `activeByDefault` in their manifest, deployments can opt out of the welcome dialog, and the app now defaults to the Advanced interface and skips the welcome dialog on first run
+- [x] Optional HTTP Basic Auth for the web (Docker) container
+
+## v2.2: A styling overhaul, expression-driven fields and labels, print atlas, and browser-native conversions
+
+- [x] A **rule-based renderer** with per-rule symbol properties, scale-dependent visibility, nested rules, and per-rule toggles, so a single layer can carry a full hierarchy of styling rules and hide anything that matches no rule when the else rule is off
+- [x] A **Style Manager** that saves reusable symbol, color-ramp, and label presets to a personal library and applies them across projects
+- [x] A symbology pack covering inverted-polygon masks, arrow and marker lines, and geometry generators, plus data-driven proportional sizing for marker icons
+- [x] **Diagram symbology**: draw pie, donut, and bar charts on features straight from their attributes
+- [x] A **data-defined labeling engine** with expression-driven label properties, placement priority, and full control over how labels are drawn
+- [x] A shared **Expression Builder** — a function reference, searchable field list, live preview, and reusable variables — wired into filters, labels, styling, and selection
+- [x] **Virtual fields**: expression-backed computed columns that update as the underlying data changes, plus a Raster Attribute Table for single-band categorical rasters
+- [x] An **attribute form designer** with edit widgets, validation constraints, and conditional field visibility for structured data entry
+- [x] **Persistent attribute joins** configured in layer properties, so a table can enrich a layer's features and stick across sessions
+- [x] **Select by Expression** and **Select by Location**, plus live query layers backed by DuckDB SQL that re-run as the data updates
+- [x] **Atlas / map series** in the Print Layout — generate one page per feature, or a uniform series of pages along a line such as a river or trail — and drop attribute-table and chart blocks onto the page
+- [x] Browser-native format conversion for COG, FlatGeobuf, Shapefile, and GeoPackage, and Vector to PMTiles running on a background worker, no Python sidecar required
+- [x] **Live GPS tracking**: a moving position marker, a recorded track log, and digitizing new features straight from the GPS feed
+- [x] Data quality tools to check validity, fix geometries, and check topology rules, catching and repairing bad geometries before they cause trouble
+- [x] A **Processing History** panel that lists every tool run, re-runs it with one click, and copies the equivalent Python code
+- [x] Timelapse mode now animates EOX Sentinel-2 cloudless annual basemaps and NASA GIBS providers (Landsat/WELD and MODIS land cover) with a provider picker and legend
+- [x] Desktop gains OS trust store and mTLS client-certificate support for native HTTP, automatic reload when local files change on disk, and Esri File Geodatabase (`.gdb`) layer support
+- [x] New Natural Earth and Source Cooperative data browsers under Plugins > Web Services, including opening or streaming large GeoParquet from Source Cooperative
+- [x] Terrain-aware 3D measurements in the Measure tool, optional title/source captions and on-map panel capture (HTML, legend, colorbar) in video recordings, and a new Georgian locale alongside full Arabic right-to-left support
+
+## v2.3: An on-map Legend panel, iOS and Google Play, the GeoLens catalog, and space-time hot spots
+
+- [x] An auto-generated **Legend panel** on the map that derives itself from the visible layers' symbology — per-class rows for graduated, categorized, rule-based, and expression styling, gradient bars for heatmaps and continuous raster colormaps, proportional-symbol size ramps, diagram fields, and land-cover labels read from a Raster Attribute Table — with an edit mode for renaming, hiding, and reordering entries, adding a section from a color dictionary, choosing a corner, collapsing sections, resizing the panel, and exporting the rendered legend as JSON, all saved with the project and shared with the Print Layout legend
+- [x] **Symbology swatches in the Layers panel**: every row carries a dot, line, square, or image glyph colored from the layer's own styling, dimmed when the layer is hidden, so a tall layer stack reads at a glance
+- [x] A new **GeoLens catalog browser** plugin for connecting to a self-hosted [GeoLens](https://github.com/geolens-io/geolens) server, searching its catalog, and adding datasets as signed vector tiles, OGC API Features GeoJSON, or server-rendered raster tiles, with automatic tile-token refresh and a Metadata link back to each dataset's page
+- [x] **iOS support**, scaffolded end to end — Tauri iOS configuration, location permissions, a signing and TestFlight CI workflow, and a publishing guide. See [iOS](ios.md)
+- [x] The **Android build is Google Play-ready**: a permanent `org.geolibre.app` package id, API level 36, 16 KB page-size alignment verified in CI, and a signed universal App Bundle published alongside the per-architecture sideload APKs. See [Android](android.md)
+- [x] **Emerging Hot Spot Analysis**: aggregate timestamped points into a space-time cube, run Getis-Ord Gi\* per time slice, and classify every cell as a new, intensifying, persistent, diminishing, sporadic, oscillating, or historical hot or cold spot, entirely in the browser
+- [x] The Time Slider animates **mosaic sources** — a MosaicJSON or STAC collection of many COGs per date — rendered as a full spatial mosaic through either the GPU or the WASM engine, with the WASM engine working in globe as well as mercator projection
+- [x] **Copy and paste layer styles** between layers from the layer menu, so a set of vectors or rasters can be given one consistent look without restyling each in turn
+- [x] **Multiple named AI profiles**: define several provider, model, and credential combinations, mark one as the default, and switch between them from the assistant panel
+- [x] **Deep-link any Whitebox tool** with a `?tool=` URL parameter that opens the Processing dialog preselected and pre-fills the tool's form from the remaining query parameters, plus a Copy link button that builds a shareable link from the settings you changed
+- [x] Add Data gains a source **CRS field for delimited text**, so CSVs with projected easting and northing columns land in the right place, and a **layer picker for multi-layer GeoPackages**, so a container full of feature tables adds only what you asked for
+- [x] The layer metadata dialog reports a raster's real georeferencing read from the GeoTIFF header — CRS and EPSG code, pixel size and extent in CRS units, data type, nodata, compression, tiling, and overviews — in a resizable dialog
+- [x] Type a coordinate into the place-search box to fly straight to it, in decimal degrees, DMS, or DDM, with no geocoder round-trip
+- [x] A new Random extract vector tool, the active layer now persists with the project, turning on the Terrain control enables 3D relief immediately, and a Logos submenu adds Maptoolkit branding alongside the MapLibre logo
+
+## v2.4: STAC and Earthdata catalogs, a free-flight camera, a timeline for tiles and data cubes, and a live embed API (current)
+
+- [x] A new **STAC catalogs browser** plugin that discovers public SpatioTemporal Asset Catalogs from STAC Index, connects to both static catalogs and STAC APIs, searches a collection's items, and adds any visualizable asset — COGs, GeoJSON, and the rest — straight to the map, so working with STAC no longer means leaving the app to hand-copy asset URLs
+- [x] A new **Earthdata GIS browser** under Plugins > Web Services that searches NASA's EOSDIS ArcGIS portal and renders its imagery, map, and feature services, and its published web maps, as first-class layers, with the mosaic pixel-size limits that used to return blank tiles handled for you
+- [x] A new **Hugging Face** panel that browses the Hub: search datasets or name an account, walk a repo's folders, and add its vector and raster files to the map through the readers that already handle each format — and go the other way, creating a dataset repo and uploading layers to it from inside GeoLibre
+- [x] A **flight simulator**: a continuous, interactive free-flight camera you steer over terrain and 3D layers with the keyboard, instead of declaring a destination and watching a scripted `flyTo`
+- [x] The **Time Slider now animates tiled data**: vector tiles, PMTiles, and MBTiles can be bound to the timeline and animated over their full extent, with the timestamp field detected from a live tile sample rather than requiring a local copy of the data
+- [x] The Time Slider also drives a layer's **own internal time dimension** through a generic temporal adapter, so a data cube such as a Zarr store joins the shared timeline instead of carrying its own bespoke time control, and the binding is saved with the project
+- [x] **Zarr gets a real Add Data path**: an Add Zarr Layer dialog for remote stores or a folder on disk, variable and dimension pickers that offer the store's actual coordinate values rather than raw indices, and a Selector field that now applies to a layer already on the map
+- [x] **OGC API - Features** collections can be added as vector layers, the JSON-native successor to WFS, from whatever URL you have in hand — a landing page, `/collections`, or a full items URL
+- [x] A versioned **`postMessage` API for host pages** that frame GeoLibre: load a project, move the camera, highlight features, and open a processing tool at runtime, with `ready`, `projectLoaded`, `selectionChanged`, `viewChanged`, `toolCompleted`, and `serverFileWritten` events coming back out. Off unless the deployment names its trusted origins. See [Embedding & Sharing](user-guide/embedding.md#talking-to-the-map-at-runtime)
+- [x] **Jupyter clients outside the app can drive the map**: attaching VS Code's Jupyter extension, `jupyter console`, or nbclient to the desktop app's Jupyter server now makes `fly_to`, `add_geojson`, and the rest work, because the transport follows the kernel's server rather than how the notebook happens to be displayed
+- [x] A new **H3 hexagonal grid plugin** that renders the H3 grid over the current view at a chosen resolution, identifies a cell to inspect its index, parent, children, neighbors, and center, and exports the grid or the selection as GeoJSON or CSV — plus typing an **H3 cell index** into the place-search box, as a hexadecimal string or a 64-bit integer, to frame and outline that cell
+- [x] **Object detection on geotagged photos**: run the in-browser ONNX/YOLO models over an imported photo layer, not just map imagery
+- [x] The AI assistant gains a **model picker in the panel itself**, refreshed model lists for every provider, credentials that survive a provider change, and arrow-key recall of previous prompts
+- [x] **Indicator (KPI) tiles in the Dashboard panel**: a big-number widget with count, sum, mean, min, max, or median aggregation and custom prefix and suffix, alongside the existing chart widgets
+- [x] **Editing GeoLens datasets in place**: a dataset added as GeoJSON can be redrawn with the GeoEditor or retyped in the attribute table, and the plugin's Edits section shows what changed and writes it back to the GeoLens dataset — added, moved, and deleted features become per-feature `POST`/`PUT`/`PATCH`/`DELETE` calls, with the row ids GeoLens assigns stamped back onto the layer. Private GeoLens rasters also render now, with the API key attached to exactly their tile URLs and nothing else
+- [x] Plugins can call `addZarrLayer` to use the Zarr renderer GeoLibre already ships instead of bundling their own, keep their own paint properties on custom layers so the Style panel's sliders actually do something, and expose layer groups of their own
+- [x] GeoLibre is on **[Google Play](https://play.google.com/store/apps/details?id=org.geolibre.app)**, so Android users can install the signed, auto-updating build in one tap instead of sideloading an APK (see [Downloads](downloads.md#android-installation))
+- [x] Linux **AppImage releases now carry update information and a `.zsync`**, so AppImageUpdate, AppImageLauncher, AppManager, and AM can update the app and transfer only the blocks that changed instead of the whole download
+- [x] All 15 non-English locales are back at 100% coverage, Georgian included
 
 ## Plugin marketplace and registry (design)
 

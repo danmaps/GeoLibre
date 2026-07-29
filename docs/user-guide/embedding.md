@@ -20,22 +20,44 @@ A chrome-free `maponly` embed shows only the map, as in this shared 3D Tiles pro
 
 ## URL parameters
 
-| Parameter | Example | Description |
-| --- | --- | --- |
-| `url` | `url=https://share.geolibre.app/you/project.geolibre.json` | Loads a `.geolibre.json` project from a public URL. |
-| `layout` | `layout=compact` | Compact embed layout: icon-only toolbar buttons and hidden project metadata. `embed` and `iframe` are aliases. |
-| `toolbar` | `toolbar=icons` | Icon-only toolbar buttons without the full compact layout. `icon` and `icon-only` are aliases. |
-| `panels` | `panels=none` | Hides the Layers, Style, and Attribute table panels. `hidden`, `hide`, and `off` are aliases. |
-| `hidePanels` | `hidePanels=true` | Alternative way to hide those panels. |
-| `maponly` | `maponly` | Hides all chrome (toolbar, panels, and status bar), leaving only the map. The bare flag or `true`, `1`, `yes`, `on` enable it. |
-| `welcome` | `welcome=0` | Hides the first-launch welcome wizard. Accepts `0`, `false`, `off`, or `no`. A `url=` deep link already suppresses it automatically. |
-| `theme` | `theme=dark` | Sets the initial color theme, overriding the OS preference. Accepts `dark` or `light`; the in-app toggle still works afterward. |
+| Parameter    | Example                                                    | Description                                                                                                                           |
+| ------------ | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `url`        | `url=https://share.geolibre.app/you/project.geolibre.json` | Loads a `.geolibre.json` project from a public URL.                                                                                   |
+| `layout`     | `layout=compact`                                           | Compact embed layout: icon-only toolbar buttons and hidden project metadata. `embed` and `iframe` are aliases.                        |
+| `toolbar`    | `toolbar=icons`                                            | Icon-only toolbar buttons without the full compact layout. `icon` and `icon-only` are aliases.                                        |
+| `panels`     | `panels=none`                                              | Hides the Layers, Style, and Attribute table panels. `hidden`, `hide`, and `off` are aliases.                                         |
+| `hidePanels` | `hidePanels=true`                                          | Alternative way to hide those panels.                                                                                                 |
+| `maponly`    | `maponly`                                                  | Hides all chrome (toolbar, panels, and status bar), leaving only the map. The bare flag or `true`, `1`, `yes`, `on` enable it.        |
+| `welcome`    | `welcome=0`                                                | Hides the first-launch welcome wizard. Accepts `0`, `false`, `off`, or `no`. A `url=` deep link already suppresses it automatically.  |
+| `theme`      | `theme=dark`                                               | Sets the initial color theme, overriding the OS preference. Accepts `dark` or `light`; the in-app toggle still works afterward.       |
+| `tool`       | `tool=adaptive_filter`                                     | Opens the Processing (Whitebox toolbox) dialog on a specific tool by its id. Unknown ids open the dialog without preselecting a tool. |
 
 Parameters combine. For a narrow, chrome-free, dark embed of a shared project:
 
 ```text
 https://web.geolibre.app/?url=https://share.geolibre.app/you/project.geolibre.json&maponly&theme=dark
 ```
+
+### Deep-linking a Processing tool
+
+`tool=<id>` opens the Processing (Whitebox toolbox) dialog preselected to a tool.
+Any **additional** query parameters pre-fill that tool's form, using the tool's
+own parameter names, so a link can arrive ready to run:
+
+```text
+https://web.geolibre.app/?tool=extract_cog_subset&url=https%3A%2F%2Fdata.source.coop%2Fgiswqs%2Fopengeos%2Fdem.tif&bbox_crs=4326
+```
+
+When `tool=` is present the app is in **tool mode**: `url` names a tool input
+(here, the COG to subset) rather than a project to load, so the project loader
+stands down. App/embed parameters above (`theme`, `layout`, `panels`, `maponly`,
+`locale`, …) keep their own meaning and are never passed to the tool.
+Preselection and parameter prefilling apply only to an id that matches the
+Processing menu: an id not in the menu still opens the dialog, but without
+preselecting a tool or applying any parameters. A known id the current engine
+doesn't expose (WASM in the browser, the Python sidecar on desktop) likewise
+isn't preselected. Tool ids match the Processing menu — the same ids used across
+the [Whitebox toolbox](processing.md).
 
 ## Embedding in a page
 
@@ -54,6 +76,129 @@ Drop the viewer into an `<iframe>`:
 ```
 
 Use `layout=compact` when you want a slim toolbar to remain (for example, so viewers can switch basemaps), or `maponly` for a pure map.
+
+## Talking to the map at runtime
+
+URL parameters configure the app once, at load. To keep talking to a **live**
+embed (fly to the record the user just clicked in your app, highlight it, open a
+processing tool) and to hear what the user does inside the map, use the embed
+`postMessage` API.
+
+### Enabling it
+
+The API is **off by default**: a public deployment can never be driven by the
+page that frames it. Turn it on by naming the origins you trust. For the Docker
+image, that is one environment variable:
+
+```bash
+docker run --rm -p 8080:80 \
+  -e GEOLIBRE_EMBED_ORIGINS="https://portal.example.com,https://erp.example.com" \
+  ghcr.io/opengeos/geolibre:latest
+```
+
+For a static build, bake it in instead:
+`VITE_GEOLIBRE_EMBED_ORIGINS="https://portal.example.com" npm run build`.
+
+Entries are origins (`scheme://host[:port]`); a trailing path is ignored. `*`
+allows any origin and is only appropriate on a private network. The allowlist is
+enforced in both directions: a message from an unlisted origin is ignored, and
+every message the app sends is addressed to a listed origin. (With `*`
+configured, outbound messages are addressed to `*` until the host's first
+message identifies it, which is one more reason to name your origins.)
+
+Setting the allowlist also narrows the `?embed=1` project/scripting bridges (used
+by the [Python package](../python.md)) to the same origins. As extra hardening
+you can stop other sites from framing the app at all by adding
+`Content-Security-Policy: frame-ancestors <your origins>` at your reverse proxy.
+
+### Message shape
+
+Every message, in both directions, is versioned:
+
+```json
+{ "v": 1, "type": "setView", "payload": { "center": [-95.7, 37.1], "zoom": 5 } }
+```
+
+Messages the **app** sends also carry `"source": "geolibre"`, so you can filter
+them out of the other `postMessage` traffic on your page.
+
+### Host to GeoLibre
+
+| Type               | Payload                                                    | Effect                                                                             |
+| ------------------ | ---------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `loadProject`      | `{ url }`                                                  | Loads a `.geolibre.json` project without reloading the iframe.                      |
+| `setView`          | `{ bbox }` or `{ center, zoom, bearing, pitch, duration }` | Fits a bounding box, or flies the camera to the properties you send.                |
+| `highlightFeature` | `{ layerId, featureId \| featureIds \| filter, fit }`      | Selects and highlights features; `filter` matches properties. `fit` zooms to them.  |
+| `openTool`         | `{ id, params }`                                           | Opens the Processing dialog on a tool, pre-filling `params`. Runtime twin of `?tool=`. |
+
+Send `{ layerId }` alone to `highlightFeature` to clear the highlight. A request
+that names features (or a filter) but matches none is rejected rather than
+treated as a clear, so a mistyped id does not silently wipe the user's selection.
+Highlighting reads the layer's features from the project, so it applies to vector
+layers GeoLibre holds as GeoJSON, not to ones whose features live only in a tile
+source.
+
+Add a `requestId` to any message and the app answers with an `ack` (below)
+reporting whether it worked.
+
+### GeoLibre to host
+
+| Type                | Payload                                                        | Fires when                                                       |
+| ------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------- |
+| `ready`             | `{ version }`                                                  | The app has mounted and is listening.                             |
+| `ack`               | `{ requestId, ok, error }`                                     | A message you sent with a `requestId` was applied (or rejected).  |
+| `projectLoaded`     | `{ url, name, layerIds }`                                      | A project finished loading, whoever started it.                   |
+| `selectionChanged`  | `{ layerId, featureIds }`                                      | The user (or your `highlightFeature`) changed the selection.      |
+| `viewChanged`       | `{ bbox, center, zoom, bearing, pitch }`                       | The camera moved (throttled to about four events a second).       |
+| `toolCompleted`     | `{ id, name, status, engine, durationMs, outputLayerNames }`   | A processing run finished, successfully or not.                   |
+| `serverFileWritten` | `{ path, toolId }`                                             | A file-based tool wrote an output (conversion and raster tools).  |
+
+### A host page
+
+```html
+<iframe
+  id="map"
+  src="https://gis.example.com/?url=https://erp.example.com/fields.geolibre.json&maponly"
+  title="GeoLibre map"
+  width="100%"
+  height="600"
+  style="border: 0"
+></iframe>
+
+<script>
+  const frame = document.getElementById("map");
+  const APP_ORIGIN = "https://gis.example.com";
+
+  const send = (type, payload) =>
+    frame.contentWindow.postMessage({ v: 1, type, payload }, APP_ORIGIN);
+
+  window.addEventListener("message", (event) => {
+    if (event.origin !== APP_ORIGIN) return;
+    const message = event.data;
+    if (message?.source !== "geolibre" || message.v !== 1) return;
+
+    if (message.type === "ready") {
+      // Safe to start sending commands.
+    } else if (message.type === "selectionChanged") {
+      showRecordFor(message.payload.featureIds[0]);
+    }
+  });
+
+  // Click a record in your own UI: fly to it and highlight it, no reload.
+  function focusField(field) {
+    send("setView", { bbox: field.bbox });
+    send("highlightFeature", {
+      layerId: "fields",
+      filter: { parcel_id: field.id },
+      fit: true,
+    });
+  }
+</script>
+```
+
+Wait for `ready` before sending: messages that arrive before the app has mounted
+are not queued. Treat `ready` as idempotent, since it is re-sent whenever the app
+remounts (a navigation inside the frame, a development hot reload).
 
 ## What works in an embed
 
